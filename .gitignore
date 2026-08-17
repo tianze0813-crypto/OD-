@@ -1,0 +1,14 @@
+# generated / intermediate outputs
+work/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# editor / os
+.vscode/
+.idea/
+*.swp
+*~
+
+# large model weights stay local
+models/*.pth
