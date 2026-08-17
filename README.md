@@ -53,8 +53,7 @@
 
 输出：`work/step1_inference/<clip>_raw.json`。
 
-模型权重 `models/*.pth` 已 gitignore，不提交仓库；配置文件
-`models/voxelnext_v2_waymo_infer.yaml` 会被 git 跟踪。
+模型权重和配置文件均位于 `models/`，会随仓库一起跟踪。
 
 ### Step 2：identity / class / filter / yaw
 
@@ -152,7 +151,7 @@ inference/       Step1 OpenPCDet 推理脚本
 pipeline/        step1..step5 单条与批量入口
 archive/         不再参与当前链路的旧版本/旧预览文件
 tests/           当前链路的单元测试
-models/          推理配置与本地权重（权重不入 git）
+models/          推理配置与模型权重
 ```
 
 ## Truck 重合过滤规则

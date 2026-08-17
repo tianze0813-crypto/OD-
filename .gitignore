@@ -9,6 +9,3 @@ __pycache__/
 .idea/
 *.swp
 *~
-
-# large model weights stay local
-models/*.pth
