@@ -16,9 +16,10 @@
 默认 0.05）。过滤建议在模型推理后、跟踪/后处理前执行，避免不可见目标
 参与跟踪制造 ID 碎片。
 
-坐标系：输入点云和 box 使用统一的 pose 局部帧。calib.json 的 tf2base_link 给的是
-base_from_sensor，因此 cam_from_local = inv(base_from_cam) @ base_from_pose，
-逐帧静态，不需要 pose_data.txt。
+坐标系：输入点云和 box 使用统一的主雷达局部帧（当前为 lidar_top）。
+calib.json 的 tf2base_link 给的是 base_from_sensor，因此
+cam_from_lidar = inv(base_from_cam) @ base_from_lidar。逐帧静态，不需要
+pose_data.txt。
 """
 
 import json
@@ -36,8 +37,10 @@ def load_clip_cameras(clip_root):
     clip_root = Path(clip_root)
     calib = json.loads((clip_root / "transforms" / "calib.json").read_text(encoding="utf-8"))
     tf = calib["tf2base_link"]
-    # Exported points and detector boxes use the standardized pose frame.
-    B_P = np.asarray(tf["pose"], dtype=np.float64)  # base_from_detection_frame
+    # Step 1 detects directly in lidar/lidar_top, so project from that frame.
+    # Older clips without lidar_top used the standardized pose frame.
+    detection_sensor = "lidar_top" if "lidar_top" in tf else "pose"
+    B_L = np.asarray(tf[detection_sensor], dtype=np.float64)
     cams = {}
     for name in CAMERA_NAMES:
         if name not in calib or name not in tf:
@@ -48,8 +51,9 @@ def load_clip_cameras(clip_root):
             "D": np.asarray(c["D"], dtype=np.float64),
             "w": int(c["imgw"]),
             "h": int(c["imgh"]),
-            # cam_from_detection_frame
-            "T": np.linalg.inv(np.asarray(tf[name], dtype=np.float64)) @ B_P,
+            # cam_from_lidar_top (or the legacy pose frame fallback)
+            "T": np.linalg.inv(np.asarray(tf[name], dtype=np.float64)) @ B_L,
+            "source_frame": detection_sensor,
         }
     return cams
 

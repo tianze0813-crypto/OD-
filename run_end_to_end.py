@@ -106,6 +106,9 @@ def main():
                         help="step5: do not remove Truck detections")
     parser.add_argument("--keep-static-nonmotorized", action="store_true",
                         help="step5: do not remove static non-motorized tracks")
+    parser.add_argument("--car-only", "--step6-car-only", dest="car_only",
+                        action="store_true",
+                        help="step6: final labels keep only Car")
     parser.add_argument("--score-thresh", type=float, default=0.3)
     parser.add_argument("--drop-vis-below", type=float, default=0.05)
     args = parser.parse_args()
@@ -122,8 +125,9 @@ def main():
         step3_root = tmp_root / "step3"
         step4_root = tmp_root / "step4"
         step5_root = tmp_root / "step5"
+        step6_root = tmp_root / "step6"
         for path in (step1_root, step2_root, step3_root,
-                     step4_root, step5_root):
+                     step4_root, step5_root, step6_root):
             path.mkdir(parents=True, exist_ok=True)
 
         for index, clip in enumerate(clips, 1):
@@ -185,12 +189,24 @@ def main():
                 step5_cmd.append("--keep-static-nonmotorized")
             run(step5_cmd)
 
+            final_json = step5_json
+            if args.car_only:
+                step6_json = step6_root / f"{base}_step6.json"
+                step6_diag = step6_root / f"{base}_step6_diagnostics.json"
+                run([
+                    args.post_python,
+                    ROOT / "pipeline" / "step6_car_only_filter.py",
+                    "--step5-json", step5_json, "--clip", clip,
+                    "--out-json", step6_json, "--diagnostics", step6_diag,
+                ])
+                final_json = step6_json
+
             # No intermediate clip is stored.  The input clip itself is
             # renamed to <clip>_pre and only label/ is added.
             clip.rename(final_clip)
             try:
                 labels = write_labels_only(
-                    json.loads(step5_json.read_text(encoding="utf-8")),
+                    json.loads(final_json.read_text(encoding="utf-8")),
                     final_clip)
             except Exception:
                 final_clip.rename(clip)
@@ -206,6 +222,7 @@ def main():
                 "input_clip": str(clip),
                 "final_clip": str(final_clip),
                 "labels": labels,
+                "car_only": args.car_only,
                 "sust_export": str(sust_dest) if sust_dest else None,
             })
 
