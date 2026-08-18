@@ -51,37 +51,105 @@
 
 ## 坐标系与 base_link 约定
 
-- 推理输入是 `lidar/lidar_top/*.bin`；模型输出的 `box_lidar` 和 Step2--Step5
-  的所有点云、框几何都在 `lidar_top` 局部坐标系，格式为
-  `[x, y, z, dx, dy, dz, yaw]`，长度单位为米，`yaw` 是绕局部 z 轴的弧度。
-- 最终 `label/<frame>.json` 的 `psr.position`、`psr.scale`、`psr.rotation.z`
-  仍然使用这个 `lidar_top` 坐标系；`box_to_label` 只做字段和类别映射，不做
-  坐标变换。SUST 的 `Vehicle` 会映射为最终 `obj_type: Car`。
-- 当前 `CoordinateProvider` 按以下方向读取标定：
+### 当前使用的坐标系
 
-  ```text
-  base_from_pose      = tf2base_link.pose
-  base_from_lidar_top = tf2base_link.lidar_top
-  world_from_lidar_top(t)
-      = world_from_pose(t) @ inv(base_from_pose) @ base_from_lidar_top
-  ```
+代码使用列向量和齐次变换，约定 `p_dst = T_dst_from_src @ p_src`。当前各坐标系的
+职责如下：
 
-  `pose_data.txt` 每行按当前代码解释为
-  `timestamp_ns, x, y, z, qx, qy, qz, qw`，提供 `world_from_pose`。矩阵必须是
-  有限的 4x4 刚体变换，时间戳单位必须是纳秒，四元数顺序必须是 `x,y,z,w`。
-- 相机可见度模块保持原有实现，使用静态变换
-  `cam_from_pose = inv(base_from_cam) @ base_from_pose`。本次不调整该模块；
-  如果输入的 `box_lidar` 实际来自 `lidar_top`，需要先确认上游已经把它转换到
-  `pose` 局部坐标，不能仅凭目录名判断。
+| 坐标系 | 代码中的来源 | 用途 | 是否写入最终 label |
+| --- | --- | --- | --- |
+| `lidar_top` | `lidar/lidar_top/*.bin`，OpenPCDet 原始输出 | `box_lidar`、点云裁剪、Step2--Step6 的局部框几何 | 是，最终 box 就在这里 |
+| `pose` | `transforms/pose_data.txt` 对应的局部帧 | 作为 `world_from_pose` 的输入帧；`CoordinateProvider` 的中间帧 | 否 |
+| `base_link` | `transforms/calib.json` 的 `tf2base_link` | 传感器外参的中间参考帧，不直接导出 label | 否 |
+| `world` | `pose_data.txt` 的位姿输出帧 | 跟踪中心、静态车位、运动判断、yaw 稳定、Truck 中心平滑/插值 | 否 |
 
-把 `base_link` 的原点从 front 雷达改到 top 雷达本身不会要求重写跟踪或标签坐标，
-前提是同步重算 `tf2base_link` 下所有传感器外参，并保持 `pose_data.txt` 的 pose
-语义不变。若 top 就是新的 base 原点，通常应满足
-`tf2base_link.lidar_top` 为单位阵（具体仍以标定工具输出为准）。不要只改
-`pose` 或只改 `lidar_top`，也不要把检测框先转换到 `base_link` 后仍称为
-`box_lidar`；否则 world 跟踪、yaw、点云拟合、相机投影和最终 label 会同时产生
-平移/旋转偏差。若 `pose_data.txt` 也改成了 `world_from_lidar_top`，则需要同步
-改写 `CoordinateProvider` 公式，不能直接套用当前实现。
+**当前最终结论：`label/<frame>.json` 中的 box 是 `lidar_top` 局部坐标，
+不是 `base_link` 坐标，也不是 `world` 坐标。** `tracking.box_to_label()` 只把
+`box_lidar` 映射到 SUST 的 `psr` 字段，不做坐标变换：
+
+```text
+box_lidar = [x, y, z, dx, dy, dz, yaw]
+label.psr.position = [x, y, z]
+label.psr.scale    = [dx, dy, dz]
+label.psr.rotation.z = yaw
+```
+
+`x,y,z` 是 box 中心，`dx,dy,dz` 是沿 box 局部 x/y/z 轴的长度、宽度、高度，
+`yaw` 是绕局部 z 轴的弧度。代码没有对 lidar 的轴方向再做一次交换或翻转。
+`Vehicle` 在导出时按 `CLASS_MAP` 变为 `obj_type: Car`。
+
+### world 变换和约束
+
+`calib.json` 中 `tf2base_link.<sensor>` 表示 `base_from_sensor`。当前
+`CoordinateProvider` 使用：
+
+```text
+base_from_pose      = tf2base_link.pose
+base_from_lidar_top = tf2base_link.lidar_top
+
+world_from_lidar_top(t)
+    = world_from_pose(t)
+    @ inv(base_from_pose)
+    @ base_from_lidar_top
+```
+
+也就是对一个 top 雷达点依次执行：
+
+```text
+lidar_top -> base_link -> pose -> world
+```
+
+`pose_data.txt` 每行只读取前 8 列，格式必须是
+`timestamp_ns, x, y, z, qx, qy, qz, qw`；时间戳按纳秒解释，四元数顺序是
+`x,y,z,w`。代码会在相邻位姿间对平移线性插值、对四元数 SLERP；相邻位姿间隔
+超过 0.6 秒时使用较近的一帧，超出时间范围时使用端点帧。`tf2base_link` 中参与
+计算的矩阵必须是有限的 4x4 矩阵。
+
+各步骤对坐标的实际使用是：
+
+1. Step1 从 `lidar_top` 点云推理，输出的 `box_lidar` 原样进入后续流程。
+2. Step2 用 `world_from_lidar_top` 做跨帧 identity、静态/动态判断和 yaw 世界角计算，
+   结果再写回 `lidar_top` 的 `box_lidar`。
+3. Step3 的 Car 点云拟合、Step4 的 Truck 点云拟合都直接在 `lidar_top` 中进行；
+   Truck 的中心平滑和缺失帧插值暂时在 `world` 中计算，写回前再逆变换回
+   `lidar_top`。
+4. Step5 的“是否运动”使用 `world` 中心轨迹，但不改变 box 的坐标系；Step6 只删
+   非 Car 检测，也不改变任何保留框的坐标。
+5. `label/` 导出不再经过任何变换，因此最终坐标仍是每帧自己的 `lidar_top` 局部帧。
+
+### 当前可见度模块的特别说明
+
+可见度实现按已恢复的远端版本保持不变。`filtering/camera_visibility.py` 当前构造
+的是：
+
+```text
+cam_from_pose = inv(base_from_cam) @ base_from_pose
+```
+
+因此它假定传入的 box 已经在 `pose` 局部帧；它不读取 `pose_data.txt`。但本仓库的
+Step1 会把 OpenPCDet 直接对 `lidar/lidar_top/*.bin` 的输出传给该模块，并没有在
+Step1 中做 `lidar_top -> pose` 转换。也就是说：
+
+- 如果当前数据的 `pose` 与 `lidar_top` 实际是同一坐标帧，这段投影可以直接使用；
+- 如果两者存在平移或旋转差异，Step1 的 visibility 比例和 5% 可见度过滤可能不准，
+  Step4 为插入 Truck 计算的 visibility 也有同样前提；
+- 这不改变后续 `box_lidar` 和最终 label 的坐标结论。要修复该契约，必须统一上游
+  box 的输入帧或修改可见度实现，不能只改 README。
+
+### 更换 base_link 的影响
+
+代码没有把 `base_link` 原点硬编码为 front 或 top 雷达；实际原点由每个 clip 的
+`tf2base_link` 标定决定。把原点从 front 改到 top 后，只要同时重算
+`tf2base_link` 下所有传感器外参，并保持 `pose_data.txt` 仍表示同一个
+`world_from_pose`，上面的变换链可以保持物理意义不变，跟踪和最终 label 不需要
+改成 `base_link` 坐标。若 top 就是新 base 原点，通常 `tf2base_link.lidar_top`
+应为单位阵（以实际标定工具输出为准）。
+
+不要只改 `pose` 或只改 `lidar_top`，也不要把 box 先转换到 `base_link`/`world` 后
+仍然把它命名为 `box_lidar`；否则点云拟合、跟踪、yaw、可见度投影和最终 label 会
+同时出现平移或旋转偏差。若 `pose_data.txt` 的语义也改成了
+`world_from_lidar_top`，必须同步改写 `CoordinateProvider` 的公式，不能继续直接
+套用当前实现。
 
 ## 分步运行
 
