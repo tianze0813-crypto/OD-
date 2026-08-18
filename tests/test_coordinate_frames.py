@@ -36,21 +36,21 @@ class CoordinateFrameContractTest(unittest.TestCase):
         (transforms / "pose_data.txt").write_text(
             "0,0,0,0,0,0,0,1\n", encoding="utf-8")
 
-    def test_camera_projection_prefers_lidar_top(self):
+    def test_camera_projection_keeps_pose_contract(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self._write_clip(root)
             cameras = load_clip_cameras(root)
-        self.assertEqual(cameras["cam_front"]["source_frame"], "lidar_top")
         self.assertTrue(np.allclose(
-            cameras["cam_front"]["T"][:3, 3], [2.0, -3.0, 0.0]))
+            cameras["cam_front"]["T"][:3, 3], [10.0, -3.0, 0.0]))
 
     def test_legacy_pose_fallback_is_preserved(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self._write_clip(root, include_top=False)
             cameras = load_clip_cameras(root)
-        self.assertEqual(cameras["cam_front"]["source_frame"], "pose")
+        self.assertTrue(np.allclose(
+            cameras["cam_front"]["T"][:3, 3], [10.0, -3.0, 0.0]))
 
     def test_world_from_lidar_top_contract(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -69,9 +69,10 @@
   `pose_data.txt` 每行按当前代码解释为
   `timestamp_ns, x, y, z, qx, qy, qz, qw`，提供 `world_from_pose`。矩阵必须是
   有限的 4x4 刚体变换，时间戳单位必须是纳秒，四元数顺序必须是 `x,y,z,w`。
-- 相机可见度使用静态变换
-  `cam_from_lidar_top = inv(base_from_cam) @ base_from_lidar_top`；没有
-  `lidar_top` 外参的旧 clip 才回退到 `pose`。
+- 相机可见度模块保持原有实现，使用静态变换
+  `cam_from_pose = inv(base_from_cam) @ base_from_pose`。本次不调整该模块；
+  如果输入的 `box_lidar` 实际来自 `lidar_top`，需要先确认上游已经把它转换到
+  `pose` 局部坐标，不能仅凭目录名判断。
 
 把 `base_link` 的原点从 front 雷达改到 top 雷达本身不会要求重写跟踪或标签坐标，
 前提是同步重算 `tf2base_link` 下所有传感器外参，并保持 `pose_data.txt` 的 pose
