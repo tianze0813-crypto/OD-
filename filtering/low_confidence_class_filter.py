@@ -1,10 +1,9 @@
-"""Step 5 filters for classes with unreliable detector output.
+"""Legacy class filters retained for compatibility.
 
-Truck and non-motorized vehicles are currently too noisy for annotation.  By
-default every Truck box is removed.  For Cyclist/non-motorized tracks, only
-tracks that never move after the initial observation are removed; a cyclist
-that waits at a red light and later moves again is kept because its motion
-provides evidence that the track is real.
+The active pipeline Step 5 no longer calls this module.  It now performs the
+final point-count/lifecycle gate and converts boxes to ``base_link``.  These
+helpers remain available for callers that explicitly relied on the previous
+Truck/non-motorized class policy.
 """
 
 from __future__ import annotations

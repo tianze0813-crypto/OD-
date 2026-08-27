@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Step 5 batch: optional low-confidence class filters over step-4 clips."""
+"""Step 5 batch: final filtering and box conversion over step-4 clips."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from filtering.low_confidence_class_filter import LowConfidenceClassFilterConfig
+from filtering.final_filter import FinalFilterConfig
 from pipeline.step5_class_motion_filter import run
 
 
@@ -27,8 +27,10 @@ def main() -> None:
     parser.add_argument("--work-root", type=Path,
                         default=PROJECT_ROOT / "work" / "step5_class_motion_filter")
     parser.add_argument("--suffix", type=str, default="_step5")
-    parser.add_argument("--keep-truck", action="store_true")
-    parser.add_argument("--keep-static-nonmotorized", action="store_true")
+    parser.add_argument("--sparsity-max-points", type=int, default=10,
+                        help="remove boxes containing this many points or fewer")
+    parser.add_argument("--short-track-max-frames", type=int, default=3,
+                        help="remove tracks observed in this many frames or fewer")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
@@ -38,9 +40,10 @@ def main() -> None:
     args.work_root.mkdir(parents=True, exist_ok=True)
     args.out_root.mkdir(parents=True, exist_ok=True)
 
-    config = LowConfidenceClassFilterConfig(
-        drop_truck=not args.keep_truck,
-        drop_static_nonmotorized=not args.keep_static_nonmotorized)
+    config = FinalFilterConfig(
+        max_points_in_box=args.sparsity_max_points,
+        max_track_length=args.short_track_max_frames,
+    )
     summaries = []
     for index, step4_json in enumerate(step4_jsons, start=1):
         clip_name = step4_json.name[:-len("_step4.json")]
@@ -61,11 +64,9 @@ def main() -> None:
             "diagnostics": str(diagnostics),
             "before_detections": result["before_detections"],
             "after_detections": result["after_detections"],
-            "truck_boxes_removed": result["truck_boxes_removed"],
-            "static_nonmotorized_tracks_removed": result[
-                "static_nonmotorized_tracks_removed"],
-            "static_nonmotorized_boxes_removed": result[
-                "static_nonmotorized_boxes_removed"],
+            "point_filter_removed": result["point_filter_removed"],
+            "short_track_removed": result["short_track_removed"],
+            "boxes_converted": result["boxes_converted"],
         })
 
     summary_path = args.work_root / "batch_summary.json"

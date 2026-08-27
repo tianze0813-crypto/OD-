@@ -47,7 +47,7 @@ def apply_car_only_filter(
     after_detections = sum(len(f.get("detections", [])) for f in output)
     return output, {
         "policy": {
-            "pipeline_position": "after_step5_class_motion_filter",
+            "pipeline_position": "after_step5_final_filter",
             "keep_label_class": "Car",
             "criterion": "canonical class emitted by box_to_label",
             "mutated_fields": "remove non-Car detections only",

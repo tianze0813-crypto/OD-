@@ -102,10 +102,10 @@ def main():
     parser.add_argument("--final-suffix", type=str, default="_pre")
     parser.add_argument("--overwrite", action="store_true",
                         help="如果 <clip>_pre 已存在，先删除再生成")
-    parser.add_argument("--keep-truck", action="store_true",
-                        help="step5: do not remove Truck detections")
-    parser.add_argument("--keep-static-nonmotorized", action="store_true",
-                        help="step5: do not remove static non-motorized tracks")
+    parser.add_argument("--sparsity-max-points", type=int, default=10,
+                        help="step5: remove boxes containing this many points or fewer")
+    parser.add_argument("--short-track-max-frames", type=int, default=3,
+                        help="step5: remove tracks observed in this many frames or fewer")
     parser.add_argument("--car-only", "--step6-car-only", dest="car_only",
                         action="store_true",
                         help="step6: final labels keep only Car")
@@ -182,11 +182,9 @@ def main():
                 ROOT / "pipeline" / "step5_class_motion_filter.py",
                 "--step4-json", step4_json, "--clip", clip,
                 "--out-json", step5_json, "--diagnostics", step5_diag,
+                "--sparsity-max-points", args.sparsity_max_points,
+                "--short-track-max-frames", args.short_track_max_frames,
             ]
-            if args.keep_truck:
-                step5_cmd.append("--keep-truck")
-            if args.keep_static_nonmotorized:
-                step5_cmd.append("--keep-static-nonmotorized")
             run(step5_cmd)
 
             final_json = step5_json

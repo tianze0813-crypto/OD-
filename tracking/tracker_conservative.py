@@ -185,6 +185,44 @@ def finite_box(det: Dict[str, Any]) -> bool:
     return isinstance(box, list) and len(box) >= 7 and bool(np.all(np.isfinite(np.asarray(box[:7], dtype=float))))
 
 
+def box_lidar_to_base_link(
+        box: Sequence[float],
+        base_from_lidar_top: np.ndarray,
+) -> List[float]:
+    """Transform a lidar-top box to the base_link box representation.
+
+    The box format stores a center, three extents, and one planar yaw.  A
+    rigid sensor extrinsic preserves the extents; the center is transformed
+    homogeneously and the heading vector is rotated before its XY yaw is
+    recovered.  If the extrinsic contains roll/pitch, the returned yaw is the
+    XY projection because this seven-value format cannot encode a fully tilted
+    3-D box.
+    """
+    values = np.asarray(box[:7], dtype=np.float64)
+    if values.shape != (7,) or not np.all(np.isfinite(values)):
+        raise ValueError("box must contain seven finite values")
+    transform = np.asarray(base_from_lidar_top, dtype=np.float64)
+    if transform.shape != (4, 4) or not np.all(np.isfinite(transform)):
+        raise ValueError("base_from_lidar_top must be a finite 4x4 matrix")
+    rotation = transform[:3, :3]
+    determinant = float(np.linalg.det(rotation))
+    if abs(determinant) < 1e-9:
+        raise ValueError("base_from_lidar_top rotation is singular")
+
+    center = (transform @ np.r_[values[:3], 1.0])[:3]
+    heading = rotation @ np.array([
+        math.cos(float(values[6])), math.sin(float(values[6])), 0.0,
+    ], dtype=np.float64)
+    horizontal_norm = float(np.linalg.norm(heading[:2]))
+    if horizontal_norm < 1e-9:
+        raise ValueError("box heading has no base_link XY projection")
+    yaw = math.atan2(float(heading[1]), float(heading[0]))
+    return [
+        float(center[0]), float(center[1]), float(center[2]),
+        float(values[3]), float(values[4]), float(values[5]), float(yaw),
+    ]
+
+
 def rectangle_corners(center: Sequence[float], size: Sequence[float], yaw: float) -> np.ndarray:
     hx, hy = max(float(size[0]), 1e-3) / 2.0, max(float(size[1]), 1e-3) / 2.0
     local = np.array([[hx, hy], [-hx, hy], [-hx, -hy], [hx, -hy]], dtype=np.float64)
