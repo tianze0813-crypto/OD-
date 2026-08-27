@@ -134,12 +134,12 @@ class Step5FinalFilterTest(unittest.TestCase):
             frames = []
             for frame_index in range(4):
                 frame_id = str(frame_index)
-                # Eleven points are inside each box; the second track exists
+                # Six points are inside each box; the second track exists
                 # for only three frames and must be removed by lifecycle.
                 points = np.asarray(
-                    [[0.1 * i, 0.0, 0.0, 1.0] for i in range(11)]
+                    [[0.1 * i, 0.0, 0.0, 1.0] for i in range(6)]
                     + [[10.0 + 0.1 * i, 0.0, 0.0, 1.0]
-                       for i in range(11)], dtype=np.float32)
+                       for i in range(6)], dtype=np.float32)
                 points.tofile(root / "lidar" / "lidar_top" / f"{frame_id}.bin")
                 detections = [self._det(1, 0.0)]
                 if frame_index < 3:
@@ -153,7 +153,7 @@ class Step5FinalFilterTest(unittest.TestCase):
 
             output, stats = apply_final_filter(
                 frames, root, coords,
-                FinalFilterConfig(max_points_in_box=10,
+                FinalFilterConfig(max_points_in_box=5,
                                   max_track_length=3))
 
         self.assertEqual(stats["point_filter_removed"], 0)
@@ -172,7 +172,7 @@ class Step5FinalFilterTest(unittest.TestCase):
             root = Path(directory)
             coords = self._clip(root)
             points = np.asarray(
-                [[0.1 * i, 0.0, 0.0, 1.0] for i in range(10)],
+                [[0.1 * i, 0.0, 0.0, 1.0] for i in range(5)],
                 dtype=np.float32)
             points.tofile(root / "lidar" / "lidar_top" / "0.bin")
             frames = [{

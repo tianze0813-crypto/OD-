@@ -24,7 +24,7 @@ from tracking import tracker_conservative as tracking
 class FinalFilterConfig:
     """Thresholds use an inclusive drop rule: ``<=`` is removed."""
 
-    max_points_in_box: int = 10
+    max_points_in_box: int = 5
     max_track_length: int = 3
 
 

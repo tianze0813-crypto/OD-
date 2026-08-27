@@ -235,7 +235,7 @@ Step5 不再按类别删除 Truck 或非机动车。它只执行两项最终过�
 box 的坐标：
 
 ```text
-1. box 内点数 <= 10：删除该检测
+1. box 内点数 <= 5：删除该检测
 2. 轨迹长度 <= 3 帧：删除该轨迹的全部检测
 3. 对剩余 box 应用 lidar_top -> base_link 的静态外参
 ```
@@ -254,10 +254,10 @@ box 的坐标：
   --out-clip work/step5_class_motion_filter/data/<clip>_step5
 ```
 
-可调阈值（默认即需求中的 `10` 和 `3`）：
+可调阈值（默认值为 `5` 和 `3`）：
 
 ```bash
---sparsity-max-points 10
+--sparsity-max-points 5
 --short-track-max-frames 3
 ```
 

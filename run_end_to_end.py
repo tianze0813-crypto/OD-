@@ -102,7 +102,7 @@ def main():
     parser.add_argument("--final-suffix", type=str, default="_pre")
     parser.add_argument("--overwrite", action="store_true",
                         help="如果 <clip>_pre 已存在，先删除再生成")
-    parser.add_argument("--sparsity-max-points", type=int, default=10,
+    parser.add_argument("--sparsity-max-points", type=int, default=5,
                         help="step5: remove boxes containing this many points or fewer")
     parser.add_argument("--short-track-max-frames", type=int, default=3,
                         help="step5: remove tracks observed in this many frames or fewer")

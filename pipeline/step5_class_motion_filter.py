@@ -53,7 +53,7 @@ def main() -> None:
     parser.add_argument("--out-json", type=Path, required=True)
     parser.add_argument("--out-clip", type=Path)
     parser.add_argument("--diagnostics", type=Path)
-    parser.add_argument("--sparsity-max-points", type=int, default=10,
+    parser.add_argument("--sparsity-max-points", type=int, default=5,
                         help="remove boxes containing this many points or fewer")
     parser.add_argument("--short-track-max-frames", type=int, default=3,
                         help="remove tracks observed in this many frames or fewer")
