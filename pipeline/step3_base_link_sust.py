@@ -156,6 +156,8 @@ def run_clip(clip: Path, output_root: Path, overwrite: bool = False) -> Dict[str
         "car_boxes": diagnostics["car_boxes"],
         "roof_evidence_boxes": diagnostics["roof_evidence_boxes"],
         "roof_rejections": diagnostics["roof_rejections"],
+        "ground_temporal_repaired_boxes": diagnostics.get(
+            "ground_temporal_repaired_boxes", 0),
         "z_modes": {
             key: diagnostics[key]
             for key in ("z_both_boxes", "z_ground_boxes", "z_roof_boxes",

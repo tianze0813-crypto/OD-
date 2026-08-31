@@ -5,6 +5,7 @@ import numpy as np
 from geometry.car_box_fit import (
     CarBoxFitConfig,
     _fit_z_boundaries,
+    _repair_track_ground,
     _roof_evidence,
 )
 
@@ -111,6 +112,33 @@ class ZBoundaryFallbackTest(unittest.TestCase):
         self.assertAlmostEqual(height, 1.50)
         self.assertAlmostEqual(fit_z, 0.99)
 
+    def test_weak_roof_that_disagrees_with_track_height_uses_prior(self):
+        item = self.item(0.20, 18, 1.45, 6)
+        item["roof_detail"] = {"selected_run": [4, 5]}
+        fit_z, height, mode = _fit_z_boundaries(
+            item, self.track_height, self.config)
+        self.assertEqual(mode, "ground_prior")
+        self.assertAlmostEqual(height, self.track_height)
+        self.assertAlmostEqual(fit_z, 1.04)
+
+    def test_small_track_height_error_still_uses_prior(self):
+        item = self.item(-1.685, 49, -0.125, 157)
+        item["roof_detail"] = {"selected_run": [29, 30]}
+        fit_z, height, mode = _fit_z_boundaries(
+            item, 1.7456, self.config)
+        self.assertEqual(mode, "ground_prior")
+        self.assertAlmostEqual(height, 1.7456)
+        self.assertAlmostEqual(fit_z, -0.7722, places=3)
+
+    def test_strong_roof_run_keeps_reasonable_boundary_pair(self):
+        item = self.item(0.20, 18, 1.70, 6)
+        item["roof_detail"] = {"selected_run": [1, 2, 3, 4, 5]}
+        fit_z, height, mode = _fit_z_boundaries(
+            item, self.track_height, self.config)
+        self.assertEqual(mode, "both")
+        self.assertAlmostEqual(height, 1.50)
+        self.assertAlmostEqual(fit_z, 0.99)
+
     def test_unreasonable_pair_keeps_ground_and_uses_track_height(self):
         fit_z, height, mode = _fit_z_boundaries(
             self.item(0.20, 18, 3.00, 6), self.track_height, self.config)
@@ -139,6 +167,64 @@ class ZBoundaryFallbackTest(unittest.TestCase):
         self.assertEqual(mode, "raw_fallback")
         self.assertAlmostEqual(height, self.track_height)
         self.assertAlmostEqual(fit_z, 1.50)
+
+
+class GroundTemporalRepairTest(unittest.TestCase):
+    config = CarBoxFitConfig()
+
+    @staticmethod
+    def item(timestamp: int, ground_z: float, points: int = 30):
+        return {
+            "timestamp": timestamp,
+            "ground_z": ground_z,
+            "ground_points": points,
+        }
+
+    def test_bimodal_jump_is_interpolated_between_lower_surface_samples(self):
+        items = [
+            self.item(0, -1.80),
+            self.item(20_000_000, -1.82),
+            self.item(40_000_000, -1.25),
+            self.item(60_000_000, -1.23),
+            self.item(80_000_000, -1.24),
+            self.item(100_000_000, -1.81),
+            self.item(120_000_000, -1.83),
+        ]
+        repaired = _repair_track_ground(items, self.config)
+        self.assertEqual(repaired, 3)
+        self.assertAlmostEqual(items[2]["ground_z"], -1.8175)
+        self.assertAlmostEqual(items[3]["ground_z"], -1.815)
+        self.assertAlmostEqual(items[4]["ground_z"], -1.8125)
+        self.assertTrue(items[2]["ground_detail"]["repaired"])
+
+    def test_single_jump_is_left_untouched(self):
+        items = [
+            self.item(0, -1.80),
+            self.item(20_000_000, -1.25),
+            self.item(40_000_000, -1.82),
+        ]
+        repaired = _repair_track_ground(items, self.config)
+        self.assertEqual(repaired, 0)
+        self.assertAlmostEqual(items[1]["ground_z"], -1.25)
+
+    def test_long_prefix_uses_single_following_ground_anchor(self):
+        items = [
+            self.item(0, -1.00),
+            self.item(20_000_000, -1.02),
+            self.item(40_000_000, -1.01),
+            self.item(60_000_000, -1.80),
+            self.item(80_000_000, -1.82),
+            self.item(100_000_000, -1.81),
+            self.item(120_000_000, -1.00),
+            self.item(140_000_000, -1.80),
+            self.item(160_000_000, -1.82),
+            self.item(180_000_000, -1.81),
+        ]
+        repaired = _repair_track_ground(items, self.config)
+        self.assertGreaterEqual(repaired, 4)
+        for item in items[:3]:
+            self.assertAlmostEqual(item["ground_z"], -1.80, places=2)
+            self.assertTrue(item["ground_detail"]["repaired"])
 
 
 if __name__ == "__main__":

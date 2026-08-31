@@ -83,6 +83,19 @@ class CarBoxFitConfig:
     # boundary moves and the other side uses the track-level height prior.
     z_roof_clearance: float = 0.04
     z_min_center_change: float = 0.03
+    # A short roof run can be a lower body/windshield layer rather than the
+    # roof.  Reject it only when it also disagrees with the robust track
+    # height; strong roof evidence remains untouched.
+    z_height_abs_tolerance: float = 0.18
+    z_height_relative_tolerance: float = 0.08
+    z_weak_roof_max_windows: int = 4
+    # Ground is repaired only for a track-local bimodal sequence with repeated
+    # abrupt jumps.  Single-frame or monotonic ground changes are preserved.
+    ground_temporal_jump: float = 0.25
+    ground_temporal_max_gap: float = 0.35
+    ground_bimodal_gap: float = 0.25
+    ground_min_jump_count: int = 2
+    ground_min_cluster_samples: int = 3
 
     # XY shrink-only policy.
     body_crop_margin: float = 0.22
@@ -591,6 +604,106 @@ def _track_height(items: Sequence[MutableMapping[str, Any]],
     return float(np.median(original)) if original else 1.5
 
 
+def _repair_track_ground(
+        items: Sequence[MutableMapping[str, Any]],
+        config: CarBoxFitConfig) -> int:
+    """Repair only a clearly bimodal, abruptly switching ground sequence.
+
+    ``_estimate_ground`` intentionally remains unchanged for ordinary frames.
+    When one track alternates between two surfaces, the higher cluster is
+    treated as the competing surface only if the lower cluster is the larger
+    one and the sequence contains repeated large jumps.  Values in that
+    cluster are linearly interpolated from the nearest lower-cluster samples.
+    A long prefix or suffix can use its single lower-cluster anchor; short edge
+    runs remain untouched.
+    """
+    valid = [
+        (index, item, float(item["ground_z"]))
+        for index, item in enumerate(items)
+        if item.get("ground_z") is not None
+        and int(item.get("ground_points", 0)) >= config.ground_min_points
+    ]
+    if (len(valid) < 2 * config.ground_min_cluster_samples):
+        return 0
+
+    values = np.asarray([entry[2] for entry in valid], dtype=np.float64)
+    ordered = np.sort(values)
+    gaps = np.diff(ordered)
+    if len(gaps) == 0:
+        return 0
+    split = int(np.argmax(gaps))
+    largest_gap = float(gaps[split])
+    low_count = split + 1
+    high_count = len(ordered) - low_count
+    if (largest_gap < config.ground_bimodal_gap
+            or low_count < config.ground_min_cluster_samples
+            or high_count < config.ground_min_cluster_samples
+            or low_count < high_count):
+        return 0
+
+    jumps = 0
+    for (_, left, left_z), (_, right, right_z) in zip(valid, valid[1:]):
+        gap_sec = (int(right["timestamp"]) - int(left["timestamp"])) / 1e9
+        if (gap_sec <= config.ground_temporal_max_gap
+                and abs(right_z - left_z) >= config.ground_temporal_jump):
+            jumps += 1
+    if jumps < config.ground_min_jump_count:
+        return 0
+
+    low_limit = float(ordered[split])
+    low_entries = [entry for entry in valid if entry[2] <= low_limit]
+    high_entries = [entry for entry in valid if entry[2] > low_limit]
+    high_indices = {entry[0] for entry in high_entries}
+
+    def _high_run_length(index: int) -> int:
+        start = index
+        while start - 1 in high_indices:
+            start -= 1
+        stop = index
+        while stop + 1 in high_indices:
+            stop += 1
+        return stop - start + 1
+
+    repaired = 0
+    for index, item, original in high_entries:
+        previous = max((entry for entry in low_entries if entry[0] < index),
+                       default=None, key=lambda entry: entry[0])
+        following = min((entry for entry in low_entries if entry[0] > index),
+                        default=None, key=lambda entry: entry[0])
+        if previous is None and following is None:
+            continue
+        if previous is None or following is None:
+            # A long high-cluster prefix/suffix can have only one lower
+            # anchor.  It is still repairable when the track has already met
+            # the repeated-jump and bimodality checks above; short edge runs
+            # remain untouched.
+            if _high_run_length(index) < config.ground_min_cluster_samples:
+                continue
+            anchor = following if previous is None else previous
+            target = float(anchor[2])
+        else:
+            _, previous_item, previous_z = previous
+            _, following_item, following_z = following
+            previous_ts = int(previous_item["timestamp"])
+            following_ts = int(following_item["timestamp"])
+            current_ts = int(item["timestamp"])
+            if following_ts <= previous_ts:
+                continue
+            alpha = (current_ts - previous_ts) / (following_ts - previous_ts)
+            target = previous_z + float(np.clip(alpha, 0.0, 1.0)) * (following_z - previous_z)
+        if abs(target - original) < config.ground_temporal_jump / 2.0:
+            continue
+        item["ground_detail"] = {
+            "repaired": True,
+            "original_ground_z": round(original, 4),
+            "repaired_ground_z": round(float(target), 4),
+            "reason": "track_bimodal_ground_temporal_jump",
+        }
+        item["ground_z"] = float(target)
+        repaired += 1
+    return repaired
+
+
 def _fit_z_boundaries(item: MutableMapping[str, Any], height: float,
                       config: CarBoxFitConfig) -> Tuple[float, float, str]:
     """Fit the ground and roof boundaries of one Car observation.
@@ -619,13 +732,25 @@ def _fit_z_boundaries(item: MutableMapping[str, Any], height: float,
     z_bounds = box_geometry._SIZE_BOUNDS["Car"][2]
     if bottom is not None and top is not None:
         raw_height = top - bottom
-        if z_bounds[0] <= raw_height <= z_bounds[1]:
+        height_tolerance = max(
+            float(config.z_height_abs_tolerance),
+            float(config.z_height_relative_tolerance) * float(height),
+        )
+        roof_detail = item.get("roof_detail")
+        selected_run = (roof_detail.get("selected_run")
+                        if isinstance(roof_detail, Mapping) else None)
+        weak_roof = (isinstance(selected_run, (list, tuple))
+                     and len(selected_run) <= config.z_weak_roof_max_windows)
+        inconsistent_track_height = abs(raw_height - float(height)) > height_tolerance
+        if (z_bounds[0] <= raw_height <= z_bounds[1]
+                and not (weak_roof and inconsistent_track_height)):
             fit_height = raw_height
             fit_z = (bottom + top) / 2.0
             mode = "both"
         else:
-            # Both surfaces exist but disagree with the Car height prior.
-            # Trust the lower ground boundary and use the track height.
+            # Both surfaces exist but a weak roof candidate disagrees with the
+            # track height prior (or violates the physical Car bounds). Trust
+            # the lower ground boundary and use the track height.
             fit_height = height
             fit_z = bottom + height / 2.0
             mode = "ground_prior"
@@ -667,6 +792,7 @@ def apply_car_box_fit(
 
     static_boxes = dynamic_boxes = 0
     ground_boxes = roof_boxes = 0
+    ground_temporal_repaired_boxes = 0
     z_both_boxes = z_ground_boxes = z_roof_boxes = z_fallback_boxes = 0
     both_boxes = single_boxes = none_boxes = 0
     size_smoothed_boxes = 0
@@ -695,9 +821,16 @@ def apply_car_box_fit(
             ground_z, ground_points = box_geometry._estimate_ground(points, box, config)
             item["ground_z"] = ground_z
             item["ground_points"] = ground_points
+            item["ground_detail"] = {
+                "repaired": False,
+                "original_ground_z": (None if ground_z is None
+                                       else round(float(ground_z), 4)),
+            }
             item["points"] = points
             item["xy_result"] = _fit_xy_shrink_only(
                 points, box, ground_z, config)
+
+        ground_temporal_repaired_boxes += _repair_track_ground(items, config)
 
         if track_id in static_ids:
             static_items = [
@@ -845,6 +978,9 @@ def apply_car_box_fit(
             "roof_evidence_boxes": sum(
                 item.get("roof_z") is not None for item in items),
             "roof_rejections": dict(sorted(track_roof_rejections.items())),
+            "ground_temporal_repaired": sum(
+                bool(item.get("ground_detail", {}).get("repaired"))
+                for item in items),
         })
 
     invariant = box_geometry.verify_geometry_only(frames, output)
@@ -892,6 +1028,7 @@ def apply_car_box_fit(
         "roof_examples": roof_examples,
         "ground_adjusted_boxes": ground_boxes,
         "roof_adjusted_boxes": roof_boxes,
+        "ground_temporal_repaired_boxes": ground_temporal_repaired_boxes,
         "final_detections": final_detections,
         "invariant_check": invariant,
         "details": track_details,
