@@ -18,8 +18,10 @@ from pipeline.step5_class_motion_filter import run
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--step3-work-root", type=Path,
-                        default=PROJECT_ROOT / "work" / "step3_car_box_fit")
+    parser.add_argument("--step4-work-root", type=Path,
+                        default=PROJECT_ROOT / "work" / "step4_car_size_filter")
+    parser.add_argument("--step3-work-root", type=Path, default=None,
+                        help="兼容旧流程：直接读取 Step3 JSON")
     parser.add_argument("--clip-root", type=Path,
                         default=PROJECT_ROOT / "work" / "step3_car_box_fit" / "data")
     parser.add_argument("--out-root", type=Path,
@@ -34,9 +36,15 @@ def main() -> None:
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
-    step3_jsons = sorted(args.step3_work_root.glob("*_step3.json"))
-    if not step3_jsons:
-        raise SystemExit(f"no *_step3.json found under {args.step3_work_root}")
+    if args.step3_work_root is not None:
+        input_root = args.step3_work_root
+        input_suffix = "_step3.json"
+    else:
+        input_root = args.step4_work_root
+        input_suffix = "_step4.json"
+    input_jsons = sorted(input_root.glob(f"*{input_suffix}"))
+    if not input_jsons:
+        raise SystemExit(f"no *{input_suffix} found under {input_root}")
     args.work_root.mkdir(parents=True, exist_ok=True)
     args.out_root.mkdir(parents=True, exist_ok=True)
 
@@ -45,8 +53,8 @@ def main() -> None:
         max_track_length=args.short_track_max_frames,
     )
     summaries = []
-    for index, step3_json in enumerate(step3_jsons, start=1):
-        clip_name = step3_json.name[:-len("_step3.json")]
+    for index, input_json in enumerate(input_jsons, start=1):
+        clip_name = input_json.name[:-len(input_suffix)]
         clip = args.clip_root / f"{clip_name}_step3"
         if not clip.is_dir():
             raise SystemExit(f"missing step-3 clip for {clip_name}: {clip}")
@@ -55,8 +63,8 @@ def main() -> None:
         out_clip = args.out_root / f"{clip_name}{args.suffix}"
         if (out_clip.exists() or out_json.exists()) and not args.overwrite:
             raise SystemExit(f"output exists, pass --overwrite: {out_clip}")
-        print(f"[{index}/{len(step3_jsons)}] {clip_name}", flush=True)
-        result = run(step3_json, clip, out_json, out_clip, diagnostics, config)
+        print(f"[{index}/{len(input_jsons)}] {clip_name}", flush=True)
+        result = run(input_json, clip, out_json, out_clip, diagnostics, config)
         summaries.append({
             "clip": clip_name,
             "out_clip": str(out_clip),

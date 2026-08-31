@@ -28,13 +28,14 @@
 中间 JSON 全部写入系统临时目录，跑完自动删除；不再生成 `work/`，也不再复制
 中间 `_step2/_step3` clip。
 
-端到端脚本的有效链路如下，Step4 已移除，Step5 已包含最终 Car-only 过滤：
+端到端脚本的有效链路如下，Step5 已包含最终 Car-only 过滤：
 
 ```text
 原始 clip
   -> step1  lidar 推理 + 相机可见度预过滤
   -> step2  identity / class / hard-filter / yaw
   -> step3  Car box XY 拟合 + 地面/车顶 Z 拟合
+  -> step4  将轨迹稳健长度 >= 6m 的 Car 统一标记为 Truck
   -> step5 最终点数/短链过滤 + Car-only + box 转换到 base_link
   -> SUST clip
 ```
@@ -48,7 +49,7 @@
 
 | 坐标系 | 代码中的来源 | 用途 | 是否写入最终 label |
 | --- | --- | --- | --- |
-| `lidar_top` | `lidar/lidar_top/*.bin`，OpenPCDet 原始输出 | Step1--Step3 的 `box_lidar`、点云裁剪，以及 Step5 点数统计 | 否，Step5 后 box 已转换 |
+| `lidar_top` | `lidar/lidar_top/*.bin`，OpenPCDet 原始输出 | Step1--Step4 的 `box_lidar`、点云裁剪，以及 Step5 点数统计 | 否，Step5 后 box 已转换 |
 | `pose` | `transforms/pose_data.txt` 对应的局部帧 | 作为 `world_from_pose` 的输入帧；`CoordinateProvider` 的中间帧 | 否 |
 | `base_link` | `transforms/calib.json` 的 `tf2base_link` | Step5 转换后的 box 和最终 label 坐标 | 是，Step5 后写入 label |
 | `world` | `pose_data.txt` 的位姿输出帧 | 跟踪中心、静态车位、运动判断和 yaw 稳定 | 否 |
@@ -105,11 +106,13 @@ lidar_top -> base_link -> pose -> world
    结果再写回 `lidar_top` 的 `box_lidar`。
 3. Step3 的 Car box 拟合直接在 `lidar_top` 中进行；先确定最终 XY footprint，
    再在该 footprint 内自下而上寻找连续车顶截面。
-4. Step5 在 `lidar_top` 点云中统计 box 内点数，按点数和轨迹长度过滤，然后把保留
+4. Step4 只读取 Step3 的 box 尺寸；轨迹稳健长度达到 `6m` 的 Car 统一改标为
+   `Truck`，不改变 box、点云、yaw 或坐标。
+5. Step5 在 `lidar_top` 点云中统计 box 内点数，按点数和轨迹长度过滤，然后把保留
    box 转换到 `base_link`；点云文件本身不转换。
-5. Step5 在转换前固定只保留规范类别 `Car`，再将 box 转到 `base_link`；
+6. Step5 在转换前固定只保留规范类别 `Car`，再将 box 转到 `base_link`；
    因此 Step6 不再是端到端链路中的必要步骤。
-6. `label/` 导出直接使用 Step5 的 `box_lidar`，因此最终坐标是
+7. `label/` 导出直接使用 Step5 的 `box_lidar`，因此最终坐标是
    `base_link` 局部帧。
 
 ### 当前可见度模块的特别说明
@@ -225,6 +228,33 @@ Step3 会先完成 shrink-only XY 拟合和静态轨迹尺寸平滑，再用最�
 锚点。短边缘段和普通单次跳变保持原值。
 ```
 
+### Step 4：大尺寸 Car 转 Truck
+
+Step4 不做点云拟合或坐标变换，只对 Step3 输出按轨迹稳健尺寸做一次类别闸门：
+
+```text
+1. 只检查 class_name == Car 的检测
+2. 计算每条 track 的 max(dx, dy) 中位数
+3. 中位数 >= 6.0m：该 track 的 Car 全部改为 Truck
+4. 其他检测和 box 字段保持不变
+```
+
+这样的大尺寸 Car 会在后续 Step5 的 Car-only 阶段被删除。
+
+单条：
+
+```bash
+/home/moga/miniconda3/envs/sustechpoints/bin/python pipeline/step4_car_size_filter.py \
+  --step3-json work/step3_car_box_fit/<clip>_step3.json \
+  --out-json work/step4_car_size_filter/<clip>_step4.json
+```
+
+批量：
+
+```bash
+/home/moga/miniconda3/envs/sustechpoints/bin/python pipeline/step4_car_size_filter_batch.py --overwrite
+```
+
 ### Step 5：最终过滤 + Car-only + box 转换到 base_link
 
 Step5 固定只保留最终规范类别为 `Car` 的检测。它先执行两项终检，再进行 Car-only
@@ -245,7 +275,7 @@ Step5 固定只保留最终规范类别为 `Car` 的检测。它先执行两项�
 
 ```bash
 /home/moga/miniconda3/envs/sustechpoints/bin/python pipeline/step5_class_motion_filter.py \
-  --step3-json work/step3_car_box_fit/<clip>_step3.json \
+  --step4-json work/step4_car_size_filter/<clip>_step4.json \
   --clip work/step3_car_box_fit/data/<clip>_step3 \
   --out-json work/step5_class_motion_filter/<clip>_step5.json \
   --out-clip work/step5_class_motion_filter/data/<clip>_step5
@@ -306,11 +336,11 @@ yaw、track_id 或坐标。
 
 ```text
 classification/  Step2 类别精修
-filtering/       Step1/Step2 可见度与硬过滤，Step5 最终过滤
+filtering/       Step1/Step2 可见度与硬过滤，Step4/Step5 最终类别与点数过滤
 tracking/        保守跟踪器 + 静态优先跟踪器
 geometry/        Step2 yaw，Step3 Car box 与地面/车顶拟合
 inference/       Step1 OpenPCDet 推理脚本
-pipeline/        step1、step2、step3、step5 主链路；step6 为兼容入口
+pipeline/        step1、step2、step3、step4、step5 主链路；step6 为兼容入口
 archive/         不再参与当前链路的旧版本/旧预览文件
 tests/           当前链路的单元测试
 models/          推理配置与模型权重

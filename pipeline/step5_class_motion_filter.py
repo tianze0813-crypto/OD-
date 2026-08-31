@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Step 5: final filtering, Car-only selection, and box-frame conversion.
 
-Point counts are evaluated in the original ``lidar_top`` cloud.  Kept boxes
+Input may be the Step3 JSON or the Step4 class-gated JSON. Point counts are
+evaluated in the original ``lidar_top`` cloud. Kept boxes
 are restricted to the canonical ``Car`` class and converted to ``base_link``
 after filtering; the point-cloud files are not rewritten.
 """
@@ -48,7 +49,9 @@ def run(step3_json: Path, clip: Path, out_json: Path,
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--step3-json", type=Path, required=True)
+    parser.add_argument("--step3-json", "--step4-json", dest="input_json",
+                        type=Path, required=True,
+                        help="Step3/Step4 JSON（保留旧参数名）")
     parser.add_argument("--clip", type=Path, required=True)
     parser.add_argument("--out-json", type=Path, required=True)
     parser.add_argument("--out-clip", type=Path)
@@ -64,7 +67,7 @@ def main() -> None:
     )
     diagnostics_path = args.diagnostics or args.out_json.with_name(
         args.out_json.stem + "_diagnostics.json")
-    result = run(args.step3_json, args.clip, args.out_json, args.out_clip,
+    result = run(args.input_json, args.clip, args.out_json, args.out_clip,
                  diagnostics_path, config)
     print(json.dumps({
         "before_detections": result["before_detections"],

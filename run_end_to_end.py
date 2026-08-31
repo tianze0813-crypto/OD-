@@ -123,8 +123,9 @@ def main():
         step1_root = tmp_root / "step1"
         step2_root = tmp_root / "step2"
         step3_root = tmp_root / "step3"
+        step4_root = tmp_root / "step4"
         step5_root = tmp_root / "step5"
-        for path in (step1_root, step2_root, step3_root, step5_root):
+        for path in (step1_root, step2_root, step3_root, step4_root, step5_root):
             path.mkdir(parents=True, exist_ok=True)
 
         for index, clip in enumerate(clips, 1):
@@ -165,12 +166,20 @@ def main():
                  "--clip", clip, "--out-json", step3_json,
                  "--diagnostics", step3_diag])
 
+            step4_json = step4_root / f"{base}_step4.json"
+            step4_diag = step4_root / f"{base}_step4_diagnostics.json"
+            run([args.post_python,
+                 ROOT / "pipeline" / "step4_car_size_filter.py",
+                 "--step3-json", step3_json,
+                 "--out-json", step4_json,
+                 "--diagnostics", step4_diag])
+
             step5_json = step5_root / f"{base}_step5.json"
             step5_diag = step5_root / f"{base}_step5_diagnostics.json"
             step5_cmd = [
                 args.post_python,
                 ROOT / "pipeline" / "step5_class_motion_filter.py",
-                "--step3-json", step3_json, "--clip", clip,
+                "--step4-json", step4_json, "--clip", clip,
                 "--out-json", step5_json, "--diagnostics", step5_diag,
                 "--sparsity-max-points", args.sparsity_max_points,
                 "--short-track-max-frames", args.short_track_max_frames,
@@ -202,6 +211,12 @@ def main():
                 "final_clip": str(final_clip),
                 "labels": labels,
                 "car_only": True,
+                "large_car_tracks_relabelled": json.loads(
+                    step4_diag.read_text(encoding="utf-8")
+                )["large_car_tracks_relabelled"],
+                "large_car_detections_relabelled": json.loads(
+                    step4_diag.read_text(encoding="utf-8")
+                )["large_car_detections_relabelled"],
                 "sust_export": str(sust_dest) if sust_dest else None,
             })
 
