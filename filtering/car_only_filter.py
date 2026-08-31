@@ -1,4 +1,8 @@
-"""Step 6: keep only detections that export as the SUST ``Car`` class."""
+"""Legacy helper for keeping only detections that export as ``Car``.
+
+The active Step5 calls the same policy inline; this module remains for
+backward-compatible standalone Step6 invocations.
+"""
 
 from __future__ import annotations
 

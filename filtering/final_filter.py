@@ -1,9 +1,10 @@
-"""Final detection filtering and box-frame conversion for Step 5.
+"""Final Car-only filtering and box-frame conversion for Step 5.
 
 Point counts are measured against the original ``lidar_top`` point cloud and
 the pre-conversion boxes.  Only detections with more than the configured point
 threshold and tracks longer than the configured lifecycle threshold are kept.
-Kept boxes are then converted to ``base_link`` using the clip calibration.
+Only detections whose canonical export class is ``Car`` are retained.  Kept
+boxes are then converted to ``base_link`` using the clip calibration.
 """
 
 from __future__ import annotations
@@ -44,6 +45,15 @@ def _valid_box(det: Dict[str, Any]) -> bool:
     return all(float(value) > 0.0 for value in det["box_lidar"][3:6])
 
 
+def _label_class(det: Dict[str, Any]) -> str:
+    """Return the canonical class emitted by ``tracking.box_to_label``."""
+    raw = det.get("class_name", "")
+    mapped = tracking.CLASS_MAP.get(raw)
+    if mapped is not None:
+        return mapped
+    return tracking.CLASS_MAP.get(str(raw).lower(), str(raw))
+
+
 def _point_counts(
         frames: Sequence[Dict[str, Any]],
         clip: Path,
@@ -80,7 +90,7 @@ def apply_final_filter(
         coords: tracking.CoordinateProvider,
         config: FinalFilterConfig = FinalFilterConfig(),
 ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Filter final detections and convert every kept box to base_link.
+    """Filter final detections, keep canonical Car, and convert to base_link.
 
     The input and output frame lists are not mutated.  Point filtering happens
     before lifecycle filtering; a track shortened by sparse observations is
@@ -131,6 +141,23 @@ def apply_final_filter(
         frame["detections"] = kept
         frame["num_detections"] = len(kept)
 
+    classes_before = Counter(
+        _label_class(det)
+        for frame in output for det in frame.get("detections", []))
+    classes_removed = Counter()
+    car_only_removed = 0
+    for frame in output:
+        kept = []
+        for det in frame.get("detections", []):
+            label_class = _label_class(det)
+            if label_class == "Car":
+                kept.append(det)
+            else:
+                car_only_removed += 1
+                classes_removed[label_class] += 1
+        frame["detections"] = kept
+        frame["num_detections"] = len(kept)
+
     converted = 0
     for frame in output:
         for det in frame.get("detections", []):
@@ -141,22 +168,15 @@ def apply_final_filter(
 
     before_detections = sum(len(f.get("detections", [])) for f in source)
     after_detections = sum(len(f.get("detections", [])) for f in output)
-    before_classes = Counter(
-        str(det.get("class_name", ""))
-        for frame in source for det in frame.get("detections", []))
-    after_classes = Counter(
-        str(det.get("class_name", ""))
-        for frame in output for det in frame.get("detections", []))
-    classes_removed = before_classes - after_classes
     return output, {
         "policy": {
-            "pipeline_position": "after_truck_size_interpolation_overlap",
+            "pipeline_position": "after_car_box_fit",
             "point_count_frame": "lidar_top",
             "input_box_frame": "lidar_top",
             "output_box_frame": "base_link",
             "drop_points_in_box_at_or_below": int(config.max_points_in_box),
             "drop_track_length_at_or_below": int(config.max_track_length),
-            "class_filtering": "none",
+            "class_filtering": "canonical label class == Car",
             "point_cloud_conversion": "none",
             "mutated_fields": ["detections", "box_lidar", "box_frame"],
         },
@@ -165,9 +185,11 @@ def apply_final_filter(
         "invalid_box_removed": invalid_removed,
         "short_track_ids": sorted(short_track_ids),
         "short_track_removed": short_track_removed,
+        "car_only_removed": car_only_removed,
         "after_detections": after_detections,
         "detections_removed": before_detections - after_detections,
         "boxes_converted": converted,
+        "classes_before_car_filter": dict(sorted(classes_before.items())),
         "point_drop_examples": point_drop_examples,
         "track_lifecycles_after_point_filter": {
             str(track_id): length

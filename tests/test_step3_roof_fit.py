@@ -1,0 +1,145 @@
+import unittest
+
+import numpy as np
+
+from geometry.car_box_fit import (
+    CarBoxFitConfig,
+    _fit_z_boundaries,
+    _roof_evidence,
+)
+
+
+def roof_patch(z: float, x_offset: float = 0.0) -> np.ndarray:
+    return np.asarray([
+        [x + x_offset, y, z + dz]
+        for x in (-0.70, -0.35, 0.0, 0.35, 0.70)
+        for y in (-0.30, 0.0, 0.30)
+        for dz in (-0.015, 0.0, 0.015)
+    ], dtype=np.float64)
+
+
+class BottomUpRoofEvidenceTest(unittest.TestCase):
+    config = CarBoxFitConfig()
+    bottom = 0.25
+    box = [0.0, 0.0, 1.45, 4.4, 2.0, 2.4, 0.0]
+
+    def test_continuous_roof_wins_over_high_narrow_branch(self):
+        roof = roof_patch(1.75)
+        branch = np.asarray([
+            [x, y, 2.55 + dz]
+            for x in (-0.15, 0.0, 0.15)
+            for y in (-0.04, 0.04)
+            for dz in (-0.02, 0.02)
+        ], dtype=np.float64)
+
+        roof_z, support, detail = _roof_evidence(
+            np.vstack((roof, branch)), self.box, self.bottom, self.config)
+
+        self.assertIsNotNone(roof_z)
+        self.assertLess(abs(float(roof_z) - 1.765), 0.02)
+        self.assertGreaterEqual(support, self.config.roof_min_points)
+        self.assertEqual(detail["scan_direction"], "bottom_up")
+        self.assertEqual(detail["scan_start"], self.bottom)
+        self.assertTrue(detail["roof_gap_reached"])
+        self.assertTrue(detail["shape"]["center_covered"])
+
+    def test_patch_outside_footprint_center_is_rejected(self):
+        roof_z, support, detail = _roof_evidence(
+            roof_patch(1.75, x_offset=1.25), self.box, self.bottom,
+            self.config)
+
+        self.assertIsNone(roof_z)
+        self.assertEqual(support, 0)
+        self.assertEqual(detail["rejected_reason"],
+                         "no_continuous_roof_section")
+
+    def test_single_sparse_high_layer_is_not_a_roof(self):
+        sparse = np.asarray([
+            [x, y, 2.30 + dz]
+            for x in (-0.9, 0.9)
+            for y in (-0.45, 0.45)
+            for dz in (-0.005, 0.005)
+        ], dtype=np.float64)
+
+        roof_z, support, detail = _roof_evidence(
+            sparse, self.box, self.bottom, self.config)
+
+        self.assertIsNone(roof_z)
+        self.assertEqual(support, 0)
+        self.assertIn(detail["rejected_reason"], {
+            "no_continuous_roof_section",
+            "roof_section_not_vertically_continuous",
+        })
+
+    def test_two_side_spans_with_empty_center_are_not_a_roof(self):
+        # The two patches have enough total span and grid connectivity to pass
+        # the old envelope check, but the box center contains no return.
+        side_patches = np.asarray([
+            [x, y, 2.30 + dz]
+            for x in (-1.00, -0.75, 0.75, 1.00)
+            for y in (-0.35, 0.35)
+            for dz in (-0.005, 0.005)
+        ], dtype=np.float64)
+
+        roof_z, support, detail = _roof_evidence(
+            side_patches, self.box, self.bottom, self.config)
+
+        self.assertIsNone(roof_z)
+        self.assertEqual(support, 0)
+        self.assertEqual(detail["rejected_reason"],
+                         "no_continuous_roof_section")
+
+
+class ZBoundaryFallbackTest(unittest.TestCase):
+    config = CarBoxFitConfig(z_min_center_change=0.0)
+    track_height = 1.60
+
+    @staticmethod
+    def item(ground_z=None, ground_points=0, roof_z=None, roof_points=0):
+        return {
+            "det": {"box_lidar": [0.0, 0.0, 1.50, 4.4, 2.0, 2.4, 0.0]},
+            "ground_z": ground_z,
+            "ground_points": ground_points,
+            "roof_z": roof_z,
+            "roof_points": roof_points,
+        }
+
+    def test_both_reasonable_boundaries_are_used_directly(self):
+        fit_z, height, mode = _fit_z_boundaries(
+            self.item(0.20, 18, 1.70, 6), self.track_height, self.config)
+        self.assertEqual(mode, "both")
+        self.assertAlmostEqual(height, 1.50)
+        self.assertAlmostEqual(fit_z, 0.99)
+
+    def test_unreasonable_pair_keeps_ground_and_uses_track_height(self):
+        fit_z, height, mode = _fit_z_boundaries(
+            self.item(0.20, 18, 3.00, 6), self.track_height, self.config)
+        self.assertEqual(mode, "ground_prior")
+        self.assertAlmostEqual(height, self.track_height)
+        self.assertAlmostEqual(fit_z, 1.04)
+
+    def test_ground_only_keeps_ground_and_uses_track_height(self):
+        fit_z, height, mode = _fit_z_boundaries(
+            self.item(0.20, 18), self.track_height, self.config)
+        self.assertEqual(mode, "ground")
+        self.assertAlmostEqual(height, self.track_height)
+        self.assertAlmostEqual(fit_z, 1.04)
+
+    def test_roof_only_keeps_roof_and_uses_track_height(self):
+        fit_z, height, mode = _fit_z_boundaries(
+            self.item(roof_z=1.70, roof_points=6),
+            self.track_height, self.config)
+        self.assertEqual(mode, "roof_downward")
+        self.assertAlmostEqual(height, self.track_height)
+        self.assertAlmostEqual(fit_z, 0.94)
+
+    def test_no_boundaries_keeps_center_and_uses_track_height(self):
+        fit_z, height, mode = _fit_z_boundaries(
+            self.item(), self.track_height, self.config)
+        self.assertEqual(mode, "raw_fallback")
+        self.assertAlmostEqual(height, self.track_height)
+        self.assertAlmostEqual(fit_z, 1.50)
+
+
+if __name__ == "__main__":
+    unittest.main()

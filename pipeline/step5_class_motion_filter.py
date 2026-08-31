@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Step 5: final sparse/short-track filtering and box-frame conversion.
+"""Step 5: final filtering, Car-only selection, and box-frame conversion.
 
 Point counts are evaluated in the original ``lidar_top`` cloud.  Kept boxes
-are converted to ``base_link`` after filtering; the point-cloud files are not
-rewritten.
+are restricted to the canonical ``Car`` class and converted to ``base_link``
+after filtering; the point-cloud files are not rewritten.
 """
 
 from __future__ import annotations
@@ -21,15 +21,15 @@ from filtering.final_filter import FinalFilterConfig, apply_final_filter
 from tracking import tracker_conservative as tracking
 
 
-def run(step4_json: Path, clip: Path, out_json: Path,
+def run(step3_json: Path, clip: Path, out_json: Path,
         out_clip: Path | None, diagnostics_path: Path,
         config: FinalFilterConfig = FinalFilterConfig()
         ) -> dict:
-    frames = json.loads(step4_json.read_text(encoding="utf-8"))
+    frames = json.loads(step3_json.read_text(encoding="utf-8"))
     coords = tracking.CoordinateProvider(Path(clip))
     output, result = apply_final_filter(frames, Path(clip), coords, config)
     result.update({
-        "source_step4_json": str(step4_json.resolve()),
+        "source_step3_json": str(step3_json.resolve()),
         "source_clip": str(Path(clip).resolve()),
     })
     out_json.parent.mkdir(parents=True, exist_ok=True)
@@ -48,7 +48,7 @@ def run(step4_json: Path, clip: Path, out_json: Path,
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--step4-json", type=Path, required=True)
+    parser.add_argument("--step3-json", type=Path, required=True)
     parser.add_argument("--clip", type=Path, required=True)
     parser.add_argument("--out-json", type=Path, required=True)
     parser.add_argument("--out-clip", type=Path)
@@ -64,13 +64,14 @@ def main() -> None:
     )
     diagnostics_path = args.diagnostics or args.out_json.with_name(
         args.out_json.stem + "_diagnostics.json")
-    result = run(args.step4_json, args.clip, args.out_json, args.out_clip,
+    result = run(args.step3_json, args.clip, args.out_json, args.out_clip,
                  diagnostics_path, config)
     print(json.dumps({
         "before_detections": result["before_detections"],
         "after_detections": result["after_detections"],
         "point_filter_removed": result["point_filter_removed"],
         "short_track_removed": result["short_track_removed"],
+        "car_only_removed": result["car_only_removed"],
         "boxes_converted": result["boxes_converted"],
         "labels": result.get("labels"),
     }, ensure_ascii=False, indent=2))

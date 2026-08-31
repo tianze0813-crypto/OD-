@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Step 6: optionally keep only Car labels after step 5."""
+"""Legacy Step 6: keep only Car labels after a step-5 result."""
 
 from __future__ import annotations
 

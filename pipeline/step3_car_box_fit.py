@@ -61,6 +61,7 @@ def main() -> None:
         "both_side_boxes", "single_side_boxes", "unchanged_xy_boxes",
         "size_smoothed_boxes",
         "z_both_boxes", "z_ground_boxes", "z_roof_boxes", "z_fallback_boxes",
+        "roof_evidence_boxes", "roof_rejections",
         "ground_adjusted_boxes", "roof_adjusted_boxes", "final_detections",
         "invariant_check", "labels")}, ensure_ascii=False, indent=2))
 

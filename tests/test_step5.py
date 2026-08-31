@@ -121,7 +121,7 @@ class Step5FinalFilterTest(unittest.TestCase):
     @staticmethod
     def _det(track_id: int, x: float) -> dict:
         return {
-            "class_name": "Truck" if track_id == 2 else "Pedestrian",
+            "class_name": "Truck" if track_id == 2 else "Car",
             "score": 0.8,
             "track_id": track_id,
             "box_lidar": [x, 0.0, 0.0, 4.0, 2.0, 2.0, 0.0],
@@ -158,6 +158,7 @@ class Step5FinalFilterTest(unittest.TestCase):
 
         self.assertEqual(stats["point_filter_removed"], 0)
         self.assertEqual(stats["short_track_removed"], 3)
+        self.assertEqual(stats["car_only_removed"], 0)
         self.assertEqual(stats["boxes_converted"], 4)
         self.assertEqual(
             [d["track_id"] for f in output for d in f["detections"]],
@@ -182,6 +183,40 @@ class Step5FinalFilterTest(unittest.TestCase):
             output, stats = apply_final_filter(frames, root, coords)
         self.assertEqual(output[0]["detections"], [])
         self.assertEqual(stats["point_filter_removed"], 1)
+
+    def test_car_only_is_always_applied_after_other_filters(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            coords = self._clip(root)
+            frames = []
+            for frame_index in range(4):
+                frame_id = str(frame_index)
+                points = np.asarray(
+                    [[0.1 * i, 0.0, 0.0, 1.0] for i in range(6)]
+                    + [[10.0 + 0.1 * i, 0.0, 0.0, 1.0]
+                       for i in range(6)], dtype=np.float32)
+                points.tofile(root / "lidar" / "lidar_top" / f"{frame_id}.bin")
+                frames.append({
+                    "frame_id": frame_id,
+                    "num_points": len(points),
+                    "num_detections": 2,
+                    "detections": [
+                        self._det(1, 0.0),
+                        {
+                            "class_name": "Cyclist", "score": 0.8,
+                            "track_id": 2,
+                            "box_lidar": [10.0, 0.0, 0.0, 4.0, 2.0, 2.0, 0.0],
+                        },
+                    ],
+                })
+            output, stats = apply_final_filter(frames, root, coords)
+
+        self.assertEqual(stats["point_filter_removed"], 0)
+        self.assertEqual(stats["short_track_removed"], 0)
+        self.assertEqual(stats["car_only_removed"], 4)
+        self.assertEqual(
+            [d["track_id"] for f in output for d in f["detections"]],
+            [1, 1, 1, 1])
 
     def test_box_conversion_rotates_heading_into_base_link(self):
         angle = np.pi / 2.0

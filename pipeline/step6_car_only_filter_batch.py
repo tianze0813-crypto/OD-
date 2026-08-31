@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Step 6 batch: keep only Car labels over step-5 clips."""
+"""Legacy Step 6 batch: keep only Car labels over step-5 clips."""
 
 from __future__ import annotations
 

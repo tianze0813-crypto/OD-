@@ -106,9 +106,9 @@ def main():
                         help="step5: remove boxes containing this many points or fewer")
     parser.add_argument("--short-track-max-frames", type=int, default=3,
                         help="step5: remove tracks observed in this many frames or fewer")
+    # Kept as a hidden compatibility flag; Step5 now always applies Car-only.
     parser.add_argument("--car-only", "--step6-car-only", dest="car_only",
-                        action="store_true",
-                        help="step6: final labels keep only Car")
+                        action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--score-thresh", type=float, default=0.3)
     parser.add_argument("--drop-vis-below", type=float, default=0.05)
     args = parser.parse_args()
@@ -123,11 +123,8 @@ def main():
         step1_root = tmp_root / "step1"
         step2_root = tmp_root / "step2"
         step3_root = tmp_root / "step3"
-        step4_root = tmp_root / "step4"
         step5_root = tmp_root / "step5"
-        step6_root = tmp_root / "step6"
-        for path in (step1_root, step2_root, step3_root,
-                     step4_root, step5_root, step6_root):
+        for path in (step1_root, step2_root, step3_root, step5_root):
             path.mkdir(parents=True, exist_ok=True)
 
         for index, clip in enumerate(clips, 1):
@@ -168,36 +165,20 @@ def main():
                  "--clip", clip, "--out-json", step3_json,
                  "--diagnostics", step3_diag])
 
-            step4_json = step4_root / f"{base}_step4.json"
-            step4_diag = step4_root / f"{base}_step4_diagnostics.json"
-            run([args.post_python,
-                 ROOT / "pipeline" / "step4_truck_size_interp_overlap.py",
-                 "--step3-json", step3_json, "--clip", clip,
-                 "--out-json", step4_json, "--diagnostics", step4_diag])
-
             step5_json = step5_root / f"{base}_step5.json"
             step5_diag = step5_root / f"{base}_step5_diagnostics.json"
             step5_cmd = [
                 args.post_python,
                 ROOT / "pipeline" / "step5_class_motion_filter.py",
-                "--step4-json", step4_json, "--clip", clip,
+                "--step3-json", step3_json, "--clip", clip,
                 "--out-json", step5_json, "--diagnostics", step5_diag,
                 "--sparsity-max-points", args.sparsity_max_points,
                 "--short-track-max-frames", args.short_track_max_frames,
             ]
             run(step5_cmd)
 
+            # Step5 already enforces the final Car-only policy.
             final_json = step5_json
-            if args.car_only:
-                step6_json = step6_root / f"{base}_step6.json"
-                step6_diag = step6_root / f"{base}_step6_diagnostics.json"
-                run([
-                    args.post_python,
-                    ROOT / "pipeline" / "step6_car_only_filter.py",
-                    "--step5-json", step5_json, "--clip", clip,
-                    "--out-json", step6_json, "--diagnostics", step6_diag,
-                ])
-                final_json = step6_json
 
             # No intermediate clip is stored.  The input clip itself is
             # renamed to <clip>_pre and only label/ is added.
@@ -220,7 +201,7 @@ def main():
                 "input_clip": str(clip),
                 "final_clip": str(final_clip),
                 "labels": labels,
-                "car_only": args.car_only,
+                "car_only": True,
                 "sust_export": str(sust_dest) if sust_dest else None,
             })
 

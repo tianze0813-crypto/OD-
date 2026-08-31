@@ -68,6 +68,8 @@ def main() -> None:
             "z_ground_boxes": result.get("z_ground_boxes"),
             "z_roof_boxes": result.get("z_roof_boxes"),
             "z_fallback_boxes": result.get("z_fallback_boxes"),
+            "roof_evidence_boxes": result.get("roof_evidence_boxes"),
+            "roof_rejections": result.get("roof_rejections"),
             "ground_adjusted_boxes": result["ground_adjusted_boxes"],
             "roof_adjusted_boxes": result["roof_adjusted_boxes"],
             "invariant_check": result["invariant_check"],
