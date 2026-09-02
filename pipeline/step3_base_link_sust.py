@@ -24,9 +24,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from geometry.box_geometry import GeometryConfig, apply_geometry_legacy
-from geometry.car_box_fit import CarBoxFitConfig, apply_car_box_fit
-from pipeline import step2_identity_class_filter_yaw as step2
+from pipeline import step2_5_class_correction as step2_5
+from pipeline import step2_identity
+from pipeline import step3_refinement
 from tracking import tracker_conservative as tracking
 
 
@@ -127,22 +127,22 @@ def run_clip(clip: Path, output_root: Path, overwrite: bool = False) -> Dict[str
         input_json = temp_root / "input.json"
         step2_json = temp_root / "step2.json"
         step2_diagnostics_path = temp_root / "step2_diagnostics.json"
+        step2_5_json = temp_root / "step2_5.json"
+        step2_5_diagnostics_path = temp_root / "step2_5_diagnostics.json"
+        step3_json = temp_root / "step3.json"
+        step3_diagnostics_path = temp_root / "step3_diagnostics.json"
         input_json.write_text(
             json.dumps(source_frames, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8")
-        step2_diagnostics = step2.run(
+        step2_diagnostics = step2_identity.run(
             input_json, clip, step2_json, None, step2_diagnostics_path)
-        frames = json.loads(step2_json.read_text(encoding="utf-8"))
-        generic, generic_diagnostics = apply_geometry_legacy(
-            frames, coords, clip,
-            step2_diagnostics["tracking"],
-            step2_diagnostics["static_yaw_stabilization"], GeometryConfig())
-        fitted, diagnostics = apply_car_box_fit(
-            generic, coords, clip,
-            step2_diagnostics["tracking"],
-            step2_diagnostics["static_yaw_stabilization"],
-            CarBoxFitConfig())
-        diagnostics["multiclass_geometry"] = generic_diagnostics
+        step2_5.run(step2_json, step2_diagnostics_path, clip,
+                    step2_5_json, None, step2_5_diagnostics_path)
+        diagnostics = step3_refinement.run(
+            step2_5_json, step2_5_diagnostics_path, clip, step3_json,
+            None, step3_diagnostics_path)
+        step2_5_frames = json.loads(step2_5_json.read_text(encoding="utf-8"))
+        fitted = json.loads(step3_json.read_text(encoding="utf-8"))
 
     destination = output_root / clip.name
     if destination.exists():
@@ -152,24 +152,26 @@ def run_clip(clip: Path, output_root: Path, overwrite: bool = False) -> Dict[str
         shutil.rmtree(destination)
     shutil.copytree(clip, destination, ignore=shutil.ignore_patterns("label"))
     labels = _write_sust_labels(fitted, destination, coords)
+    car_stats = diagnostics.get("car_refinement", {})
     return {
         "input_clip": str(clip.resolve()),
         "output_clip": str(destination.resolve()),
         "input_frames": len(source_frames),
         "input_detections": sum(len(f["detections"]) for f in source_frames),
-        "step2_detections": sum(len(f.get("detections", [])) for f in frames),
+        "step2_detections": step2_diagnostics["final_detections"],
+        "step2_5_detections": sum(len(f.get("detections", [])) for f in step2_5_frames),
         "output_labels": labels,
         "car_boxes": diagnostics["car_boxes"],
-        "roof_evidence_boxes": diagnostics["roof_evidence_boxes"],
-        "roof_rejections": diagnostics["roof_rejections"],
-        "ground_temporal_repaired_boxes": diagnostics.get(
+        "roof_evidence_boxes": car_stats.get("roof_evidence_boxes", 0),
+        "roof_rejections": car_stats.get("roof_rejections", {}),
+        "ground_temporal_repaired_boxes": car_stats.get(
             "ground_temporal_repaired_boxes", 0),
         "z_modes": {
-            key: diagnostics[key]
+            key: car_stats.get(key, 0)
             for key in ("z_both_boxes", "z_ground_boxes", "z_roof_boxes",
                         "z_fallback_boxes")
         },
-        "invariant_check": diagnostics["invariant_check"],
+        "invariant_check": car_stats.get("invariant_check"),
     }
 
 

@@ -441,8 +441,9 @@ class ConservativeTracker:
                        self.dynamic_base_gate + self.dynamic_max_velocity * max(dt - 0.1, 0.0))
             if dxy > gate:
                 return 1e9, "distance_gate"
-        if not class_compatible(obs.detection.get("class_name", ""), tr.class_name):
-            return 1e9, "class_gate"
+        # Identity association is deliberately class-blind.  The detector can
+        # flicker between the five semantic labels, while position, motion,
+        # size and IoU provide the stable evidence needed for annotation IDs.
         scale_delta = float(np.linalg.norm(obs.size - tr.size) / max(float(np.linalg.norm(tr.size)), 1.0))
         if scale_delta > 1.35 and dxy > 0.75:
             return 1e9, "size_gate"
@@ -509,7 +510,7 @@ class ConservativeTracker:
         return matches, used_obs
 
     def _maybe_lock_static(self, tr: Track) -> None:
-        if tr.is_static or tr.class_name not in STATIC_CLASSES or len(tr.observations) < self.min_static_hits:
+        if tr.is_static or len(tr.observations) < self.min_static_hits:
             return
         times = [o.timestamp for o in tr.observations]
         duration = (max(times) - min(times)) / 1e9
@@ -623,8 +624,6 @@ class ConservativeTracker:
                 start_obs = start.observations[0]
                 gap = (start_obs.timestamp - end_obs.timestamp) / 1e9
                 if gap <= 0.0 or gap > max_gap_sec:
-                    continue
-                if not class_compatible(end.class_name, start.class_name):
                     continue
                 vs = self._endpoint_velocity(start.observations, at_end=False)
                 pred_fwd = end_obs.world[:2] + ve * gap

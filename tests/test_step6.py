@@ -3,7 +3,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from pipeline.step6_car_only_filter import run
+from deprecated.pipeline.step6_car_only_filter import run
 from filtering.car_only_filter import apply_car_only_filter
 from tracking.tracker_conservative import box_to_label
 

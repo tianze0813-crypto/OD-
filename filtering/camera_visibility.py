@@ -204,8 +204,12 @@ def compute_clip_visibility(out_frames, clip_root, args):
 
 
 def filter_raw_frames(frames, clip_root, drop_below, occl_tol=0.3):
-    """模型推理后的原始检测 JSON 帧列表：计算可见度并过滤被遮挡>=95% 的 box。
-    原地修改 frames（附加 visibility 字段、删除被过滤的检测），返回统计。"""
+    """Attach visibility metadata and optionally drop very low-visibility boxes.
+
+    The current Step1 caller passes ``drop_below=0`` so identity tracking sees
+    every model detection.  Callers that explicitly pass a positive threshold
+    retain the legacy in-place filtering behavior.
+    """
     cams = load_clip_cameras(clip_root)
     stats = {"frames": 0, "checked": 0, "tag1": 0, "tag2": 0,
              "dropped": 0, "cameras": len(cams)}

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Step 1: run lidar-top inference and camera-visibility pre-filtering.
+"""Step 1: run lidar-top inference and attach camera visibility metadata.
 
 Input is an unlabelled SUST clip (``lidar/lidar_top/*.bin`` plus
 ``transforms/``).  Output is the ``*_raw.json`` consumed by step 2.
@@ -78,12 +78,14 @@ def run_inference(clip: Path, args) -> Path:
 
     if not args.no_visibility_check:
         frames = json.loads(raw_json.read_text(encoding="utf-8"))
+        # Visibility is metadata at this stage.  Identity assignment must see
+        # every detector output; both hard-filter passes happen after Step2.
         stats = camera_visibility.filter_raw_frames(
-            frames, clip, args.drop_vis_below, args.vis_occl_tol)
+            frames, clip, 0.0, args.vis_occl_tol)
         raw_json.write_text(
             json.dumps(frames, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8")
-        print(f"visibility filter: checked={stats['checked']} "
+        print(f"visibility metadata: checked={stats['checked']} "
               f"dropped={stats['dropped']}", flush=True)
     return raw_json
 

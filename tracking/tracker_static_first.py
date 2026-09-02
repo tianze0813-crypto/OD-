@@ -2,10 +2,11 @@
 """Static-first, clip-local BEV identity association.
 
 Tracking is deliberately split into two independent passes. Persistent
-Vehicle/Car/Truck/Bus positions are discovered from the full clip in world
-coordinates before any ID exists. Observations assigned to those positions
-receive one immutable slot identity. Every remaining observation is handled
-by the ordinary motion tracker from :mod:`tracker_conservative`.
+positions are discovered from the full clip in world coordinates before any
+ID exists, without consulting semantic class labels. Observations assigned to
+those positions receive one immutable slot identity. Every remaining
+observation is handled by the ordinary motion tracker from
+:mod:`tracker_conservative`.
 
 The identity stage only adds ``track_id``. It never changes a raw box, class,
 score, or frame count, and never creates a box for a missed detection.
@@ -174,9 +175,10 @@ class StaticFirstTracker:
                 ))
         self.diagnostics["frames"] = len(frames)
         self.diagnostics["detections"] = sum(len(x) for x in by_frame)
+        # Static evidence is geometry-driven.  Do not use semantic labels to
+        # decide which detections may contribute to an identity or slot.
         self.diagnostics["static_observations"] = sum(
-            1 for items in by_frame for o in items
-            if o.detection.get("class_name") in STATIC_CLASSES)
+            len(items) for items in by_frame)
         return by_frame
 
     @staticmethod
@@ -296,10 +298,7 @@ class StaticFirstTracker:
 
     def _discover_candidates(self, frames: Sequence[Dict[str, Any]],
                              by_frame: Sequence[Sequence[tracking.Observation]]) -> List[SlotCandidate]:
-        observations = [
-            o for items in by_frame for o in items
-            if o.detection.get("class_name") in STATIC_CLASSES
-        ]
+        observations = [o for items in by_frame for o in items]
         if not observations:
             return []
         xy = np.asarray([o.world[:2] for o in observations], dtype=np.float64)
@@ -310,10 +309,6 @@ class StaticFirstTracker:
             by_seen_frame: Dict[int, int] = {}
             for member_index in neighbor_ids:
                 obs = observations[member_index]
-                if not tracking.class_compatible(
-                        obs.detection.get("class_name", ""),
-                        seed.detection.get("class_name", "")):
-                    continue
                 if not size_compatible(obs.size, seed.size):
                     continue
                 if tracking.angle_distance(obs.yaw, seed.yaw, modulo_pi=True) > self.slot_yaw_gate:
@@ -331,10 +326,6 @@ class StaticFirstTracker:
             by_seen_frame = {}
             for member_index in refined_ids:
                 obs = observations[member_index]
-                if not tracking.class_compatible(
-                        obs.detection.get("class_name", ""),
-                        seed.detection.get("class_name", "")):
-                    continue
                 if not size_compatible(obs.size, seed.size):
                     continue
                 if tracking.angle_distance(obs.yaw, seed.yaw, modulo_pi=True) > self.slot_yaw_gate:
@@ -493,9 +484,6 @@ class StaticFirstTracker:
         return slots
 
     def _slot_cost(self, obs: tracking.Observation, slot: StaticSlot) -> float:
-        class_name = obs.detection.get("class_name", "")
-        if class_name not in STATIC_CLASSES or not tracking.class_compatible(class_name, slot.class_name):
-            return 1e9
         distance = float(np.linalg.norm(obs.world[:2] - slot.center))
         if distance > self.slot_match_radius:
             return 1e9
@@ -517,8 +505,7 @@ class StaticFirstTracker:
         assigned_detection_ids: set[int] = set()
         for frame_index, observations in enumerate(by_frame):
             eligible = [o for o in observations
-                        if (o.detection.get("class_name") in STATIC_CLASSES
-                            and o.detection.get("track_id") is None)]
+                        if o.detection.get("track_id") is None]
             if not eligible or not self.slots:
                 continue
             costs = np.full((len(eligible), len(self.slots)), 1e9, dtype=np.float64)
@@ -606,8 +593,6 @@ class StaticFirstTracker:
                 cross = abs(float(np.dot(delta, cross_axis)))
                 if (along > self.duplicate_slot_along_gate
                         or cross > self.duplicate_slot_cross_gate):
-                    continue
-                if not tracking.class_compatible(left.class_name, right.class_name):
                     continue
                 if (tracking.angle_distance(left.yaw, right.yaw, modulo_pi=True)
                         > self.slot_yaw_gate):
@@ -767,10 +752,6 @@ class StaticFirstTracker:
                 gap = (start.timestamp - end.timestamp) / 1e9
                 if gap <= 0.0 or gap > 1.2 or self._near_parking_region(start.world):
                     continue
-                if not tracking.class_compatible(
-                        end.detection.get("class_name", ""),
-                        start.detection.get("class_name", "")):
-                    continue
                 size_delta = float(np.linalg.norm(end.size - start.size)) / max(
                     float(np.linalg.norm(end.size)), 1.0)
                 if size_delta > 0.45:
@@ -842,10 +823,7 @@ class StaticFirstTracker:
         """Anisotropic row gate: strict between spaces, tolerant across them."""
         if slot.row_axis is None:
             return None
-        class_name = obs.detection.get("class_name", "")
-        if (class_name not in STATIC_CLASSES
-                or not tracking.class_compatible(class_name, slot.class_name)
-                or not size_compatible(obs.size, slot.size, max_delta=0.8)):
+        if not size_compatible(obs.size, slot.size, max_delta=0.8):
             return None
         yaw_delta = tracking.angle_distance(obs.yaw, slot.yaw, modulo_pi=True)
         if yaw_delta > 0.70:
@@ -950,7 +928,7 @@ class StaticFirstTracker:
                 if tid in static_ids:
                     claimed.add(tid)
                     continue
-                if det.get("class_name") not in STATIC_CLASSES or not tracking.finite_box(det):
+                if not tracking.finite_box(det):
                     continue
                 box = det["box_lidar"]
                 dynamic_obs.append(tracking.Observation(
@@ -1380,6 +1358,7 @@ class StaticFirstTracker:
         self.diagnostics["slot_details"] = [{
             "slot_id": s.slot_id,
             "track_id": s.track_id,
+            "class_name": s.class_name,
             "center": [round(float(x), 4) for x in s.center],
             "yaw": round(float(s.yaw), 5),
             "size": [round(float(x), 4) for x in s.size],

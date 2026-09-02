@@ -32,15 +32,16 @@
 
 ```text
 原始 clip
-  -> step1  lidar 推理 + 相机可见度预过滤
-  -> step2  identity / class / hard-filter / yaw
-  -> step3  多类别轨迹几何稳定 + Car 点云 XY/Z 精拟合
+  -> step1  lidar 推理 + 相机可见度元数据
+  -> step2  类别无关 identity + 第一遍 hard-filter / 去重
+  -> step2.5 轨迹类别修正 + 第二遍 hard-filter / 短轨迹处理
+  -> step3  公共 yaw + 按类别路由的几何精修（当前仅 Car）
   -> final 五类规范化 + box 转换到 base_link
   -> SUST clip
 
 模型输出类别固定为：`Car`、`Truck`、`Bus`、`Pedestrian`、
-`Nonmotorized_vehicle`。类别在 Step2 完成 ID 后按轨迹多数票稳定，不再按
-box 长度把 Car/Truck/Bus 互相改标。
+`Nonmotorized_vehicle`。跟踪阶段不使用类别约束；类别在 Step2.5 完成 ID 后按轨迹多数票
+稳定，不再按 box 长度把 Car/Truck/Bus 互相改标。
 ```
 
 ## 坐标系与 base_link 约定
@@ -153,7 +154,7 @@ Step2--Step3 的 `lidar_top` 点云计算；否则点云拟合、跟踪、yaw �
 
 ## 分步运行
 
-### Step 1：lidar 推理 + 可见度预过滤
+### Step 1：lidar 推理 + 可见度元数据
 
 使用 OpenPCDet 环境：
 
@@ -162,19 +163,20 @@ Step2--Step3 的 `lidar_top` 点云计算；否则点云拟合、跟踪、yaw �
   --clip /path/to/scene_clip
 ```
 
-输出：`work/step1_inference/<clip>_raw.json`。
+输出：`work/step1_inference/<clip>_raw.json`。此阶段只附加 visibility，不删除框；
+可见度硬过滤在 Step2 完成 ID 后执行。
 
 模型权重和配置文件均位于 `models/`，会随仓库一起跟踪。
 默认使用 `models/vn5_nuscenes_checkpoint_epoch_12.pth` 与
 `models/voxelnext_fiveclass_nuscenes_infer.yaml`；如部署环境不同，可通过
 `--cfg` 和 `--ckpt` 覆盖。
 
-### Step 2：identity / class / filter / yaw
+### Step 2：类别无关 identity + 第一遍硬过滤
 
 单条：
 
 ```bash
-/home/moga/miniconda3/envs/sustechpoints/bin/python pipeline/step2_identity_class_filter_yaw.py \
+/home/moga/miniconda3/envs/sustechpoints/bin/python pipeline/step2_identity.py \
   --in-json work/step1_inference/<clip>_raw.json \
   --clip /path/to/scene_clip \
   --out-json work/step2_identity/<clip>_step2.json \
@@ -184,39 +186,54 @@ Step2--Step3 的 `lidar_top` 点云计算；否则点云拟合、跟踪、yaw �
 批量：
 
 ```bash
-/home/moga/miniconda3/envs/sustechpoints/bin/python pipeline/step2_identity_class_filter_yaw_batch.py --overwrite
+/home/moga/miniconda3/envs/sustechpoints/bin/python pipeline/step2_identity_batch.py \
+  --clip-root /path/to/clips --overwrite
 ```
 
-Step2 保留分数、范围、可见度和短轨迹等基础标注过滤；类别使用五类模型结果，
-按 track 多数票稳定，不执行旧的 Vehicle/Car 尺寸重分类。
+Step2 先完成类别无关 ID，再执行第一遍分数、范围、可见度、点数等硬过滤和同中心去重。
+不做类别修正、yaw 或短轨迹删除。
 
-### Step 3：多类别几何与 Car 精拟合
+### Step 2.5：类别修正 + 第二遍硬过滤
 
 ```bash
-/home/moga/miniconda3/envs/sustechpoints/bin/python pipeline/step3_car_box_fit.py \
+/home/moga/miniconda3/envs/sustechpoints/bin/python pipeline/step2_5_class_correction.py \
   --step2-json work/step2_identity/<clip>_step2.json \
   --step2-diagnostics work/step2_identity/<clip>_step2_diagnostics.json \
   --clip /path/to/scene_clip \
-  --out-json work/step3_car_box_fit/<clip>_step3.json \
-  --out-clip work/step3_car_box_fit/data/<clip>_step3
+  --out-json work/step2_5_class_correction/<clip>_step2_5.json
+```
+
+Step2.5 只允许修改 `class_name`，按 track 多数票稳定五类语义，然后再次执行同一套
+硬过滤，最后删除生命周期不足的轨迹。`track_id`、box 和帧结构均受保护。
+
+### Step 3：公共 yaw + 类别路由精修
+
+```bash
+/home/moga/miniconda3/envs/sustechpoints/bin/python pipeline/step3_refinement.py \
+  --step2-5-json work/step2_5_class_correction/<clip>_step2_5.json \
+  --step2-5-diagnostics work/step2_5_class_correction/<clip>_step2_5_diagnostics.json \
+  --clip /path/to/scene_clip \
+  --out-json work/step3_refinement/<clip>_step3.json \
+  --out-clip work/step3_refinement/data/<clip>_step3
 ```
 
 批量：
 
 ```bash
-/home/moga/miniconda3/envs/sustechpoints/bin/python pipeline/step3_car_box_fit_batch.py --overwrite
+/home/moga/miniconda3/envs/sustechpoints/bin/python pipeline/step3_refinement_batch.py \
+  --clip-root /path/to/clips --overwrite
 ```
 
 如需对已有 Step3 JSON 单独执行五类 final 适配：
 
 ```bash
 python pipeline/five_class_postprocess.py \
-  --input-json work/step3_car_box_fit/<clip>_step3.json \
+  --input-json work/step3_refinement/<clip>_step3.json \
   --clip /path/to/scene_clip \
   --output-json work/final/<clip>_final.json
 ```
 
-Step3 会先对五类轨迹完成保守几何稳定和静态轨迹尺寸平滑，再对 Car 使用
+Step3 先对所有类别执行公共 yaw；然后仅对 Car 使用
 经过验证的 shrink-only XY/地面/车顶拟合，并用最终 XY footprint
 重新裁点。车顶搜索从当前地面边界（无地面证据时从原 box 下边界）开始，以 `5cm`
 步长检查重叠的 `10cm` 水平截面。截面必须同时满足点数、长短轴跨度、中心覆盖、稳健
@@ -242,7 +259,8 @@ Step3 会先对五类轨迹完成保守几何稳定和静态轨迹尺寸平滑�
 
 ### 旧 Step 4/Step 5（兼容脚本）
 
-`pipeline/step4_*` 和 `pipeline/step5_*` 保留给旧 Car 流程回放，但不再由
+`deprecated/pipeline/step4_*`、`step5_*`、`step6_*` 以及旧 Step2/Step3
+保留给旧 Car 流程回放，但不再由
 `run_end_to_end.py` 调用。五类端到端 final 阶段不做尺寸改标、Car-only、
 点数或短链过滤，仅执行类别/box 校验和坐标转换。
 
@@ -260,15 +278,15 @@ Step3 会先对五类轨迹完成保守几何稳定和静态轨迹尺寸平滑�
 单条：
 
 ```bash
-/home/moga/miniconda3/envs/sustechpoints/bin/python pipeline/step4_car_size_filter.py \
-  --step3-json work/step3_car_box_fit/<clip>_step3.json \
+/home/moga/miniconda3/envs/sustechpoints/bin/python deprecated/pipeline/step4_car_size_filter.py \
+  --step3-json work/step3_refinement/<clip>_step3.json \
   --out-json work/step4_car_size_filter/<clip>_step4.json
 ```
 
 批量：
 
 ```bash
-/home/moga/miniconda3/envs/sustechpoints/bin/python pipeline/step4_car_size_filter_batch.py --overwrite
+/home/moga/miniconda3/envs/sustechpoints/bin/python deprecated/pipeline/step4_car_size_filter_batch.py --overwrite
 ```
 
 旧 Step5：最终过滤 + Car-only + box 转换到 base_link
@@ -290,9 +308,9 @@ Step3 会先对五类轨迹完成保守几何稳定和静态轨迹尺寸平滑�
 单条：
 
 ```bash
-/home/moga/miniconda3/envs/sustechpoints/bin/python pipeline/step5_class_motion_filter.py \
+/home/moga/miniconda3/envs/sustechpoints/bin/python deprecated/pipeline/step5_class_motion_filter.py \
   --step4-json work/step4_car_size_filter/<clip>_step4.json \
-  --clip work/step3_car_box_fit/data/<clip>_step3 \
+  --clip work/step3_refinement/data/<clip>_step3 \
   --out-json work/step5_class_motion_filter/<clip>_step5.json \
   --out-clip work/step5_class_motion_filter/data/<clip>_step5
 ```
@@ -307,7 +325,7 @@ Step3 会先对五类轨迹完成保守几何稳定和静态轨迹尺寸平滑�
 批量：
 
 ```bash
-/home/moga/miniconda3/envs/sustechpoints/bin/python pipeline/step5_class_motion_filter_batch.py --overwrite
+/home/moga/miniconda3/envs/sustechpoints/bin/python deprecated/pipeline/step5_class_motion_filter_batch.py --overwrite
 ```
 
 ### 已有 base_link 检测直接运行 Step3
@@ -334,7 +352,7 @@ yaw、track_id 或坐标。
 单条：
 
 ```bash
-/home/moga/miniconda3/envs/sustechpoints/bin/python pipeline/step6_car_only_filter.py \
+/home/moga/miniconda3/envs/sustechpoints/bin/python deprecated/pipeline/step6_car_only_filter.py \
   --step5-json work/step5_class_motion_filter/<clip>_step5.json \
   --clip work/step5_class_motion_filter/data/<clip>_step5 \
   --out-json work/step6_car_only_filter/<clip>_step6.json \
@@ -344,7 +362,7 @@ yaw、track_id 或坐标。
 批量：
 
 ```bash
-/home/moga/miniconda3/envs/sustechpoints/bin/python pipeline/step6_car_only_filter_batch.py --overwrite
+/home/moga/miniconda3/envs/sustechpoints/bin/python deprecated/pipeline/step6_car_only_filter_batch.py --overwrite
 ```
 
 ## 目录说明
@@ -355,8 +373,9 @@ filtering/       Step1/Step2 可见度与硬过滤，final 五类输出与坐标
 tracking/        保守跟踪器 + 静态优先跟踪器
 geometry/        Step2 yaw，Step3 多类别几何与 Car 地面/车顶精拟合
 inference/       Step1 OpenPCDet 推理脚本
-pipeline/        step1、step2、step3、step4、step5 主链路；step6 为兼容入口
-archive/         不再参与当前链路的旧版本/旧预览文件
+pipeline/        step1、step2、step2.5、step3 主链路；旧名称仅保留兼容转发
+deprecated/      旧 Step2/Step3/Step4/Step5/Step6 Car 链路
+deprecated/      不再参与当前链路的旧版本/旧预览文件
 tests/           当前链路的单元测试
 models/          推理配置与模型权重
 ```

@@ -183,13 +183,13 @@ class StaticFirstTrackerTest(unittest.TestCase):
         self.assertIn("slot_remains_occupied", {
             x["reason"] for x in coordination["rejected_departures"]})
 
-    def test_only_selected_vehicle_classes_enter_static_pass(self):
+    def test_static_pass_is_class_blind(self):
         rows = [[detection(0.0, 0.0), {
             "class_name": "Pedestrian", "score": 0.9,
             "box_lidar": [4.0, 0.0, 0.0, 0.8, 0.8, 1.7, 0.0],
         }] for _ in range(8)]
         _source, output, diagnostics = self.run_tracker(rows)
-        self.assertEqual(diagnostics["static_slots"], 1)
+        self.assertEqual(diagnostics["static_slots"], 2)
         vehicle_ids = {f["detections"][0]["track_id"] for f in output}
         pedestrian_ids = {f["detections"][1]["track_id"] for f in output}
         self.assertEqual(len(vehicle_ids), 1)

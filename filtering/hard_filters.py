@@ -72,6 +72,16 @@ def _in_annotation_range(box: Sequence[float], config: HardFilterConfig) -> bool
             and -config.range_front <= y <= config.range_rear)
 
 
+def _class_allowed(value: Any, allowed: Sequence[str]) -> bool:
+    """Accept model aliases while leaving class correction to Step2.5."""
+    raw = str(value or "").strip()
+    allowed_set = {str(item) for item in allowed}
+    if raw in allowed_set:
+        return True
+    canonical = tracking.canonical_class_name(raw)
+    return canonical is not None and canonical in allowed_set
+
+
 def apply_hard_filters(frames: List[Dict[str, Any]], clip: Path,
                        config: HardFilterConfig = HardFilterConfig()) -> Dict[str, Any]:
     """Apply the annotation contract before class pre-association.
@@ -117,7 +127,7 @@ def apply_hard_filters(frames: List[Dict[str, Any]], clip: Path,
                 class_name = str(det.get("class_name", ""))
                 if float(det.get("score", 0.0)) < config.score_threshold:
                     reasons.append("score")
-                if class_name not in config.keep_classes:
+                if not _class_allowed(class_name, config.keep_classes):
                     reasons.append("class_whitelist")
                 if not _in_annotation_range(box, config):
                     reasons.append("annotation_range")

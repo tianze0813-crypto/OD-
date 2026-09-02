@@ -124,9 +124,10 @@ def main():
         tmp_root = Path(tmp)
         step1_root = tmp_root / "step1"
         step2_root = tmp_root / "step2"
+        step2_5_root = tmp_root / "step2_5"
         step3_root = tmp_root / "step3"
         final_root = tmp_root / "final"
-        for path in (step1_root, step2_root, step3_root, final_root):
+        for path in (step1_root, step2_root, step2_5_root, step3_root, final_root):
             path.mkdir(parents=True, exist_ok=True)
 
         for index, clip in enumerate(clips, 1):
@@ -154,17 +155,33 @@ def main():
             step2_json = step2_root / f"{base}_step2.json"
             step2_diag = step2_root / f"{base}_step2_diagnostics.json"
             run([args.post_python,
-                 ROOT / "pipeline" / "step2_identity_class_filter_yaw.py",
+                 ROOT / "pipeline" / "step2_identity.py",
                  "--in-json", raw_json, "--clip", clip,
                  "--out-json", step2_json,
-                 "--diagnostics", step2_diag])
+                 "--diagnostics", step2_diag,
+                 "--score-threshold", args.score_thresh,
+                 "--visibility-min-ratio", args.drop_vis_below,
+                 "--sparsity-max-points", args.sparsity_max_points])
+
+            step2_5_json = step2_5_root / f"{base}_step2_5.json"
+            step2_5_diag = step2_5_root / f"{base}_step2_5_diagnostics.json"
+            run([args.post_python,
+                 ROOT / "pipeline" / "step2_5_class_correction.py",
+                 "--step2-json", step2_json,
+                 "--step2-diagnostics", step2_diag,
+                 "--clip", clip, "--out-json", step2_5_json,
+                 "--diagnostics", step2_5_diag,
+                 "--score-threshold", args.score_thresh,
+                 "--visibility-min-ratio", args.drop_vis_below,
+                 "--sparsity-max-points", args.sparsity_max_points,
+                 "--min-lifecycle", args.short_track_max_frames])
 
             step3_json = step3_root / f"{base}_step3.json"
             step3_diag = step3_root / f"{base}_step3_diagnostics.json"
             run([args.post_python,
-                 ROOT / "pipeline" / "step3_car_box_fit.py",
-                 "--step2-json", step2_json,
-                 "--step2-diagnostics", step2_diag,
+                 ROOT / "pipeline" / "step3_refinement.py",
+                 "--step2-5-json", step2_5_json,
+                 "--step2-5-diagnostics", step2_5_diag,
                  "--clip", clip, "--out-json", step3_json,
                  "--diagnostics", step3_diag])
 

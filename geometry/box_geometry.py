@@ -584,6 +584,7 @@ def apply_geometry_legacy(
         clip: Path, tracking_diagnostics: Mapping[str, Any],
         static_yaw_diagnostics: Mapping[str, Any],
         config: GeometryConfig = GeometryConfig(),
+        classes: Sequence[str] | None = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     output = copy.deepcopy(list(frames))
     tracks = _build_tracks(output, coords)
@@ -603,9 +604,16 @@ def apply_geometry_legacy(
     static_snap_boxes = 0
     static_snap_face_axes = 0
     fallback_tracks = 0
+    processed_boxes = 0
 
+    allowed_classes = None if classes is None else {str(value) for value in classes}
+    skipped_tracks = 0
     for track_id, items in sorted(tracks.items()):
         class_name = _class_name(items)
+        if allowed_classes is not None and class_name not in allowed_classes:
+            skipped_tracks += 1
+            continue
+        processed_boxes += len(items)
         cutoff = cutoffs.get(track_id, math.inf)
         initial_sizes = np.asarray([_physical_size(item["det"]["box_lidar"])
                                     for item in items])
@@ -847,7 +855,10 @@ def apply_geometry_legacy(
             "no_interpolation": True,
         },
         "tracks": len(tracks),
-        "boxes": sum(len(items) for items in tracks.values()),
+        "tracks_refined": len(tracks) - skipped_tracks,
+        "tracks_skipped": skipped_tracks,
+        "class_scope": (None if allowed_classes is None else sorted(allowed_classes)),
+        "boxes": processed_boxes,
         "static_boxes": static_boxes,
         "dynamic_boxes": dynamic_boxes,
         "point_adjusted_boxes": point_boxes,
