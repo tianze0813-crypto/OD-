@@ -16,6 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from classification.class_refinement import (
     ClassRefinementConfig,
+    finalize_model_track_classes,
     finalize_track_classes,
     preassociate_and_unify,
 )
@@ -65,7 +66,8 @@ def run(
         hard_filter_config: HardFilterConfig = HardFilterConfig(),
         class_config: ClassRefinementConfig = ClassRefinementConfig(),
         min_lifecycle: int = 4,
-        same_center_gate: float = 0.35) -> Dict[str, Any]:
+        same_center_gate: float = 0.35,
+        preserve_model_classes: bool = True) -> Dict[str, Any]:
     source = json.loads(Path(in_json).read_text(encoding="utf-8"))
     if not isinstance(source, list):
         raise ValueError(f"input must be a list of frames: {in_json}")
@@ -77,39 +79,27 @@ def run(
         "input_frames": len(frames),
         "input_detections": _count(frames),
         "stage_order": [
-            "class_preassociation_and_unification",
             "static_first_identity_tracking",
             "hard_annotation_filters",
+            "model_class_majority_vote",
             "same_center_deduplication",
             "short_track_filter",
             "confirmed_static_parking_yaw_stabilization",
             "integrated_vehicle_and_pedestrian_yaw",
-            "final_track_class_consistency_and_size_classification",
             "sust_export",
         ],
     }
 
-    before_classes = copy.deepcopy(frames)
     coords = tracking.CoordinateProvider(Path(clip))
-    # Preserve the reviewed pre-tracking class behavior so final size
-    # thresholds cannot perturb identity tracking. Final size decisions use
-    # complete tracks after static-first identity assignment.
-    tracking_class_config = ClassRefinementConfig(
-        max_cross_class_gap_sec=class_config.max_cross_class_gap_sec,
-        max_cross_class_distance=class_config.max_cross_class_distance,
-        max_cross_class_speed=class_config.max_cross_class_speed,
-        max_relative_size_delta=class_config.max_relative_size_delta,
-        uniqueness_margin=class_config.uniqueness_margin,
-        truck_length_min=5.0,
-        pedestrian_length_max=class_config.pedestrian_length_max,
-        pedestrian_width_max=class_config.pedestrian_width_max,
-        cyclist_length_max=3.0,
-        cyclist_width_max=1.35,
-    )
-    diagnostics["class_preassociation"] = preassociate_and_unify(
-        frames, coords, tracking_class_config)
-    diagnostics["class_only_check"] = _assert_class_only(before_classes, frames)
-
+    if preserve_model_classes:
+        for frame in frames:
+            for det in frame.get("detections", []):
+                canonical = tracking.canonical_class_name(
+                    det.get("class_name", ""))
+                if canonical is not None:
+                    det["class_name"] = canonical
+    # The five-class model supplies semantic labels. Track first, then use a
+    # majority vote to remove per-frame flicker without legacy size renaming.
     pre_tracking = copy.deepcopy(frames)
     tracker = static_first.StaticFirstTracker(coords)
     tracked, tracking_diagnostics = tracker.process(frames)
@@ -117,17 +107,28 @@ def run(
     diagnostics["identity_only_check"] = static_first.verify_identity_only(
         pre_tracking, tracked)
 
-    for source_frame, tracked_frame in zip(source, tracked):
-        source_detections = source_frame.get("detections", [])
-        tracked_detections = tracked_frame.get("detections", [])
-        if len(source_detections) != len(tracked_detections):
-            raise AssertionError("cannot align source classes after tracking")
-        for source_det, tracked_det in zip(
-                source_detections, tracked_detections):
-            tracked_det["_step2_source_class"] = str(
-                source_det.get("class_name", ""))
+    if not preserve_model_classes:
+        before_classes = copy.deepcopy(tracked)
+        diagnostics["class_preassociation"] = preassociate_and_unify(
+            tracked, coords, class_config)
+        diagnostics["class_only_check"] = _assert_class_only(
+            before_classes, tracked)
+
+    if not preserve_model_classes:
+        for source_frame, tracked_frame in zip(source, tracked):
+            source_detections = source_frame.get("detections", [])
+            tracked_detections = tracked_frame.get("detections", [])
+            if len(source_detections) != len(tracked_detections):
+                raise AssertionError("cannot align source classes after tracking")
+            for source_det, tracked_det in zip(
+                    source_detections, tracked_detections):
+                tracked_det["_step2_source_class"] = str(
+                    source_det.get("class_name", ""))
     diagnostics["hard_filters"] = apply_hard_filters(
         tracked, Path(clip), hard_filter_config)
+    if preserve_model_classes:
+        diagnostics["class_finalization"] = finalize_model_track_classes(
+            tracked, tracking.TARGET_CLASSES)
     static_track_ids = {int(slot.track_id) for slot in tracker.slots}
     diagnostics["same_center_deduplication"] = deduplicate_same_center(
         tracked, static_track_ids=static_track_ids,
@@ -141,17 +142,12 @@ def run(
     tracked, diagnostics["yaw_integrated"] = apply_yaw_integrated(
         tracked, pre_static_yaw, coords, Path(clip),
         tracking_diagnostics, diagnostics["static_yaw_stabilization"])
-    before_final_class = copy.deepcopy(tracked)
-    diagnostics["class_finalization"] = finalize_track_classes(
-        tracked, class_config)
-    for before_frame, after_frame in zip(before_final_class, tracked):
-        for before_det, after_det in zip(
-                before_frame.get("detections", []),
-                after_frame.get("detections", [])):
-            before_det.pop("_step2_source_class", None)
-            after_det.pop("_step2_source_class", None)
-    diagnostics["final_class_only_check"] = _assert_class_only(
-        before_final_class, tracked)
+    if not preserve_model_classes:
+        before_final_class = copy.deepcopy(tracked)
+        diagnostics["class_finalization"] = finalize_track_classes(
+            tracked, class_config)
+        diagnostics["final_class_only_check"] = _assert_class_only(
+            before_final_class, tracked)
     diagnostics["final_detections"] = _count(tracked)
 
     Path(out_json).parent.mkdir(parents=True, exist_ok=True)
@@ -187,13 +183,15 @@ def main() -> None:
     parser.add_argument("--visibility-min-ratio", type=float, default=0.05)
     parser.add_argument("--pedestrian-max-distance", type=float, default=20.0)
     parser.add_argument("--keep-classes",
-                        default="Vehicle,Car,Truck,Pedestrian,Cyclist")
+                        default="Car,Truck,Bus,Pedestrian,Nonmotorized_vehicle,Vehicle,Cyclist")
     parser.add_argument("--same-center-gate", type=float, default=0.35)
     parser.add_argument("--truck-length-min", type=float, default=6.0)
     parser.add_argument("--pedestrian-length-max", type=float, default=1.25)
     parser.add_argument("--pedestrian-width-max", type=float, default=1.10)
     parser.add_argument("--cyclist-length-max", type=float, default=3.5)
     parser.add_argument("--cyclist-width-max", type=float, default=1.50)
+    parser.add_argument("--legacy-size-classification", action="store_true",
+                        help="restore the legacy Vehicle/Car size relabeling")
     args = parser.parse_args()
 
     hard_config = HardFilterConfig(
@@ -220,11 +218,12 @@ def main() -> None:
         args.in_json, args.clip, args.out_json, args.out_clip,
         diagnostics_path, hard_filter_config=hard_config,
         class_config=class_config, min_lifecycle=args.min_lifecycle,
-        same_center_gate=args.same_center_gate)
+        same_center_gate=args.same_center_gate,
+        preserve_model_classes=not args.legacy_size_classification)
     print(json.dumps({
         "input_detections": diagnostics["input_detections"],
         "hard_filter_removed": diagnostics["hard_filters"]["detections_removed"],
-        "class_pre_changed": diagnostics["class_preassociation"]["detections_changed"],
+        "class_changed": diagnostics["class_finalization"]["detections_changed"],
         "tracks": diagnostics["tracking"].get("tracks_total"),
         "same_center_removed": diagnostics["same_center_deduplication"]["boxes_removed"],
         "short_tracks_removed": diagnostics["short_track_filter"]["tracks_dropped"],

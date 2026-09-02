@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Step 3: Car box fitting on one completed step-2 clip."""
+"""Step 3: class-aware box fitting on one completed step-2 clip."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from geometry.box_geometry import GeometryConfig, apply_geometry_legacy
 from geometry.car_box_fit import CarBoxFitConfig, apply_car_box_fit
 from tracking import tracker_conservative as tracking
 
@@ -21,9 +22,18 @@ def run(step2_json: Path, step2_diagnostics: Path, clip: Path,
     frames = json.loads(step2_json.read_text(encoding="utf-8"))
     diagnostics = json.loads(step2_diagnostics.read_text(encoding="utf-8"))
     coords = tracking.CoordinateProvider(Path(clip))
-    output, result = apply_car_box_fit(
+    # The generic geometry pass fits all five classes with their class-aware
+    # physical priors.  The reviewed bottom-up roof/face fitter then makes its
+    # additional Car-only refinement, preserving the old high-quality path.
+    generic_output, generic_result = apply_geometry_legacy(
         frames, coords, Path(clip), diagnostics["tracking"],
+        diagnostics["static_yaw_stabilization"], GeometryConfig())
+    output, result = apply_car_box_fit(
+        generic_output, coords, Path(clip), diagnostics["tracking"],
         diagnostics["static_yaw_stabilization"], CarBoxFitConfig())
+    result["multiclass_geometry"] = generic_result
+    result["multiclass_tracks"] = generic_result.get("tracks", 0)
+    result["multiclass_boxes"] = generic_result.get("boxes", 0)
     result.update({
         "source_step2_json": str(step2_json.resolve()),
         "source_step2_diagnostics": str(step2_diagnostics.resolve()),

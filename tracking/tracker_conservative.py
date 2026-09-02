@@ -35,16 +35,37 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 
-STATIC_CLASSES = {"Vehicle", "Car", "Truck"}
-VEHICLE_CLASSES = STATIC_CLASSES | {"Bus", "Other Vehicle"}
+STATIC_CLASSES = {"Vehicle", "Car", "Truck", "Bus"}
+VEHICLE_CLASSES = STATIC_CLASSES | {"Other Vehicle"}
+TARGET_CLASSES = (
+    "Car", "Truck", "Bus", "Pedestrian", "Nonmotorized_vehicle"
+)
 CLASS_MAP = {
     "car": "Car", "truck": "Truck", "bus": "Bus",
-    "construction_vehicle": "Engineering_vehicle",
+    "construction_vehicle": "Truck", "Construction_vehicle": "Truck",
+    "trailer": "Truck", "Trailer": "Truck",
     "pedestrian": "Pedestrian", "bicycle": "Nonmotorized_vehicle",
-    "motorcycle": "Nonmotorized_vehicle", "Cyclist": "Nonmotorized_vehicle",
+    "motorcycle": "Nonmotorized_vehicle", "cyclist": "Nonmotorized_vehicle",
+    "Cyclist": "Nonmotorized_vehicle",
+    "nonmotorized_vehicle": "Nonmotorized_vehicle",
+    "nonmotorized vehicle": "Nonmotorized_vehicle",
     "Car": "Car", "Truck": "Truck", "Vehicle": "Car",
-    "Pedestrian": "Pedestrian", "Cyclist": "Nonmotorized_vehicle",
+    "Bus": "Bus", "Pedestrian": "Pedestrian",
+    "Cyclist": "Nonmotorized_vehicle",
+    "Nonmotorized_vehicle": "Nonmotorized_vehicle",
 }
+
+
+def canonical_class_name(value: Any) -> str | None:
+    """Map model aliases to the five classes emitted by SUST labels."""
+    text = str(value).strip()
+    if not text:
+        return None
+    direct = CLASS_MAP.get(text)
+    if direct in TARGET_CLASSES:
+        return direct
+    folded = CLASS_MAP.get(text.casefold())
+    return folded if folded in TARGET_CLASSES else None
 
 
 def wrap_angle(a: float) -> float:

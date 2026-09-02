@@ -31,6 +31,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tracking import tracker_conservative as tracking
+from filtering.five_class_output import apply_five_class_output
 
 
 DEFAULT_INFERENCE_PYTHON = "/home/moga/miniconda3/envs/openpcdet/bin/python"
@@ -102,11 +103,12 @@ def main():
     parser.add_argument("--final-suffix", type=str, default="_pre")
     parser.add_argument("--overwrite", action="store_true",
                         help="如果 <clip>_pre 已存在，先删除再生成")
+    # Retained as hidden compatibility flags. Five-class output does not run
+    # the legacy Step5 point/lifecycle or Car-only filters.
     parser.add_argument("--sparsity-max-points", type=int, default=5,
-                        help="step5: remove boxes containing this many points or fewer")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--short-track-max-frames", type=int, default=3,
-                        help="step5: remove tracks observed in this many frames or fewer")
-    # Kept as a hidden compatibility flag; Step5 now always applies Car-only.
+                        help=argparse.SUPPRESS)
     parser.add_argument("--car-only", "--step6-car-only", dest="car_only",
                         action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--score-thresh", type=float, default=0.3)
@@ -123,13 +125,13 @@ def main():
         step1_root = tmp_root / "step1"
         step2_root = tmp_root / "step2"
         step3_root = tmp_root / "step3"
-        step4_root = tmp_root / "step4"
-        step5_root = tmp_root / "step5"
-        for path in (step1_root, step2_root, step3_root, step4_root, step5_root):
+        final_root = tmp_root / "final"
+        for path in (step1_root, step2_root, step3_root, final_root):
             path.mkdir(parents=True, exist_ok=True)
 
         for index, clip in enumerate(clips, 1):
             base = clip.name
+            input_clip_path = str(clip)
             final_clip = clip.with_name(base + args.final_suffix)
             print(f"\n===== [{index}/{len(clips)}] {base} =====", flush=True)
 
@@ -166,28 +168,18 @@ def main():
                  "--clip", clip, "--out-json", step3_json,
                  "--diagnostics", step3_diag])
 
-            step4_json = step4_root / f"{base}_step4.json"
-            step4_diag = step4_root / f"{base}_step4_diagnostics.json"
-            run([args.post_python,
-                 ROOT / "pipeline" / "step4_car_size_filter.py",
-                 "--step3-json", step3_json,
-                 "--out-json", step4_json,
-                 "--diagnostics", step4_diag])
-
-            step5_json = step5_root / f"{base}_step5.json"
-            step5_diag = step5_root / f"{base}_step5_diagnostics.json"
-            step5_cmd = [
-                args.post_python,
-                ROOT / "pipeline" / "step5_class_motion_filter.py",
-                "--step4-json", step4_json, "--clip", clip,
-                "--out-json", step5_json, "--diagnostics", step5_diag,
-                "--sparsity-max-points", args.sparsity_max_points,
-                "--short-track-max-frames", args.short_track_max_frames,
-            ]
-            run(step5_cmd)
-
-            # Step5 already enforces the final Car-only policy.
-            final_json = step5_json
+            final_json = final_root / f"{base}_final.json"
+            final_diag = final_root / f"{base}_final_diagnostics.json"
+            step3_frames = json.loads(step3_json.read_text(encoding="utf-8"))
+            coords = tracking.CoordinateProvider(clip)
+            final_frames, final_result = apply_five_class_output(
+                step3_frames, coords)
+            final_json.write_text(
+                json.dumps(final_frames, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8")
+            final_diag.write_text(
+                json.dumps(final_result, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8")
 
             # No intermediate clip is stored.  The input clip itself is
             # renamed to <clip>_pre and only label/ is added.
@@ -207,16 +199,12 @@ def main():
                 print(f"SUST export: {sust_dest}", flush=True)
 
             summaries.append({
-                "input_clip": str(clip),
+                "input_clip": input_clip_path,
                 "final_clip": str(final_clip),
                 "labels": labels,
-                "car_only": True,
-                "large_car_tracks_relabelled": json.loads(
-                    step4_diag.read_text(encoding="utf-8")
-                )["large_car_tracks_relabelled"],
-                "large_car_detections_relabelled": json.loads(
-                    step4_diag.read_text(encoding="utf-8")
-                )["large_car_detections_relabelled"],
+                "target_classes": list(tracking.TARGET_CLASSES),
+                "boxes_converted": final_result["boxes_converted"],
+                "removed_by_reason": final_result["removed_by_reason"],
                 "sust_export": str(sust_dest) if sust_dest else None,
             })
 

@@ -24,8 +24,8 @@ if str(PROJECT_ROOT) not in sys.path:
 from filtering import camera_visibility
 
 
-DEFAULT_CFG = PROJECT_ROOT / "models" / "voxelnext_v2_waymo_infer.yaml"
-DEFAULT_CKPT = PROJECT_ROOT / "models" / "vn_waymo_v2_4gpu_full_epoch10.pth"
+DEFAULT_CFG = PROJECT_ROOT / "models" / "voxelnext_fiveclass_nuscenes_infer.yaml"
+DEFAULT_CKPT = PROJECT_ROOT / "models" / "vn5_nuscenes_checkpoint_epoch_12.pth"
 
 
 def is_clip_dir(path: Path) -> bool:

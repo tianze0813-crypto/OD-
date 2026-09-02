@@ -9,6 +9,7 @@ import numpy as np
 
 from classification.class_refinement import (
     finalize_track_classes,
+    finalize_model_track_classes,
     preassociate_and_unify,
 )
 from filtering.hard_filters import deduplicate_same_center
@@ -61,6 +62,19 @@ def frames(rows):
 
 
 class ClassPreassociationTest(unittest.TestCase):
+    def test_five_class_track_vote_preserves_model_semantics(self):
+        source = frames([
+            [det("Bus", 0.0, length=4.0, width=1.8, track_id=1)],
+            [det("Truck", 0.1, length=4.0, width=1.8, track_id=1)],
+            [det("Bus", 0.2, length=4.0, width=1.8, track_id=1)],
+        ])
+        diagnostics = finalize_model_track_classes(source)
+        self.assertEqual(
+            {d["class_name"] for f in source for d in f["detections"]},
+            {"Bus"},
+        )
+        self.assertEqual(diagnostics["detections_changed"], 1)
+
     def test_mixed_small_vehicle_chain_becomes_cyclist(self):
         rows = [[det("Pedestrian", 0.2 * index)] for index in range(3)]
         rows += [[det("Vehicle", 0.2 * index)] for index in range(3, 7)]

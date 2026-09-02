@@ -56,6 +56,8 @@ _SIZE_QUANTILES = {
     "Truck": (0.75, 0.55, 0.60),
     "Cyclist": (0.50, 0.50, 0.55),
     "Pedestrian": (0.50, 0.50, 0.55),
+    "Bus": (0.75, 0.55, 0.60),
+    "Nonmotorized_vehicle": (0.50, 0.50, 0.55),
 }
 
 _SIZE_BOUNDS = {
@@ -64,6 +66,8 @@ _SIZE_BOUNDS = {
     "Truck": ((5.50, 17.00), (2.00, 3.80), (2.10, 4.80)),
     "Cyclist": ((1.10, 3.80), (0.50, 1.60), (0.90, 2.30)),
     "Pedestrian": ((0.45, 1.40), (0.40, 1.30), (1.10, 2.20)),
+    "Bus": ((7.00, 20.00), (2.20, 4.20), (2.40, 5.00)),
+    "Nonmotorized_vehicle": ((1.10, 4.00), (0.50, 1.80), (0.90, 2.50)),
 }
 
 _MAX_POINT_SHIFT = {
@@ -71,6 +75,8 @@ _MAX_POINT_SHIFT = {
     "Truck": 0.42,
     "Cyclist": 0.20,
     "Pedestrian": 0.14,
+    "Bus": 0.48,
+    "Nonmotorized_vehicle": 0.20,
 }
 
 _MAX_PATH_SHIFT = {
@@ -78,6 +84,8 @@ _MAX_PATH_SHIFT = {
     "Truck": 0.75,
     "Cyclist": 0.42,
     "Pedestrian": 0.30,
+    "Bus": 0.85,
+    "Nonmotorized_vehicle": 0.42,
 }
 
 _MAX_STATIC_SNAP_SHIFT = {
@@ -85,6 +93,8 @@ _MAX_STATIC_SNAP_SHIFT = {
     "Truck": 0.62,
     "Cyclist": 0.32,
     "Pedestrian": 0.22,
+    "Bus": 0.70,
+    "Nonmotorized_vehicle": 0.32,
 }
 
 
@@ -289,7 +299,8 @@ def _body_evidence(points: np.ndarray, box: Sequence[float], ground_z: float | N
     for axis in range(2):
         dimension = float(size_xy[axis])
         coverage = float(span_xy_field[axis] / max(dimension, 1e-6))
-        if coverage < (0.18 if class_name in {"Cyclist", "Pedestrian"} else 0.25):
+        if coverage < (0.18 if class_name in {
+                "Cyclist", "Pedestrian", "Nonmotorized_vehicle"} else 0.25):
             continue
         if abs(float(origin_local[axis])) < dimension / 2.0 + 0.50:
             continue
@@ -699,7 +710,8 @@ def apply_geometry_legacy(
             min_static_ground = max(3, int(math.ceil(0.10 * len(static_items))))
             if len(ground_values) >= min_static_ground:
                 clearance = (config.ground_clearance_small
-                             if class_name in {"Cyclist", "Pedestrian"}
+                             if class_name in {"Cyclist", "Pedestrian",
+                                                "Nonmotorized_vehicle"}
                              else config.ground_clearance_vehicle)
                 fixed_world_z = float(np.median(ground_values)
                                       + clearance + fixed_size[2] / 2.0)
@@ -756,7 +768,8 @@ def apply_geometry_legacy(
                     for index in range(len(segment))
                 ])
             clearance = (config.ground_clearance_small
-                         if class_name in {"Cyclist", "Pedestrian"}
+                         if class_name in {"Cyclist", "Pedestrian",
+                                            "Nonmotorized_vehicle"}
                          else config.ground_clearance_vehicle)
             for index, item in enumerate(segment):
                 box = item["det"]["box_lidar"]

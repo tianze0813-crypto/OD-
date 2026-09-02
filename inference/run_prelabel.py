@@ -46,6 +46,20 @@ class PcdBinDataset(DatasetTemplate):
         points = raw.reshape(-1, 4).astype(np.float32)
         # PandaSet training normalizes intensity to [0,1]; keep it consistent.
         points[:, 3] /= 255.0
+        # Some nuScenes training configs declare a fifth timestamp channel
+        # although the deployed SUST frames are single-sweep XYZI.  Supply a
+        # neutral timestamp only when the selected config requires it.
+        src_features = list(
+            self.dataset_cfg.POINT_FEATURE_ENCODING.src_feature_list)
+        if len(src_features) > points.shape[1]:
+            if src_features[:4] != ["x", "y", "z", "intensity"]:
+                raise ValueError(
+                    "unsupported point feature layout: " + str(src_features))
+            points = np.pad(points,
+                            ((0, 0), (0, len(src_features) - points.shape[1])),
+                            mode="constant")
+        elif len(src_features) < points.shape[1]:
+            points = points[:, :len(src_features)]
         return self.prepare_data({
             "points": points,
             "frame_id": point_path.stem,

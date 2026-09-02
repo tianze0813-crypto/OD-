@@ -24,6 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from geometry.box_geometry import GeometryConfig, apply_geometry_legacy
 from geometry.car_box_fit import CarBoxFitConfig, apply_car_box_fit
 from pipeline import step2_identity_class_filter_yaw as step2
 from tracking import tracker_conservative as tracking
@@ -132,11 +133,16 @@ def run_clip(clip: Path, output_root: Path, overwrite: bool = False) -> Dict[str
         step2_diagnostics = step2.run(
             input_json, clip, step2_json, None, step2_diagnostics_path)
         frames = json.loads(step2_json.read_text(encoding="utf-8"))
-        fitted, diagnostics = apply_car_box_fit(
+        generic, generic_diagnostics = apply_geometry_legacy(
             frames, coords, clip,
+            step2_diagnostics["tracking"],
+            step2_diagnostics["static_yaw_stabilization"], GeometryConfig())
+        fitted, diagnostics = apply_car_box_fit(
+            generic, coords, clip,
             step2_diagnostics["tracking"],
             step2_diagnostics["static_yaw_stabilization"],
             CarBoxFitConfig())
+        diagnostics["multiclass_geometry"] = generic_diagnostics
 
     destination = output_root / clip.name
     if destination.exists():

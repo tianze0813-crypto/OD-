@@ -25,7 +25,10 @@ class HardFilterConfig:
     visibility_occlusion_tolerance: float = 0.3
     pedestrian_max_distance: float = 20.0
     keep_classes: Tuple[str, ...] = (
-        "Vehicle", "Car", "Truck", "Pedestrian", "Cyclist"
+        "Car", "Truck", "Bus", "Pedestrian", "Nonmotorized_vehicle",
+        # Legacy aliases are accepted for standalone replay; Step2 normalizes
+        # them before the five-class pipeline writes output labels.
+        "Vehicle", "Cyclist"
     )
     diagnostic_examples_per_reason: int = 30
 

@@ -351,3 +351,62 @@ def finalize_track_classes(
         },
         "tracks": finalized,
     }
+
+
+def finalize_model_track_classes(
+        frames: List[Dict[str, Any]],
+        target_classes: Sequence[str] = tracking.TARGET_CLASSES,
+) -> Dict[str, Any]:
+    """Normalize model labels after identity assignment without size relabeling.
+
+    The five-class checkpoint already predicts the semantic category.  A track
+    vote removes occasional frame-level class flicker while preserving that
+    prediction; geometry is deliberately not used to turn a Bus into a Truck
+    or a non-motorized object into a Car.
+    """
+    allowed = set(str(value) for value in target_classes)
+    tracks: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    unknown = 0
+    for frame in frames:
+        for det in frame.get("detections", []):
+            canonical = tracking.canonical_class_name(det.get("class_name", ""))
+            if canonical is None or canonical not in allowed:
+                unknown += 1
+                continue
+            det["class_name"] = canonical
+            if det.get("track_id") is not None:
+                tracks[int(det["track_id"])].append(det)
+
+    changed = 0
+    details = []
+    for track_id, detections in sorted(tracks.items()):
+        counts = Counter(str(det["class_name"]) for det in detections)
+        # Score is only a deterministic tie-breaker; the majority vote remains
+        # the primary evidence for a track-level semantic label.
+        winner = max(sorted(counts), key=lambda name: (
+            counts[name],
+            sum(float(det.get("score", 0.0)) for det in detections
+                if det["class_name"] == name),
+            -list(target_classes).index(name) if name in target_classes else 0,
+        ))
+        track_changed = 0
+        for det in detections:
+            if det["class_name"] != winner:
+                det["class_name"] = winner
+                changed += 1
+                track_changed += 1
+        details.append({
+            "track_id": track_id,
+            "class_counts": dict(sorted(counts.items())),
+            "target_class": winner,
+            "detections": len(detections),
+            "detections_changed": track_changed,
+        })
+    return {
+        "tracks_checked": len(tracks),
+        "detections_changed": changed,
+        "unknown_detections": unknown,
+        "target_classes": list(target_classes),
+        "tracks": details,
+        "policy": "canonical model class with majority vote per assigned track",
+    }
