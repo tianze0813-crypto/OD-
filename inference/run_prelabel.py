@@ -34,6 +34,7 @@ class PcdBinDataset(DatasetTemplate):
             training=False, root_path=root_path, logger=logger,
         )
         self.sample_file_list = sorted(Path(root_path).glob("*.bin"))
+        self.intensity_scale = 1.0
 
     def __len__(self):
         return len(self.sample_file_list)
@@ -44,8 +45,7 @@ class PcdBinDataset(DatasetTemplate):
         if raw.size % 4 != 0:
             raise ValueError(f"unexpected value count in {point_path}: {raw.size}")
         points = raw.reshape(-1, 4).astype(np.float32)
-        # PandaSet training normalizes intensity to [0,1]; keep it consistent.
-        points[:, 3] /= 255.0
+        points[:, 3] *= self.intensity_scale
         # Some nuScenes training configs declare a fifth timestamp channel
         # although the deployed SUST frames are single-sweep XYZI.  Supply a
         # neutral timestamp only when the selected config requires it.
@@ -73,6 +73,11 @@ def main():
     parser.add_argument("--lidar_dir", required=True)
     parser.add_argument("--out_json", required=True)
     parser.add_argument("--score_thresh", type=float, default=0.3)
+    parser.add_argument(
+        "--intensity_scale", type=float, default=1.0 / 255.0,
+        help="Multiplier applied to the fourth (intensity) column; "
+             "default preserves the historical /255 behavior.",
+    )
     args = parser.parse_args()
 
     cfg_from_yaml_file(args.cfg_file, cfg)
@@ -83,6 +88,7 @@ def main():
         root_path=Path(args.lidar_dir),
         logger=logger,
     )
+    dataset.intensity_scale = args.intensity_scale
     model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=dataset)
     model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=True)
     model.cuda()
