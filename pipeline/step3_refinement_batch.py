@@ -53,6 +53,20 @@ def main() -> None:
             "tracks": diagnostics["tracks"],
             "car_tracks": diagnostics["car_tracks"],
             "car_boxes": diagnostics["car_boxes"],
+            "truck_boxes_removed": diagnostics["truck_overlap_merge"].get(
+                "boxes_removed", 0),
+            "truck_class_converted_boxes": diagnostics[
+                "truck_overlap_merge"].get("class_converted_boxes", 0),
+            "truck_id_remaps": len(diagnostics["truck_overlap_merge"].get(
+                "id_remaps", [])),
+            "nonmotorized_tracks_refined": diagnostics[
+                "nonmotorized_size_refinement"].get("tracks_refined", 0),
+            "nonmotorized_size_boxes": diagnostics[
+                "nonmotorized_size_refinement"].get("boxes_changed", 0),
+            "nonmotorized_center_boxes": diagnostics[
+                "nonmotorized_size_refinement"].get("centers_changed", 0),
+            "nonmotorized_yaw_boxes": diagnostics[
+                "nonmotorized_size_refinement"].get("yaw_boxes_updated", 0),
             "final_detections": diagnostics["final_detections"],
         })
     summary_path = args.work_root / "batch_summary.json"

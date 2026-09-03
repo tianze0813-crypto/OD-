@@ -94,7 +94,7 @@ class PipelineStageContractTest(unittest.TestCase):
         self.assertEqual(result["class_only_check"]["passed"], True)
         self.assertEqual(result["stage_order"][1], "hard_filters_pass_2")
 
-    def test_step3_non_car_route_is_passthrough(self):
+    def test_step3_multiclass_contract_accepts_unchanged_truck(self):
         before = [frame("Truck", 4)]
         after = copy.deepcopy(before)
         self.assertEqual(step3._verify_non_car_geometry(before, after)["passed"], True)

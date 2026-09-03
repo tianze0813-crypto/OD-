@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Run Step2 and Step3 on SUST labels whose boxes are already in ``base_link``.
+"""Run Step2 and the current Truck/NMV Step3 on SUST labels.
 
-The geometry implementation fits against ``lidar_top`` points.  This adapter
-temporarily converts input SUST boxes from ``base_link`` to ``lidar_top``, runs
-the normal Step2 identity/class/yaw stage, invokes Step3, converts the fitted
-boxes back, and writes SUST labels.  It does not run Step5 or any final filter.
+Input SUST boxes are temporarily converted from ``base_link`` to
+``lidar_top``. Step2 and Step3 then run in the lidar frame, after which the
+refined boxes are converted back and written as SUST labels. This adapter does
+not run the deprecated Step5 or any final filter.
 """
 
 from __future__ import annotations
@@ -153,6 +153,8 @@ def run_clip(clip: Path, output_root: Path, overwrite: bool = False) -> Dict[str
     shutil.copytree(clip, destination, ignore=shutil.ignore_patterns("label"))
     labels = _write_sust_labels(fitted, destination, coords)
     car_stats = diagnostics.get("car_refinement", {})
+    truck_stats = diagnostics.get("truck_overlap_merge", {})
+    nonmotorized_stats = diagnostics.get("nonmotorized_size_refinement", {})
     return {
         "input_clip": str(clip.resolve()),
         "output_clip": str(destination.resolve()),
@@ -171,7 +173,22 @@ def run_clip(clip: Path, output_root: Path, overwrite: bool = False) -> Dict[str
             for key in ("z_both_boxes", "z_ground_boxes", "z_roof_boxes",
                         "z_fallback_boxes")
         },
-        "invariant_check": car_stats.get("invariant_check"),
+        "invariant_check": diagnostics.get("non_car_geometry_check"),
+        "truck_boxes_removed": truck_stats.get("boxes_removed", 0),
+        "truck_id_remaps": len(truck_stats.get("id_remaps", [])),
+        "truck_class_converted_boxes": truck_stats.get(
+            "class_converted_boxes", 0),
+        "truck_cross_class_pairs": len(truck_stats.get(
+            "cross_class_pairs", [])),
+        "truck_near_pairs": len(truck_stats.get("near_truck_pairs", [])),
+        "nonmotorized_tracks_refined": nonmotorized_stats.get(
+            "tracks_refined", 0),
+        "nonmotorized_size_boxes": nonmotorized_stats.get(
+            "boxes_changed", 0),
+        "nonmotorized_center_boxes": nonmotorized_stats.get(
+            "centers_changed", 0),
+        "nonmotorized_yaw_boxes": nonmotorized_stats.get(
+            "yaw_boxes_updated", 0),
     }
 
 

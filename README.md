@@ -35,7 +35,7 @@
   -> step1  lidar 推理 + 相机可见度元数据
   -> step2  类别无关 identity + 第一遍 hard-filter / 去重
   -> step2.5 轨迹类别修正 + 第二遍 hard-filter / 短轨迹处理
-  -> step3  公共 yaw + 按类别路由的几何精修（当前仅 Car）
+  -> step3  公共 yaw + Truck/Nonmotorized_vehicle 分治精修（Car 仅保留 yaw）
   -> final 五类规范化 + box 转换到 base_link
   -> SUST clip
 
@@ -233,29 +233,13 @@ python pipeline/five_class_postprocess.py \
   --output-json work/final/<clip>_final.json
 ```
 
-Step3 先对所有类别执行公共 yaw；然后仅对 Car 使用
-经过验证的 shrink-only XY/地面/车顶拟合，并用最终 XY footprint
-重新裁点。车顶搜索从当前地面边界（无地面证据时从原 box 下边界）开始，以 `5cm`
-步长检查重叠的 `10cm` 水平截面。截面必须同时满足点数、长短轴跨度、中心覆盖、稳健
-中心对齐和 `6 x 4` 网格二维连通约束；至少连续两个窗口成立，并且上方 `5cm` 不再
-连续时，才把该截面认定为车顶。中心覆盖和稳健中心对齐只参与车顶的 Z 证据判定，
-不改变现有 XY 拟合。更高但狭窄、不连通或整体偏到 box 一侧的树枝噪点不会直接决定
-上边界。
-
-最终 Z 仍严格保留原来的双边界与 track 高度回退规则：
-
-```text
-地面和车顶都有：高度合理时使用两个边界；不合理时保留地面并套用 track 高度
-只有地面：保留地面，向上套用 track 高度
-只有车顶：保留车顶，向下套用 track 高度
-两个都没有：保留原 z 中心，只替换为 track 高度
-
-另外，两个边界都存在但车顶连续窗口较短、且拟合高度偏离该 track 的稳健高度先验
-时，会按“保留地面 + track 高度”回退，避免把车身/挡风玻璃层当作车顶。地面估计
-本身不改变；只有单条 Car track 出现明显双峰并反复突跳时才修正：中间异常段用前后
-可信地面帧做时序插值，轨迹开头或结尾连续达到最小聚类长度的异常段可使用唯一低地面
-锚点。短边缘段和普通单次跳变保持原值。
-```
+Step3 先对所有类别执行公共 yaw。此版本不执行 Car 几何/尺寸精修，仅保留 Car
+的 yaw 结果。Truck 随后检查同帧高重叠框、连续近距离框，以及 Truck-Car
+高 BEV IoU 重复框：统一以 Truck 为保留类别合并 track ID，Car 观测会转成
+Truck，并删除合并后同帧的重复框。Nonmotorized_vehicle
+按轨迹计算稳健的中位物理尺寸：小框优先保留检测中心并补齐尺寸，大框同时向轨迹
+中心修正；最后用修正后的中心轨迹更新 yaw。Bus/Pedestrian 保持透传。
+Car 的旧 shrink-only XY/地面/车顶模块仍保留用于兼容回放，不参与当前 Step3。
 
 ### 旧 Step 4/Step 5（兼容脚本）
 
