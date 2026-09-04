@@ -22,8 +22,8 @@ class HardFilterConfig:
     score_threshold: float = 0.3
     class_score_thresholds: Tuple[Tuple[str, float], ...] = (
         ("Car", 0.25),
-        ("Truck", 0.25),
-        ("Bus", 0.25),
+        ("Truck", 0.4),
+        ("Bus", 0.4),
         ("Pedestrian", 0.3),
         ("Nonmotorized_vehicle", 0.3),
     )
@@ -103,9 +103,9 @@ def apply_category_score_filter(
         config: HardFilterConfig = HardFilterConfig()) -> Dict[str, Any]:
     """Apply only category score thresholds before identity tracking.
 
-    Step1 uses the lowest threshold so Car/Truck/Bus candidates at 0.25-0.3 are
-    available.  This lightweight pass removes sub-threshold detections from
-    the other categories before they can add association noise; range,
+    Step1 uses the lowest configured threshold so lower-score Car candidates
+    remain available. This lightweight pass removes sub-threshold detections
+    from each category before they can add association noise; range,
     visibility, sparsity, and all other annotation filters remain after ID
     assignment in Step2 and Step2.5.
     """

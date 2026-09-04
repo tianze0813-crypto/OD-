@@ -46,7 +46,7 @@ class PipelineStageContractTest(unittest.TestCase):
             "frame_id": "0",
             "detections": [
                 dict(frame("Car")["detections"][0], score=0.25),
-                dict(frame("Truck")["detections"][0], score=0.26),
+                dict(frame("Truck")["detections"][0], score=0.41),
                 dict(frame("Bus")["detections"][0], score=0.24),
                 dict(frame("Pedestrian")["detections"][0], score=0.30),
             ],

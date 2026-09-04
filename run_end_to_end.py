@@ -145,8 +145,8 @@ def main():
         "--score-thresh", type=float, default=None,
         help="兼容参数：显式设置后覆盖全部类别阈值")
     parser.add_argument("--car-score-thresh", type=float, default=0.25)
-    parser.add_argument("--truck-score-thresh", type=float, default=0.25)
-    parser.add_argument("--bus-score-thresh", type=float, default=0.25)
+    parser.add_argument("--truck-score-thresh", type=float, default=0.4)
+    parser.add_argument("--bus-score-thresh", type=float, default=0.4)
     parser.add_argument("--pedestrian-score-thresh", type=float, default=0.3)
     parser.add_argument("--nonmotorized-score-thresh", type=float, default=0.3)
     parser.add_argument("--drop-vis-below", type=float, default=0.05)

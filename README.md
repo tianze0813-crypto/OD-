@@ -78,6 +78,10 @@ $OPENPCDET_PYTHON run_end_to_end.py \
 模型输出类别固定为：`Car`、`Truck`、`Bus`、`Pedestrian`、
 `Nonmotorized_vehicle`。跟踪阶段不使用类别约束；类别在 Step2.5 完成 ID 后按轨迹多数票
 稳定，不再按 box 长度把 Car/Truck/Bus 互相改标。
+
+当前主链路默认类别置信度阈值为：`Car=0.25`、`Truck=0.40`、`Bus=0.40`、
+`Pedestrian=0.30`、`Nonmotorized_vehicle=0.30`。Step1 使用其中最低值取得候选，
+随后在进入 Step2 前按类别阈值清理低分检测；也可以用 `--score-thresh` 显式覆盖全部类别。
 ```
 
 ## 坐标系与 base_link 约定
