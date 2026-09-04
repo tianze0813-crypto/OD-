@@ -58,22 +58,23 @@ def static_rotating_car_track_ids(
         frames: Sequence[Mapping[str, Any]],
         coords: tracking.CoordinateProvider,
         *,
-        center_gate: float = 0.6,
-        min_frames: int = 6,
-        min_total_rotation: float = 1.0,
-        min_steps: int = 3,
-        max_reversal_fraction: float = 0.30,
-        step_gate: float = 0.12,
+        center_gate: float = 3.0,
+        overlap_gate: float = 0.35,
+        yaw_gate: float = 1.30,
+        step_gate: float = 0.80,
+        min_flips: int = 2,
+        min_frames: int = 5,
 ) -> tuple[set[int], Dict[str, Any]]:
-    """Find stationary Car tracks whose heading keeps rotating.
+    """Find stationary Car tracks whose heading spins in place (false positive).
 
-    A track qualifies when all of its observations are ``Car``, the world XY
-    center span stays within ``center_gate`` (so the position is fixed), and
-    the world heading rotates continuously (enough accumulated signed
-    rotation and few direction reversals).  Such an ID is treated as a
-    detection artifact and is removed as a whole.
+    A moving turn also shows a large yaw spread, so the center alone is not
+    enough.  Wrap every observed box of a track into a world frame and require
+    BOTH a tight spatial footprint (a small center span AND boxes that keep
+    overlapping, i.e. the footprint never leaves the spot) AND a large yaw
+    swing (the heading covers most of the pi-periodic range, with several big
+    steps).  Such an ID is removed as a whole.
     """
-    by_id: dict[int, list[tuple[int, np.ndarray, float]]] = {}
+    by_id: dict[int, list[tuple[int, np.ndarray, float, np.ndarray]]] = {}
     for frame in frames:
         ts = int(frame["frame_id"])
         wf = coords.world_from_lidar(ts)
@@ -87,42 +88,57 @@ def static_rotating_car_track_ids(
                 continue
             center = tracking.center_world(box, wf)
             yaw = tracking.yaw_world(float(box[6]), wf)
+            size = np.asarray(box[3:6], dtype=np.float64)
             by_id.setdefault(int(det["track_id"]), []).append(
-                (int(ts), center, yaw))
+                (int(ts), center, yaw, size))
 
     dropped: set[int] = set()
     details: List[Dict[str, Any]] = []
     for track_id, items in by_id.items():
         items = sorted(items, key=lambda value: value[0])
-        centers = np.asarray([center[:2] for _, center, _ in items],
+        centers = np.asarray([center[:2] for _, center, _, _ in items],
                              dtype=np.float64)
-        yaws = [yaw for _, _, yaw in items]
+        yaws = [yaw for _, _, yaw, _ in items]
         if len(centers) < min_frames:
             continue
         centroid = np.median(centers, axis=0)
         span = float(np.max(np.linalg.norm(centers - centroid, axis=1)))
         if span > center_gate:
             continue
-        deltas = [tracking.wrap_angle(yaws[index] - yaws[index - 1])
+        ious = [
+            tracking.bev_iou(
+                np.r_[items[index - 1][1][:2], 0.0],
+                items[index - 1][3], items[index - 1][2],
+                np.r_[items[index][1][:2], 0.0],
+                items[index][3], items[index][2])
+            for index in range(1, len(items))
+        ]
+        mean_iou = float(np.mean(ious)) if ious else 1.0
+        if mean_iou < overlap_gate:
+            continue
+        yaw_span = 0.0
+        for left in range(len(yaws)):
+            for right in range(left + 1, len(yaws)):
+                yaw_span = max(
+                    yaw_span, tracking.angle_distance(
+                        yaws[left], yaws[right], modulo_pi=True))
+        if yaw_span < yaw_gate:
+            continue
+        deltas = [tracking.angle_distance(yaws[index], yaws[index - 1],
+                                          modulo_pi=True)
                   for index in range(1, len(yaws))]
-        total = float(sum(abs(delta) for delta in deltas))
-        abs_steps = int(sum(1 for delta in deltas if abs(delta) >= step_gate))
-        signs = [1 if delta >= 0.0 else -1 for delta in deltas
-                 if abs(delta) >= step_gate]
-        reversals = int(sum(1 for index in range(1, len(signs))
-                            if signs[index] != signs[index - 1]))
-        reversal_fraction = reversals / max(len(signs) - 1, 1)
-        if (total >= min_total_rotation and abs_steps >= min_steps
-                and reversal_fraction <= max_reversal_fraction):
-            dropped.add(track_id)
-            details.append({
-                "track_id": track_id,
-                "observations": len(centers),
-                "center_span": round(span, 4),
-                "total_rotation": round(total, 4),
-                "abs_steps": abs_steps,
-                "reversal_fraction": round(reversal_fraction, 4),
-            })
+        flips = int(sum(1 for delta in deltas if delta >= step_gate))
+        if flips < min_flips:
+            continue
+        dropped.add(track_id)
+        details.append({
+            "track_id": track_id,
+            "observations": len(centers),
+            "center_span": round(span, 4),
+            "mean_consec_iou": round(mean_iou, 4),
+            "yaw_span": round(yaw_span, 4),
+            "big_yaw_steps": flips,
+        })
     return dropped, {
         "enabled": True,
         "dropped_track_ids": sorted(dropped),
@@ -130,11 +146,11 @@ def static_rotating_car_track_ids(
         "details": details,
         "config": {
             "center_gate": center_gate,
-            "min_frames": min_frames,
-            "min_total_rotation": min_total_rotation,
-            "min_steps": min_steps,
-            "max_reversal_fraction": max_reversal_fraction,
+            "overlap_gate": overlap_gate,
+            "yaw_gate": yaw_gate,
             "step_gate": step_gate,
+            "min_flips": min_flips,
+            "min_frames": min_frames,
         },
     }
 
@@ -163,12 +179,12 @@ def run(
         class_config: ClassRefinementConfig = ClassRefinementConfig(),
         min_lifecycle: int = 4,
         static_rotation_enabled: bool = True,
-        rot_center_gate: float = 0.6,
-        rot_min_frames: int = 6,
-        rot_min_total: float = 1.0,
-        rot_min_steps: int = 3,
-        rot_max_reversal: float = 0.30,
-        rot_step_gate: float = 0.12,
+        rot_center_gate: float = 3.0,
+        rot_overlap_gate: float = 0.35,
+        rot_yaw_gate: float = 1.30,
+        rot_step_gate: float = 0.80,
+        rot_min_flips: int = 2,
+        rot_min_frames: int = 5,
 ) -> Dict[str, Any]:
     source = json.loads(Path(step2_json).read_text(encoding="utf-8"))
     if not isinstance(source, list):
@@ -187,11 +203,11 @@ def run(
         rotating_ids, static_rotation = static_rotating_car_track_ids(
             frames, coords,
             center_gate=float(rot_center_gate),
-            min_frames=int(rot_min_frames),
-            min_total_rotation=float(rot_min_total),
-            min_steps=int(rot_min_steps),
-            max_reversal_fraction=float(rot_max_reversal),
-            step_gate=float(rot_step_gate))
+            overlap_gate=float(rot_overlap_gate),
+            yaw_gate=float(rot_yaw_gate),
+            step_gate=float(rot_step_gate),
+            min_flips=int(rot_min_flips),
+            min_frames=int(rot_min_frames))
         _drop_track_ids(frames, rotating_ids)
 
     # The second filter sees canonical classes and is therefore the final
@@ -287,12 +303,12 @@ def main() -> None:
     parser.add_argument("--pedestrian-max-distance", type=float, default=20.0)
     parser.add_argument("--disable-static-rotation-filter", action="store_true",
                         help="turn off the static Car rotating-yaw filter")
-    parser.add_argument("--rot-center-gate", type=float, default=0.6)
-    parser.add_argument("--rot-min-frames", type=int, default=6)
-    parser.add_argument("--rot-min-total", type=float, default=1.0)
-    parser.add_argument("--rot-min-steps", type=int, default=3)
-    parser.add_argument("--rot-max-reversal", type=float, default=0.30)
-    parser.add_argument("--rot-step-gate", type=float, default=0.12)
+    parser.add_argument("--rot-center-gate", type=float, default=3.0)
+    parser.add_argument("--rot-overlap-gate", type=float, default=0.35)
+    parser.add_argument("--rot-yaw-gate", type=float, default=1.30)
+    parser.add_argument("--rot-step-gate", type=float, default=0.80)
+    parser.add_argument("--rot-min-flips", type=int, default=2)
+    parser.add_argument("--rot-min-frames", type=int, default=5)
     parser.add_argument("--keep-classes",
                         default=",".join(tracking.TARGET_CLASSES))
     args = parser.parse_args()
@@ -302,11 +318,11 @@ def main() -> None:
         hard_filter_config=_hard_config(args), min_lifecycle=args.min_lifecycle,
         static_rotation_enabled=not args.disable_static_rotation_filter,
         rot_center_gate=args.rot_center_gate,
-        rot_min_frames=args.rot_min_frames,
-        rot_min_total=args.rot_min_total,
-        rot_min_steps=args.rot_min_steps,
-        rot_max_reversal=args.rot_max_reversal,
-        rot_step_gate=args.rot_step_gate)
+        rot_overlap_gate=args.rot_overlap_gate,
+        rot_yaw_gate=args.rot_yaw_gate,
+        rot_step_gate=args.rot_step_gate,
+        rot_min_flips=args.rot_min_flips,
+        rot_min_frames=args.rot_min_frames)
     print(json.dumps({
         "class_changed": diagnostics["class_correction"]["detections_changed"],
         "hard_filter_removed": diagnostics["hard_filters_pass_2"]["detections_removed"],
