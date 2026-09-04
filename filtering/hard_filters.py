@@ -16,7 +16,17 @@ from tracking import tracker_conservative as tracking
 
 @dataclass(frozen=True)
 class HardFilterConfig:
+    # Fallback used for classes without an explicit category threshold.  The
+    # five-class pipeline passes the per-class values below so low-score Car
+    # and Truck candidates survive Step1 and are filtered after tracking.
     score_threshold: float = 0.3
+    class_score_thresholds: Tuple[Tuple[str, float], ...] = (
+        ("Car", 0.25),
+        ("Truck", 0.25),
+        ("Bus", 0.25),
+        ("Pedestrian", 0.3),
+        ("Nonmotorized_vehicle", 0.3),
+    )
     range_front: float = 80.0
     range_rear: float = 20.0
     range_side: float = 40.0
@@ -31,6 +41,12 @@ class HardFilterConfig:
         "Vehicle", "Cyclist"
     )
     diagnostic_examples_per_reason: int = 30
+
+    def score_threshold_for(self, class_name: Any) -> float:
+        """Return the configured threshold for a raw or canonical class."""
+        canonical = tracking.canonical_class_name(class_name)
+        thresholds = dict(self.class_score_thresholds)
+        return float(thresholds.get(canonical, self.score_threshold))
 
 
 def _load_lidar_xyz(clip: Path, frame_id: str) -> np.ndarray:
@@ -82,6 +98,58 @@ def _class_allowed(value: Any, allowed: Sequence[str]) -> bool:
     return canonical is not None and canonical in allowed_set
 
 
+def apply_category_score_filter(
+        frames: List[Dict[str, Any]],
+        config: HardFilterConfig = HardFilterConfig()) -> Dict[str, Any]:
+    """Apply only category score thresholds before identity tracking.
+
+    Step1 uses the lowest threshold so Car/Truck/Bus candidates at 0.25-0.3 are
+    available.  This lightweight pass removes sub-threshold detections from
+    the other categories before they can add association noise; range,
+    visibility, sparsity, and all other annotation filters remain after ID
+    assignment in Step2 and Step2.5.
+    """
+    before = sum(len(frame.get("detections", [])) for frame in frames)
+    removed_by_class: Counter[str] = Counter()
+    removed_examples: List[Dict[str, Any]] = []
+    for frame in frames:
+        kept = []
+        for index, det in enumerate(frame.get("detections", [])):
+            class_name = str(det.get("class_name", ""))
+            threshold = config.score_threshold_for(class_name)
+            score = float(det.get("score", 0.0))
+            if score >= threshold:
+                kept.append(det)
+                continue
+            canonical = tracking.canonical_class_name(class_name) or class_name
+            removed_by_class[canonical] += 1
+            if len(removed_examples) < config.diagnostic_examples_per_reason:
+                removed_examples.append({
+                    "frame_id": str(frame.get("frame_id", "")),
+                    "detection_index": index,
+                    "class_name": class_name,
+                    "score": round(score, 4),
+                    "threshold": threshold,
+                })
+        frame["detections"] = kept
+        frame["num_detections"] = len(kept)
+    after = sum(len(frame.get("detections", [])) for frame in frames)
+    return {
+        "policy": {
+            "score_threshold": config.score_threshold,
+            "class_score_thresholds": {
+                class_name: threshold
+                for class_name, threshold in config.class_score_thresholds
+            },
+        },
+        "detections_before": before,
+        "detections_after": after,
+        "detections_removed": before - after,
+        "removed_by_class": dict(sorted(removed_by_class.items())),
+        "removed_examples": removed_examples,
+    }
+
+
 def apply_hard_filters(frames: List[Dict[str, Any]], clip: Path,
                        config: HardFilterConfig = HardFilterConfig()) -> Dict[str, Any]:
     """Apply the annotation contract before class pre-association.
@@ -125,13 +193,14 @@ def apply_hard_filters(frames: List[Dict[str, Any]], clip: Path,
             else:
                 box = det["box_lidar"]
                 class_name = str(det.get("class_name", ""))
-                if float(det.get("score", 0.0)) < config.score_threshold:
+                score_threshold = config.score_threshold_for(class_name)
+                if float(det.get("score", 0.0)) < score_threshold:
                     reasons.append("score")
                 if not _class_allowed(class_name, config.keep_classes):
                     reasons.append("class_whitelist")
                 if not _in_annotation_range(box, config):
                     reasons.append("annotation_range")
-                if (class_name == "Pedestrian"
+                if (tracking.canonical_class_name(class_name) == "Pedestrian"
                         and math.hypot(float(box[0]), float(box[1]))
                         > config.pedestrian_max_distance):
                     reasons.append("distant_pedestrian")
@@ -167,6 +236,10 @@ def apply_hard_filters(frames: List[Dict[str, Any]], clip: Path,
     return {
         "policy": {
             "score_threshold": config.score_threshold,
+            "class_score_thresholds": {
+                class_name: threshold
+                for class_name, threshold in config.class_score_thresholds
+            },
             "range_front": config.range_front,
             "range_rear": config.range_rear,
             "range_side": config.range_side,

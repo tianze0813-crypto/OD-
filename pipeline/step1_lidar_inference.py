@@ -5,7 +5,7 @@ Input is an unlabelled SUST clip (``lidar/lidar_top/*.bin`` plus
 ``transforms/``).  Output is the ``*_raw.json`` consumed by step 2.
 
 Run this step with the OpenPCDet environment, for example:
-    /home/moga/miniconda3/envs/openpcdet/bin/python pipeline/step1_lidar_inference.py \
+    python pipeline/step1_lidar_inference.py \
         --clip /path/to/scene_clip
 """
 

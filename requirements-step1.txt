@@ -1,0 +1,29 @@
+# Runtime dependencies for pipeline/step1_lidar_inference.py and
+# inference/run_prelabel.py.
+#
+# Python 3.10 and a CUDA-enabled PyTorch build are recommended. Install the
+# torch/CUDA pair and the matching spconv wheel before this file; the versions
+# below are the combination verified on the current workstation.
+numpy==1.26.4
+scipy==1.15.3
+Pillow==12.2.0
+pandas==2.3.3
+av2==0.3.6
+kornia==0.6.12
+numba==0.65.1
+llvmlite==0.47.0
+PyYAML==6.0.3
+easydict==1.13
+tensorboardX==2.6.5
+scikit-image==0.25.2
+tqdm==4.67.3
+SharedArray==3.2.4
+opencv-python==4.11.0.86
+pyquaternion==0.9.9
+
+# These wheels must match the installed CUDA runtime. For CUDA 12.4 use:
+#   torch==2.5.1+cu124
+#   torchvision==0.20.1+cu124
+#   spconv-cu124==2.3.8
+# They are kept as comments because pip's package index selection determines
+# the CUDA variant; see the README installation commands.

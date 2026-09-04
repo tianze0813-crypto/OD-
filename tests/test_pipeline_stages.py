@@ -10,6 +10,7 @@ import numpy as np
 from pipeline import step2_5_class_correction as step25
 from pipeline import step2_identity as step2
 from pipeline import step3_refinement as step3
+from filtering.hard_filters import HardFilterConfig, apply_category_score_filter
 
 
 def make_clip(root: Path) -> Path:
@@ -40,6 +41,24 @@ def frame(class_name="Car", track_id=None):
 
 
 class PipelineStageContractTest(unittest.TestCase):
+    def test_pre_step2_score_filter_is_category_specific(self):
+        frames = [{
+            "frame_id": "0",
+            "detections": [
+                dict(frame("Car")["detections"][0], score=0.25),
+                dict(frame("Truck")["detections"][0], score=0.26),
+                dict(frame("Bus")["detections"][0], score=0.24),
+                dict(frame("Pedestrian")["detections"][0], score=0.30),
+            ],
+            "num_detections": 4,
+        }]
+        result = apply_category_score_filter(frames, HardFilterConfig())
+        self.assertEqual(result["detections_removed"], 1)
+        self.assertEqual(result["removed_by_class"], {"Bus": 1})
+        self.assertEqual(
+            [d["class_name"] for d in frames[0]["detections"]],
+            ["Car", "Truck", "Pedestrian"])
+
     def test_step2_filters_after_identity_assignment(self):
         source = [frame()]
         seen = {}

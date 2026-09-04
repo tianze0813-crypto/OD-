@@ -122,8 +122,16 @@ def run(
 
 
 def _hard_config(args: argparse.Namespace) -> HardFilterConfig:
+    class_score_thresholds = (
+        ("Car", args.car_score_threshold),
+        ("Truck", args.truck_score_threshold),
+        ("Bus", args.bus_score_threshold),
+        ("Pedestrian", args.pedestrian_score_threshold),
+        ("Nonmotorized_vehicle", args.nonmotorized_score_threshold),
+    )
     return HardFilterConfig(
         score_threshold=args.score_threshold,
+        class_score_thresholds=class_score_thresholds,
         range_front=args.range_front,
         range_rear=args.range_rear,
         range_side=args.range_side,
@@ -145,6 +153,11 @@ def main() -> None:
     parser.add_argument("--diagnostics", type=Path)
     parser.add_argument("--min-lifecycle", type=int, default=4)
     parser.add_argument("--score-threshold", type=float, default=0.3)
+    parser.add_argument("--car-score-threshold", type=float, default=0.25)
+    parser.add_argument("--truck-score-threshold", type=float, default=0.25)
+    parser.add_argument("--bus-score-threshold", type=float, default=0.25)
+    parser.add_argument("--pedestrian-score-threshold", type=float, default=0.3)
+    parser.add_argument("--nonmotorized-score-threshold", type=float, default=0.3)
     parser.add_argument("--range-front", type=float, default=80.0)
     parser.add_argument("--range-rear", type=float, default=20.0)
     parser.add_argument("--range-side", type=float, default=40.0)

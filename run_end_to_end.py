@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -32,10 +33,33 @@ if str(ROOT) not in sys.path:
 
 from tracking import tracker_conservative as tracking
 from filtering.five_class_output import apply_five_class_output
+from filtering.hard_filters import HardFilterConfig, apply_category_score_filter
 
 
-DEFAULT_INFERENCE_PYTHON = "/home/moga/miniconda3/envs/openpcdet/bin/python"
-DEFAULT_POST_PYTHON = "/home/moga/miniconda3/envs/sustechpoints/bin/python"
+def _first_existing(*candidates: Path) -> str:
+    """Choose an explicit env override, then a known local conda install."""
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return sys.executable
+
+
+_HOME = Path.home()
+DEFAULT_INFERENCE_PYTHON = _first_existing(
+    Path(os.environ["OPENPCDET_PYTHON"])
+    if os.environ.get("OPENPCDET_PYTHON") else Path(""),
+    _HOME / "miniconda3" / "envs" / "openpcdet" / "bin" / "python",
+    _HOME / "anaconda3" / "envs" / "openpcdet" / "bin" / "python",
+)
+DEFAULT_POST_PYTHON = _first_existing(
+    Path(os.environ["POSTPROCESS_PYTHON"])
+    if os.environ.get("POSTPROCESS_PYTHON") else Path(""),
+    Path(os.environ["OPENPCDET_PYTHON"])
+    if os.environ.get("OPENPCDET_PYTHON") else Path(""),
+    _HOME / "miniconda3" / "envs" / "openpcdet" / "bin" / "python",
+    _HOME / "miniconda3" / "envs" / "sustechpoints" / "bin" / "python",
+    _HOME / "anaconda3" / "envs" / "openpcdet" / "bin" / "python",
+)
 DEFAULT_SUST_ROOT = ROOT.parent / "SUSTechPOINTS" / "data"
 
 
@@ -97,6 +121,12 @@ def main():
                         default=Path(DEFAULT_INFERENCE_PYTHON))
     parser.add_argument("--post-python", type=Path,
                         default=Path(DEFAULT_POST_PYTHON))
+    parser.add_argument("--cfg", type=Path,
+                        default=ROOT / "models" / "voxelnext_fiveclass_nuscenes_infer.yaml",
+                        help="Step1 OpenPCDet inference config")
+    parser.add_argument("--ckpt", type=Path,
+                        default=ROOT / "models" / "vn5_nuscenes_checkpoint_epoch_12.pth",
+                        help="Step1 model checkpoint")
     parser.add_argument("--export-sust", action="store_true",
                         help="把最终 pre clip 复制到 SUSTechPOINTS/data")
     parser.add_argument("--sust-root", type=Path, default=DEFAULT_SUST_ROOT)
@@ -111,9 +141,37 @@ def main():
                         help=argparse.SUPPRESS)
     parser.add_argument("--car-only", "--step6-car-only", dest="car_only",
                         action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--score-thresh", type=float, default=0.3)
+    parser.add_argument(
+        "--score-thresh", type=float, default=None,
+        help="兼容参数：显式设置后覆盖全部类别阈值")
+    parser.add_argument("--car-score-thresh", type=float, default=0.25)
+    parser.add_argument("--truck-score-thresh", type=float, default=0.25)
+    parser.add_argument("--bus-score-thresh", type=float, default=0.25)
+    parser.add_argument("--pedestrian-score-thresh", type=float, default=0.3)
+    parser.add_argument("--nonmotorized-score-thresh", type=float, default=0.3)
     parser.add_argument("--drop-vis-below", type=float, default=0.05)
     args = parser.parse_args()
+
+    if args.score_thresh is not None:
+        # Preserve the old all-class override for callers that still pass it.
+        args.car_score_thresh = args.truck_score_thresh = args.bus_score_thresh = args.score_thresh
+        args.pedestrian_score_thresh = args.nonmotorized_score_thresh = args.score_thresh
+    step1_score_thresh = min(
+        args.car_score_thresh, args.truck_score_thresh,
+        args.bus_score_thresh, args.pedestrian_score_thresh,
+        args.nonmotorized_score_thresh)
+    fallback_score_thresh = (args.score_thresh
+                             if args.score_thresh is not None else 0.3)
+    score_config = HardFilterConfig(
+        score_threshold=fallback_score_thresh,
+        class_score_thresholds=(
+            ("Car", args.car_score_thresh),
+            ("Truck", args.truck_score_thresh),
+            ("Bus", args.bus_score_thresh),
+            ("Pedestrian", args.pedestrian_score_thresh),
+            ("Nonmotorized_vehicle", args.nonmotorized_score_thresh),
+        ),
+    )
 
     clips = collect_clips(args)
     if args.raw_json and len(clips) != 1:
@@ -149,8 +207,24 @@ def main():
                 run([args.inference_python,
                      ROOT / "pipeline" / "step1_lidar_inference.py",
                      "--clip", clip, "--work-root", step1_root,
-                     "--score-thresh", args.score_thresh,
+                     "--cfg", args.cfg,
+                     "--ckpt", args.ckpt,
+                     "--score-thresh", step1_score_thresh,
                      "--drop-vis-below", args.drop_vis_below])
+
+            # Step1 must run at the lowest category threshold.  Remove only
+            # category-score noise here; all geometry/visibility filters stay
+            # after ID assignment in Step2 and Step2.5.
+            raw_frames = json.loads(raw_json.read_text(encoding="utf-8"))
+            pre_step2_score_filter = apply_category_score_filter(
+                raw_frames, score_config)
+            raw_json.write_text(
+                json.dumps(raw_frames, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8")
+            print(
+                "pre-Step2 category score filter: "
+                f"removed={pre_step2_score_filter['detections_removed']}",
+                flush=True)
 
             step2_json = step2_root / f"{base}_step2.json"
             step2_diag = step2_root / f"{base}_step2_diagnostics.json"
@@ -159,7 +233,12 @@ def main():
                  "--in-json", raw_json, "--clip", clip,
                  "--out-json", step2_json,
                  "--diagnostics", step2_diag,
-                 "--score-threshold", args.score_thresh,
+                 "--score-threshold", fallback_score_thresh,
+                 "--car-score-threshold", args.car_score_thresh,
+                 "--truck-score-threshold", args.truck_score_thresh,
+                 "--bus-score-threshold", args.bus_score_thresh,
+                 "--pedestrian-score-threshold", args.pedestrian_score_thresh,
+                 "--nonmotorized-score-threshold", args.nonmotorized_score_thresh,
                  "--visibility-min-ratio", args.drop_vis_below,
                  "--sparsity-max-points", args.sparsity_max_points])
 
@@ -171,7 +250,12 @@ def main():
                  "--step2-diagnostics", step2_diag,
                  "--clip", clip, "--out-json", step2_5_json,
                  "--diagnostics", step2_5_diag,
-                 "--score-threshold", args.score_thresh,
+                 "--score-threshold", fallback_score_thresh,
+                 "--car-score-threshold", args.car_score_thresh,
+                 "--truck-score-threshold", args.truck_score_thresh,
+                 "--bus-score-threshold", args.bus_score_thresh,
+                 "--pedestrian-score-threshold", args.pedestrian_score_thresh,
+                 "--nonmotorized-score-threshold", args.nonmotorized_score_thresh,
                  "--visibility-min-ratio", args.drop_vis_below,
                  "--sparsity-max-points", args.sparsity_max_points,
                  "--min-lifecycle", args.short_track_max_frames])
@@ -222,6 +306,7 @@ def main():
                 "target_classes": list(tracking.TARGET_CLASSES),
                 "boxes_converted": final_result["boxes_converted"],
                 "removed_by_reason": final_result["removed_by_reason"],
+                "pre_step2_score_filter": pre_step2_score_filter,
                 "sust_export": str(sust_dest) if sust_dest else None,
             })
 

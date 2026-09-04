@@ -4,10 +4,44 @@
 
 输出：输入 clip 同级目录下的 `<clip>_pre`，即原始 clip 改名后增加 `label/`。
 
+## Step1 环境依赖
+
+Step1 必须使用同时安装了 CUDA PyTorch、对应 CUDA 版 `spconv` 和 OpenPCDet
+的 Python 环境；只安装后处理依赖的环境不能运行 `inference/run_prelabel.py`。
+仓库提供了已验证的 Python 依赖清单：`requirements-step1.txt`。当前工作站使用
+Python 3.10、PyTorch 2.5.1 + CUDA 12.4、`spconv-cu124==2.3.8`，可按下面命令
+安装（已有相同版本时 pip 会跳过）：
+
+```bash
+export OPENPCDET_PYTHON=/home/zhu/miniconda3/envs/openpcdet/bin/python
+export OPENPCDET_ROOT=/path/to/OpenPCDet
+
+$OPENPCDET_PYTHON -m pip install \
+  torch==2.5.1 torchvision==0.20.1 \
+  --index-url https://download.pytorch.org/whl/cu124
+$OPENPCDET_PYTHON -m pip install spconv-cu124==2.3.8
+$OPENPCDET_PYTHON -m pip install -r requirements-step1.txt
+$OPENPCDET_PYTHON -m pip install -e "$OPENPCDET_ROOT"
+```
+
+`OPENPCDET_ROOT` 应指向包含 `pcdet/` 和 `setup.py` 的 OpenPCDet checkout；如果
+该环境中 `import pcdet` 已经成功，可跳过最后一条安装命令。安装完成后先执行：
+
+```bash
+$OPENPCDET_PYTHON scripts/check_step1_env.py
+```
+
+该检查会验证 CUDA 是否可用、五类配置是否与 checkpoint 的五个 head 一致，以及
+关键 Python 模块是否可导入。当前机器的 `sustechpoints` 环境没有 `torch`、`pcdet`、
+`spconv` 和 `opencv-python`，端到端运行时请把 `--inference-python`（以及需要时的
+`--post-python`）显式指向已通过检查的环境。
+
 ## 一键端到端
 
 ```bash
-/home/moga/miniconda3/envs/sustechpoints/bin/python run_end_to_end.py \
+$OPENPCDET_PYTHON run_end_to_end.py \
+  --inference-python "$OPENPCDET_PYTHON" \
+  --post-python "$OPENPCDET_PYTHON" \
   --clip /path/to/scene_clip \
   --export-sust
 ```
@@ -15,7 +49,9 @@
 批量目录：
 
 ```bash
-/home/moga/miniconda3/envs/sustechpoints/bin/python run_end_to_end.py \
+$OPENPCDET_PYTHON run_end_to_end.py \
+  --inference-python "$OPENPCDET_PYTHON" \
+  --post-python "$OPENPCDET_PYTHON" \
   --clip-dir /path/to/clips \
   --export-sust
 ```
@@ -156,10 +192,10 @@ Step2--Step3 的 `lidar_top` 点云计算；否则点云拟合、跟踪、yaw �
 
 ### Step 1：lidar 推理 + 可见度元数据
 
-使用 OpenPCDet 环境：
+使用通过 `scripts/check_step1_env.py` 检查的 OpenPCDet 环境：
 
 ```bash
-/home/moga/miniconda3/envs/openpcdet/bin/python pipeline/step1_lidar_inference.py \
+$OPENPCDET_PYTHON pipeline/step1_lidar_inference.py \
   --clip /path/to/scene_clip
 ```
 
@@ -367,5 +403,5 @@ models/          推理配置与模型权重
 ## 测试
 
 ```bash
-/home/moga/miniconda3/envs/sustechpoints/bin/python -m unittest discover -s tests -v
+$OPENPCDET_PYTHON -m unittest discover -s tests -v
 ```

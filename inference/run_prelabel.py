@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Production pre-annotation inference for xyzi .bin point clouds.
 
-Run from /home/moga/桌面/OpenPcdet/OD预标注 (where the `cfgs` symlink lives):
-    python /home/moga/桌面/pandarset/run_prelabel.py \
-        --cfg_file cfgs/pandaset_models/voxelnext_pandaset.yaml \
+Run with the Python interpreter from the OpenPCDet environment:
+    python inference/run_prelabel.py \
+        --cfg_file models/voxelnext_fiveclass_nuscenes_infer.yaml \
         --ckpt /path/to/checkpoint_epoch_N.pth \
         --lidar_dir /path/to/clip/lidar/lidar_top \
         --out_json /path/to/results.json
