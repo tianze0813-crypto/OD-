@@ -118,6 +118,48 @@ class PipelineStageContractTest(unittest.TestCase):
         after = copy.deepcopy(before)
         self.assertEqual(step3._verify_non_car_geometry(before, after)["passed"], True)
 
+    def test_step3_runs_legacy_car_geometry_before_new_class_routes(self):
+        source = [frame("Car", 7)]
+        seen = {}
+
+        def fake_yaw(frames, *_args):
+            return frames, {}
+
+        def fake_geometry(frames, *_args, classes=None):
+            seen["geometry_classes"] = classes
+            return copy.deepcopy(frames), {"tracks": 1, "boxes": 1}
+
+        def fake_car_fit(frames, *_args):
+            seen["car_fit"] = True
+            return copy.deepcopy(frames), {
+                "car_tracks": 1,
+                "car_boxes": 1,
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            clip = make_clip(Path(directory))
+            input_json = clip / "step2_5.json"
+            diag_json = clip / "step2_5_diag.json"
+            input_json.write_text(json.dumps(source), encoding="utf-8")
+            diag_json.write_text(json.dumps({"tracking": {}}), encoding="utf-8")
+            with patch.object(step3, "stabilize_static_yaw",
+                              return_value=([], {})), \
+                    patch.object(step3, "apply_yaw_integrated", fake_yaw), \
+                    patch.object(step3, "apply_geometry_legacy", fake_geometry), \
+                    patch.object(step3, "apply_car_box_fit", fake_car_fit), \
+                    patch.object(step3, "merge_overlapping_truck_tracks",
+                                 return_value={}), \
+                    patch.object(step3, "unify_nonmotorized_track_sizes",
+                                 return_value={}):
+                result = step3.run(
+                    input_json, diag_json, clip, clip / "out.json",
+                    diagnostics_path=clip / "out_diag.json")
+
+        self.assertEqual(seen["geometry_classes"], ("Car",))
+        self.assertTrue(seen["car_fit"])
+        self.assertEqual(result["car_tracks"], 1)
+        self.assertEqual(result["car_boxes"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

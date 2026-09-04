@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Step 3: public yaw followed by Truck and nonmotorized refinement.
+"""Step 3: public yaw followed by class-specific geometry refinement.
 
-Yaw is shared by all five classes. Truck receives duplicate-track cleanup,
-which may absorb a duplicate Car track. Nonmotorized_vehicle receives
-track-size, center, and trajectory-yaw refinement; remaining
-Car/Bus/Pedestrian boxes are yaw-only pass-throughs.
+Yaw is shared by all five classes. Car keeps the reviewed legacy geometry and
+Car box fitting path. Truck receives duplicate-track cleanup, which may absorb
+a duplicate Car track. Nonmotorized_vehicle receives track-size, center, and
+trajectory-yaw refinement; Bus and Pedestrian remain yaw-only pass-throughs.
 """
 
 from __future__ import annotations
@@ -23,6 +23,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from geometry.box_geometry import GeometryConfig, apply_geometry_legacy
+from geometry.car_box_fit import CarBoxFitConfig, apply_car_box_fit
 from geometry.multiclass_refinement import (
     NonmotorizedSizeConfig,
     TruckOverlapConfig,
@@ -78,7 +80,9 @@ def run(
         out_json: Path,
         out_clip: Optional[Path] = None,
         diagnostics_path: Optional[Path] = None,
-        *, truck_config: TruckOverlapConfig = TruckOverlapConfig(),
+        *, geometry_config: GeometryConfig = GeometryConfig(),
+        car_config: CarBoxFitConfig = CarBoxFitConfig(),
+        truck_config: TruckOverlapConfig = TruckOverlapConfig(),
         nonmotorized_config: NonmotorizedSizeConfig = NonmotorizedSizeConfig(),
 ) -> Dict[str, Any]:
     source = json.loads(Path(step2_5_json).read_text(encoding="utf-8"))
@@ -98,10 +102,21 @@ def run(
         frames, before_yaw, coords, Path(clip), tracking_diagnostics,
         static_yaw_diagnostics)
 
-    # Class-specific refinements run after the shared yaw stage. Keeping the
-    # original IDs through yaw preserves static-slot diagnostics; Truck IDs
-    # are then merged and NMV centers/sizes/yaw are refined for annotation.
-    before_multiclass = copy.deepcopy(yawed)
+    # Keep the reviewed Car geometry path unchanged. It runs after the public
+    # yaw stage and before the new Truck/NMV routes; the latter only add their
+    # class-specific behavior and do not replace this Car fitting.
+    car_generic, generic_diagnostics = apply_geometry_legacy(
+        yawed, coords, Path(clip), tracking_diagnostics,
+        static_yaw_diagnostics, geometry_config, classes=("Car",))
+    car_output, car_diagnostics = apply_car_box_fit(
+        car_generic, coords, Path(clip), tracking_diagnostics,
+        static_yaw_diagnostics, car_config)
+
+    # Keeping the original IDs through yaw and Car fitting preserves
+    # static-slot diagnostics. Truck IDs are then merged and NMV
+    # centers/sizes/yaw are refined for annotation.
+    before_multiclass = copy.deepcopy(car_output)
+    yawed = car_output
     truck_diagnostics = merge_overlapping_truck_tracks(
         yawed, coords, truck_config)
     nonmotorized_diagnostics = unify_nonmotorized_track_sizes(
@@ -115,19 +130,6 @@ def run(
         for det in frame.get("detections", [])
         if det.get("track_id") is not None
     }
-    car_diagnostics = {
-        "enabled": False,
-        "policy": "Car refinement disabled; public yaw only",
-        "car_tracks": 0,
-        "car_boxes": 0,
-        "tracks": 0,
-        "boxes": 0,
-    }
-    generic_diagnostics = {
-        "enabled": False,
-        "policy": "No generic/Car geometry in this Step3 route",
-    }
-
     class_counts = Counter(
         str(det.get("class_name", ""))
         for frame in output for det in frame.get("detections", []))
@@ -140,9 +142,9 @@ def run(
         "input_detections": _count(source),
         "stage_order": [
             "public_yaw_static_and_dynamic",
+            "class_route_car_geometry",
             "class_route_truck_overlap_id_merge",
             "class_route_nonmotorized_size_center_yaw",
-            "class_route_car_yaw_only",
             "class_route_bus_passthrough",
             "class_route_pedestrian_passthrough",
         ],
@@ -150,7 +152,7 @@ def run(
         "static_yaw_stabilization": static_yaw_diagnostics,
         "yaw_integrated": yaw_diagnostics,
         "class_routes": {
-            "Car": "public_yaw_only_unless_absorbed_by_duplicate_truck",
+            "Car": "apply_geometry_legacy_then_apply_car_box_fit",
             "Truck": "merge_truck_overlaps_near_tracks_and_truck_car_duplicates",
             "Bus": "passthrough",
             "Pedestrian": "passthrough",
@@ -164,8 +166,8 @@ def run(
             "truck": truck_diagnostics,
             "nonmotorized_vehicle": nonmotorized_diagnostics,
         },
-        "car_tracks": 0,
-        "car_boxes": 0,
+        "car_tracks": car_diagnostics.get("car_tracks", 0),
+        "car_boxes": car_diagnostics.get("car_boxes", 0),
         "tracks": len(output_track_ids),
         "boxes": _count(output),
         "class_counts": dict(sorted(class_counts.items())),

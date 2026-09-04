@@ -71,7 +71,7 @@ $OPENPCDET_PYTHON run_end_to_end.py \
   -> step1  lidar 推理 + 相机可见度元数据
   -> step2  类别无关 identity + 第一遍 hard-filter / 去重
   -> step2.5 轨迹类别修正 + 第二遍 hard-filter / 短轨迹处理
-  -> step3  公共 yaw + Truck/Nonmotorized_vehicle 分治精修（Car 仅保留 yaw）
+  -> step3  公共 yaw + Car 原有几何精修 + Truck/Nonmotorized_vehicle 分治精修
   -> final 五类规范化 + box 转换到 base_link
   -> SUST clip
 
@@ -269,13 +269,14 @@ python pipeline/five_class_postprocess.py \
   --output-json work/final/<clip>_final.json
 ```
 
-Step3 先对所有类别执行公共 yaw。此版本不执行 Car 几何/尺寸精修，仅保留 Car
-的 yaw 结果。Truck 随后检查同帧高重叠框、连续近距离框，以及 Truck-Car
+Step3 先对所有类别执行公共 yaw，随后保留原有 Car 几何/尺寸精修（通用几何约束、
+shrink-only XY、地面/车顶 Z 拟合）。Truck 随后检查同帧高重叠框、连续近距离框，以及 Truck-Car
 高 BEV IoU 重复框：统一以 Truck 为保留类别合并 track ID，Car 观测会转成
 Truck，并删除合并后同帧的重复框。Nonmotorized_vehicle
 按轨迹计算稳健的中位物理尺寸：小框优先保留检测中心并补齐尺寸，大框同时向轨迹
 中心修正；最后用修正后的中心轨迹更新 yaw。Bus/Pedestrian 保持透传。
-Car 的旧 shrink-only XY/地面/车顶模块仍保留用于兼容回放，不参与当前 Step3。
+Car 不叠加 Truck/Nonmotorized_vehicle 的新规则；Truck 和 Nonmotorized_vehicle
+只执行各自的新增分治精修。
 
 ### 旧 Step 4/Step 5（兼容脚本）
 
