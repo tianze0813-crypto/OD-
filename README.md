@@ -146,7 +146,7 @@ bash scripts/run_five_class.sh ~/sust/data ~/SUSTechPOINTS/data
   -> Step1 后置类别分数过滤
   -> Step2: 类别无关 identity 跟踪 + 第一遍硬过滤 + 同中心去重
   -> Step2.5: 按 track_id 类别投票 + 第二遍硬过滤 + 短轨迹过滤
-  -> Step3: 公共 yaw + Car 几何 + Truck/NMV 分治精修
+  -> Step3: 公共 yaw + Car 专用贴合 + 其他四类通用几何 + Truck/NMV 分治精修
   -> final: 五类规范化 + lidar_top -> base_link
   -> <clip>_pre/label/*.json
 ```
@@ -212,13 +212,17 @@ Step3 先对五类执行公共 yaw：动态目标使用运动方向，静止目�
 
 **Car** 保留原有几何精修：
 
-- 按轨迹估计稳定的 `dx/dy/dz`；
+- 公共 yaw 后直接进入 Car 专用贴合，不经过通用轨迹几何平滑；
 - 使用点云可见车面做 shrink-only XY 贴合，不因噪点盲目扩大 box；
-- 静止车使用停车位和点云的稳健中心，动态车使用平滑轨迹中心；
+- 静止车只在证据不足的轴上使用轨迹稳健尺寸；
 - 使用地面点拟合底部，使用连续车顶点云拟合顶部；
-- 证据不足时回退到轨迹高度和原始中心，并限制单帧移动幅度。
+- 证据不足时回退到轨迹高度和输入中心。
 
 Car 几何只修改 `box_lidar[0:6]`，不修改 yaw、ID、类别或框是否存在。
+
+**其他四类通用几何** 对 Truck、Bus、Pedestrian 和
+Nonmotorized_vehicle 执行轨迹级尺寸稳定、静态/动态中心平滑和地面 Z 修正。Car
+明确排除在这个通用阶段之外。
 
 **Truck** 处理重复和重叠：
 
@@ -236,7 +240,7 @@ Car 几何只修改 `box_lidar[0:6]`，不修改 yaw、ID、类别或框是否�
 - 大框同时修正中心和尺寸；
 - 用修正后的中心轨迹重新更新 yaw。
 
-Bus 和 Pedestrian 在 Step3 只经过公共 yaw，不叠加其他类别的几何规则。
+Bus 和 Pedestrian 在 Step3 经过公共 yaw 和通用几何，不执行 Truck/NMV 的专项规则。
 
 ### final：规范化和坐标转换
 

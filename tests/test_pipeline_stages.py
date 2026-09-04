@@ -118,18 +118,20 @@ class PipelineStageContractTest(unittest.TestCase):
         after = copy.deepcopy(before)
         self.assertEqual(step3._verify_non_car_geometry(before, after)["passed"], True)
 
-    def test_step3_runs_legacy_car_geometry_before_new_class_routes(self):
+    def test_step3_keeps_car_out_of_generic_geometry(self):
         source = [frame("Car", 7)]
-        seen = {}
+        seen = {"order": []}
 
         def fake_yaw(frames, *_args):
             return frames, {}
 
         def fake_geometry(frames, *_args, classes=None):
+            seen["order"].append("generic")
             seen["geometry_classes"] = classes
             return copy.deepcopy(frames), {"tracks": 1, "boxes": 1}
 
         def fake_car_fit(frames, *_args):
+            seen["order"].append("car")
             seen["car_fit"] = True
             return copy.deepcopy(frames), {
                 "car_tracks": 1,
@@ -155,7 +157,11 @@ class PipelineStageContractTest(unittest.TestCase):
                     input_json, diag_json, clip, clip / "out.json",
                     diagnostics_path=clip / "out_diag.json")
 
-        self.assertEqual(seen["geometry_classes"], ("Car",))
+        self.assertEqual(seen["order"], ["car", "generic"])
+        self.assertEqual(
+            seen["geometry_classes"],
+            ("Truck", "Bus", "Pedestrian", "Nonmotorized_vehicle"))
+        self.assertNotIn("Car", seen["geometry_classes"])
         self.assertTrue(seen["car_fit"])
         self.assertEqual(result["car_tracks"], 1)
         self.assertEqual(result["car_boxes"], 1)

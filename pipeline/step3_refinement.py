@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Step 3: public yaw followed by class-specific geometry refinement.
 
-Yaw is shared by all five classes. Car keeps the reviewed legacy geometry and
-Car box fitting path. Truck receives duplicate-track cleanup, which may absorb
-a duplicate Car track. Nonmotorized_vehicle receives track-size, center, and
-trajectory-yaw refinement; Bus and Pedestrian remain yaw-only pass-throughs.
+Yaw is shared by all five classes. Car runs only the reviewed point-cloud box
+fitter. The other four classes receive generic track geometry stabilization;
+Truck and Nonmotorized_vehicle then run their additional class-specific rules.
 """
 
 from __future__ import annotations
@@ -36,6 +35,11 @@ from geometry.static_yaw import stabilize_static_yaw
 from geometry.yaw_integrated import apply_yaw_integrated
 from tracking import tracker_conservative as tracking
 from tracking.tracker_static_first import StaticSlot
+
+
+GENERIC_GEOMETRY_CLASSES = (
+    "Truck", "Bus", "Pedestrian", "Nonmotorized_vehicle",
+)
 
 
 def slots_from_tracking_diagnostics(
@@ -102,21 +106,23 @@ def run(
         frames, before_yaw, coords, Path(clip), tracking_diagnostics,
         static_yaw_diagnostics)
 
-    # Keep the reviewed Car geometry path unchanged. It runs after the public
-    # yaw stage and before the new Truck/NMV routes; the latter only add their
-    # class-specific behavior and do not replace this Car fitting.
-    car_generic, generic_diagnostics = apply_geometry_legacy(
-        yawed, coords, Path(clip), tracking_diagnostics,
-        static_yaw_diagnostics, geometry_config, classes=("Car",))
+    # Match the reviewed police-pipeline Car route: feed the post-yaw boxes
+    # directly into the dedicated shrink-only point-cloud fitter. In
+    # particular, do not move or resize Car boxes in the generic stage first.
     car_output, car_diagnostics = apply_car_box_fit(
-        car_generic, coords, Path(clip), tracking_diagnostics,
+        yawed, coords, Path(clip), tracking_diagnostics,
         static_yaw_diagnostics, car_config)
 
-    # Keeping the original IDs through yaw and Car fitting preserves
-    # static-slot diagnostics. Truck IDs are then merged and NMV
-    # centers/sizes/yaw are refined for annotation.
-    before_multiclass = copy.deepcopy(car_output)
-    yawed = car_output
+    # Generic track-level center, size, and ground stabilization belongs only
+    # to the other four classes. Truck and NMV receive their specialized rules
+    # after this common pass.
+    generic_output, generic_diagnostics = apply_geometry_legacy(
+        car_output, coords, Path(clip), tracking_diagnostics,
+        static_yaw_diagnostics, geometry_config,
+        classes=GENERIC_GEOMETRY_CLASSES)
+
+    before_multiclass = copy.deepcopy(generic_output)
+    yawed = generic_output
     truck_diagnostics = merge_overlapping_truck_tracks(
         yawed, coords, truck_config)
     nonmotorized_diagnostics = unify_nonmotorized_track_sizes(
@@ -142,21 +148,20 @@ def run(
         "input_detections": _count(source),
         "stage_order": [
             "public_yaw_static_and_dynamic",
-            "class_route_car_geometry",
+            "class_route_car_box_fit_only",
+            "generic_geometry_other_four_classes",
             "class_route_truck_overlap_id_merge",
             "class_route_nonmotorized_size_center_yaw",
-            "class_route_bus_passthrough",
-            "class_route_pedestrian_passthrough",
         ],
         "tracking": tracking_diagnostics,
         "static_yaw_stabilization": static_yaw_diagnostics,
         "yaw_integrated": yaw_diagnostics,
         "class_routes": {
-            "Car": "apply_geometry_legacy_then_apply_car_box_fit",
-            "Truck": "merge_truck_overlaps_near_tracks_and_truck_car_duplicates",
-            "Bus": "passthrough",
-            "Pedestrian": "passthrough",
-            "Nonmotorized_vehicle": "robust_track_size_then_large_box_center_and_yaw_refinement",
+            "Car": "apply_car_box_fit_only",
+            "Truck": "generic_geometry_then_overlap_id_merge",
+            "Bus": "generic_geometry",
+            "Pedestrian": "generic_geometry",
+            "Nonmotorized_vehicle": "generic_geometry_then_robust_track_size_center_yaw",
         },
         "truck_overlap_merge": truck_diagnostics,
         "nonmotorized_size_refinement": nonmotorized_diagnostics,
