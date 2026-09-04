@@ -5,7 +5,8 @@ Input:
     /path/to/<clip>          unlabelled SUST clip
 
 Output:
-    /path/to/<clip>_pre      the input clip renamed, with label/<frame>.json
+    /path/to/<clip>_pre      the input clip renamed (or copied with
+                             --preserve-input), with label/<frame>.json
 
 Intermediate JSON files are written to a system temporary directory and are
 removed automatically.  ``--export-sust`` only copies the final ``<clip>_pre``
@@ -60,7 +61,7 @@ DEFAULT_POST_PYTHON = _first_existing(
     _HOME / "miniconda3" / "envs" / "sustechpoints" / "bin" / "python",
     _HOME / "anaconda3" / "envs" / "openpcdet" / "bin" / "python",
 )
-DEFAULT_SUST_ROOT = ROOT.parent / "SUSTechPOINTS" / "data"
+DEFAULT_SUST_ROOT = Path.home() / "SUSTechPOINTS" / "data"
 
 
 def run(cmd):
@@ -86,9 +87,19 @@ def collect_clips(args):
 
 
 def replace_clip_copy(src: Path, dst: Path):
+    dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.exists():
         shutil.rmtree(dst)
     shutil.copytree(src, dst)
+
+
+def materialize_final_clip(source: Path, destination: Path,
+                           *, preserve_input: bool) -> None:
+    """Create the final clip while optionally leaving the source untouched."""
+    if preserve_input:
+        shutil.copytree(source, destination)
+    else:
+        source.rename(destination)
 
 
 def write_labels_only(frames, clip_dir: Path) -> int:
@@ -131,8 +142,14 @@ def main():
                         help="把最终 pre clip 复制到 SUSTechPOINTS/data")
     parser.add_argument("--sust-root", type=Path, default=DEFAULT_SUST_ROOT)
     parser.add_argument("--final-suffix", type=str, default="_pre")
+    parser.add_argument(
+        "--final-root", type=Path,
+        help="把最终 clip 写入此目录（默认写到输入 clip 的同级目录）")
     parser.add_argument("--overwrite", action="store_true",
                         help="如果 <clip>_pre 已存在，先删除再生成")
+    parser.add_argument(
+        "--preserve-input", action="store_true",
+        help="保留原始 clip；复制一份生成 <clip>_pre（适合批处理）")
     # Retained as hidden compatibility flags. Five-class output does not run
     # the legacy Step5 point/lifecycle or Car-only filters.
     parser.add_argument("--sparsity-max-points", type=int, default=5,
@@ -176,6 +193,12 @@ def main():
     clips = collect_clips(args)
     if args.raw_json and len(clips) != 1:
         raise SystemExit("--raw-json 仅支持单个 --clip")
+    if args.final_root is not None:
+        args.final_root = args.final_root.expanduser().resolve()
+        args.final_root.mkdir(parents=True, exist_ok=True)
+    if args.export_sust:
+        args.sust_root = args.sust_root.expanduser().resolve()
+        args.sust_root.mkdir(parents=True, exist_ok=True)
 
     summaries = []
     with tempfile.TemporaryDirectory(prefix="fullchain_") as tmp:
@@ -191,7 +214,9 @@ def main():
         for index, clip in enumerate(clips, 1):
             base = clip.name
             input_clip_path = str(clip)
-            final_clip = clip.with_name(base + args.final_suffix)
+            final_clip = ((args.final_root / (base + args.final_suffix))
+                          if args.final_root is not None
+                          else clip.with_name(base + args.final_suffix))
             print(f"\n===== [{index}/{len(clips)}] {base} =====", flush=True)
 
             if final_clip.exists():
@@ -282,21 +307,30 @@ def main():
                 json.dumps(final_result, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8")
 
-            # No intermediate clip is stored.  The input clip itself is
-            # renamed to <clip>_pre and only label/ is added.
-            clip.rename(final_clip)
+            # No intermediate clip is stored.  By default the historical
+            # behavior renames the input clip.  The one-click deployment
+            # wrapper uses --preserve-input so source data remains reusable.
+            materialize_final_clip(
+                clip, final_clip, preserve_input=args.preserve_input)
             try:
                 labels = write_labels_only(
                     json.loads(final_json.read_text(encoding="utf-8")),
                     final_clip)
             except Exception:
-                final_clip.rename(clip)
+                if args.preserve_input:
+                    shutil.rmtree(final_clip, ignore_errors=True)
+                else:
+                    final_clip.rename(clip)
                 raise
 
             sust_dest = None
             if args.export_sust:
                 sust_dest = args.sust_root / final_clip.name
-                replace_clip_copy(final_clip, sust_dest)
+                if sust_dest.resolve() != final_clip.resolve():
+                    if sust_dest.exists() and not args.overwrite:
+                        raise SystemExit(
+                            f"SUST 输出已存在，加 --overwrite 覆盖：{sust_dest}")
+                    replace_clip_copy(final_clip, sust_dest)
                 print(f"SUST export: {sust_dest}", flush=True)
 
             summaries.append({

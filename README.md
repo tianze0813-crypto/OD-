@@ -1,412 +1,357 @@
-# BEV 预标注端到端后处理流水线
+# 五类别 BEV 预标注流水线
 
-输入：未标注的 SUST 原始 clip（含 `lidar/lidar_top/*.bin` 与 `transforms/`）。
+这是一套面向 SUSTechPOINTS 的 LiDAR 预标注后处理链路。它读取未标注的 SUST
+clip，使用五类别 VoxelNeXt 权重推理、跨帧跟踪、类别稳定和几何精修，最后生成
+可直接在 SUSTechPOINTS 中打开的 `label/*.json`。
 
-输出：输入 clip 同级目录下的 `<clip>_pre`，即原始 clip 改名后增加 `label/`。
+当前主链路只使用 Step1、Step2、Step2.5、Step3 和 final；旧的 Step4/Step5/Step6
+已经移到 `deprecated/`，不参与五类别端到端运行。
 
-## Step1 环境依赖
+## 一键运行
 
-Step1 必须使用同时安装了 CUDA PyTorch、对应 CUDA 版 `spconv` 和 OpenPCDet
-的 Python 环境；只安装后处理依赖的环境不能运行 `inference/run_prelabel.py`。
-仓库提供了已验证的 Python 依赖清单：`requirements-step1.txt`。当前工作站使用
-Python 3.10、PyTorch 2.5.1 + CUDA 12.4、`spconv-cu124==2.3.8`，可按下面命令
-安装（已有相同版本时 pip 会跳过）：
-
-```bash
-export OPENPCDET_PYTHON=/home/zhu/miniconda3/envs/openpcdet/bin/python
-export OPENPCDET_ROOT=/path/to/OpenPCDet
-
-$OPENPCDET_PYTHON -m pip install \
-  torch==2.5.1 torchvision==0.20.1 \
-  --index-url https://download.pytorch.org/whl/cu124
-$OPENPCDET_PYTHON -m pip install spconv-cu124==2.3.8
-$OPENPCDET_PYTHON -m pip install -r requirements-step1.txt
-$OPENPCDET_PYTHON -m pip install -e "$OPENPCDET_ROOT"
-```
-
-`OPENPCDET_ROOT` 应指向包含 `pcdet/` 和 `setup.py` 的 OpenPCDet checkout；如果
-该环境中 `import pcdet` 已经成功，可跳过最后一条安装命令。安装完成后先执行：
+在另一台机器上把仓库和模型文件准备好后，默认只需要执行：
 
 ```bash
-$OPENPCDET_PYTHON scripts/check_step1_env.py
+cd 五类别预标链路
+bash scripts/run_five_class.sh
 ```
 
-该检查会验证 CUDA 是否可用、五类配置是否与 checkpoint 的五个 head 一致，以及
-关键 Python 模块是否可导入。当前机器的 `sustechpoints` 环境没有 `torch`、`pcdet`、
-`spconv` 和 `opencv-python`，端到端运行时请把 `--inference-python`（以及需要时的
-`--post-python`）显式指向已通过检查的环境。
-
-## 一键端到端
-
-```bash
-$OPENPCDET_PYTHON run_end_to_end.py \
-  --inference-python "$OPENPCDET_PYTHON" \
-  --post-python "$OPENPCDET_PYTHON" \
-  --clip /path/to/scene_clip \
-  --export-sust
-```
-
-批量目录：
-
-```bash
-$OPENPCDET_PYTHON run_end_to_end.py \
-  --inference-python "$OPENPCDET_PYTHON" \
-  --post-python "$OPENPCDET_PYTHON" \
-  --clip-dir /path/to/clips \
-  --export-sust
-```
-
-`--export-sust` 可选：不传时只保留 `<clip>_pre`；传入时会把 `<clip>_pre`
-复制到 `SUSTechPOINTS/data/<clip>_pre`。
-
-如果 `<clip>_pre` 已存在，需要加 `--overwrite`。
-
-中间 JSON 全部写入系统临时目录，跑完自动删除；不再生成 `work/`，也不再复制
-中间 `_step2/_step3` clip。
-
-端到端脚本的有效链路如下。当前分支针对五类模型，Step4/Step5 不再参与端到端链路：
+默认路径是：
 
 ```text
-原始 clip
-  -> step1  lidar 推理 + 相机可见度元数据
-  -> step2  类别无关 identity + 第一遍 hard-filter / 去重
-  -> step2.5 轨迹类别修正 + 第二遍 hard-filter / 短轨迹处理
-  -> step3  公共 yaw + Car 原有几何精修 + Truck/Nonmotorized_vehicle 分治精修
-  -> final 五类规范化 + box 转换到 base_link
-  -> SUST clip
-
-模型输出类别固定为：`Car`、`Truck`、`Bus`、`Pedestrian`、
-`Nonmotorized_vehicle`。跟踪阶段不使用类别约束；类别在 Step2.5 完成 ID 后按轨迹多数票
-稳定，不再按 box 长度把 Car/Truck/Bus 互相改标。
-
-当前主链路默认类别置信度阈值为：`Car=0.25`、`Truck=0.40`、`Bus=0.40`、
-`Pedestrian=0.30`、`Nonmotorized_vehicle=0.30`。Step1 使用其中最低值取得候选，
-随后在进入 Step2 前按类别阈值清理低分检测；也可以用 `--score-thresh` 显式覆盖全部类别。
+输入：~/sust/data
+输出：~/SUSTechPOINTS/data
 ```
 
-## 坐标系与 base_link 约定
+也可以显式传入两个路径，分别表示输入目录和输出目录：
 
-### 当前使用的坐标系
+```bash
+bash scripts/run_five_class.sh \
+  ~/sust/data \
+  ~/SUSTechPOINTS/data
+```
 
-代码使用列向量和齐次变换，约定 `p_dst = T_dst_from_src @ p_src`。当前各坐标系的
-职责如下：
+只跑原始 Step1 推理（不跟踪、不做后处理）时使用第二个入口：
 
-| 坐标系 | 代码中的来源 | 用途 | 是否写入最终 label |
-| --- | --- | --- | --- |
-| `lidar_top` | `lidar/lidar_top/*.bin`，OpenPCDet 原始输出 | Step1--Step3 的 `box_lidar`、点云裁剪与几何拟合 | 否，final 后 box 已转换 |
-| `pose` | `transforms/pose_data.txt` 对应的局部帧 | 作为 `world_from_pose` 的输入帧；`CoordinateProvider` 的中间帧 | 否 |
-| `base_link` | `transforms/calib.json` 的 `tf2base_link` | final 转换后的 box 和最终 label 坐标 | 是，final 后写入 label |
-| `world` | `pose_data.txt` 的位姿输出帧 | 跟踪中心、静态车位、运动判断和 yaw 稳定 | 否 |
+```bash
+bash scripts/run_raw_inference.sh
+```
 
-**当前最终结论：`label/<frame>.json` 中的 box 是 `base_link` 局部坐标，
-不是 `lidar_top` 坐标，也不是 `world` 坐标。** final 之前内部字段仍叫
-`box_lidar`，但转换后会附加 `box_frame: "base_link"`；`tracking.box_to_label()`
-只把转换后的 `box_lidar` 映射到 SUST 的 `psr` 字段，不再做坐标变换：
+它默认把每个 clip 的原始结果保存为 `~/sust/raw_inference/<clip>_raw.json`，默认
+推理阈值为 `0.1`；可用 `--raw-output`、`--score-thresh` 和 `--overwrite` 调整。
+
+两种入口都只保留最终产物。完整链路的 Step1/Step2/Step2.5/Step3 JSON、诊断文件和
+临时 clip 都写入系统临时目录，进程结束后自动删除；原始推理模式也只把 raw JSON
+复制到 `--raw-output`，不会在输入 clip 下生成旁路文件。
+
+输入目录下面的每个子目录都应是一个原始 clip：
+
+```text
+~/sust/data/<clip>/
+├── lidar/lidar_top/*.bin
+├── transforms/calib.json
+├── transforms/pose_data.txt
+└── camera/                  # 可选，按当前 SUST clip 结构提供
+```
+
+输出目录会生成：
+
+```text
+~/SUSTechPOINTS/data/<clip>_pre/
+└── label/<frame_id>.json
+```
+
+一键脚本默认使用 `models/vn5_nuscenes_checkpoint_epoch_12.pth`。输入目录中的原始
+clip 不会被改名或写入，结果以 `<clip>_pre` 的副本形式输出，便于反复调试。
+
+常用选项：
+
+```bash
+# 覆盖已经存在的输出
+bash scripts/run_five_class.sh ~/sust/data ~/SUSTechPOINTS/data --overwrite
+
+# 只检查/安装环境，不运行推理
+bash scripts/run_five_class.sh --check-only
+
+# 已经准备好环境时，禁止自动安装
+bash scripts/run_five_class.sh --skip-install
+
+# 使用其他五类别权重
+bash scripts/run_five_class.sh \
+  ~/sust/data ~/SUSTechPOINTS/data \
+  --ckpt models/nusc_frozen20_epoch20.pth
+
+# 临时让全部类别使用同一个阈值
+bash scripts/run_five_class.sh \
+  ~/sust/data ~/SUSTechPOINTS/data \
+  --score-thresh 0.3
+
+# 完整链路只跑验证，不导出最终 clip 到 SUST
+bash scripts/run_five_class.sh \
+  ~/sust/data ~/SUSTechPOINTS/data \
+  --no-export-sust
+```
+
+`--score-thresh` 是兼容参数，会覆盖五个类别的阈值。未传该参数时使用当前默认值：
+
+| 类别 | 默认阈值 |
+| --- | ---: |
+| Car | 0.25 |
+| Truck | 0.40 |
+| Bus | 0.40 |
+| Pedestrian | 0.30 |
+| Nonmotorized_vehicle | 0.30 |
+
+## 自动环境处理
+
+入口是 `scripts/run_five_class.py`，Shell 文件只是一个方便调用的包装器。脚本按下面
+顺序处理运行环境：
+
+1. 优先检查 `--python`、`OPENPCDET_PYTHON`、已有 `openpcdet`/`sustechpoints` conda
+   环境，以及当前 Python。
+2. 如果找到已经具备 CUDA PyTorch、`spconv`、OpenPCDet 和后处理依赖的环境，直接使用，
+   不重复安装。
+3. 如果没有可用环境且系统安装了 conda，自动创建 `fiveclass-prelabel`（Python 3.10）。
+4. 自动安装 `requirements-step1.txt`、CUDA 版 PyTorch 2.5.1、`spconv-cu124==2.3.8`。
+5. 如果找不到 OpenPCDet 源码，默认克隆官方仓库；也可以提前设置
+   `OPENPCDET_ROOT=/path/to/OpenPCDet`，避免使用自动克隆。
+6. 调用 `scripts/check_step1_env.py` 检查 CUDA、五类别配置、checkpoint head 数量和关键
+   Python 模块，检查通过后才开始推理。
+
+自动安装需要网络、pip/conda 权限和 NVIDIA 驱动。没有 NVIDIA GPU 时，后处理代码仍可
+单独测试，但 `inference/run_prelabel.py` 会因模型调用 `.cuda()` 而无法完成推理。模型
+权重不会自动下载，必须存在于仓库 `models/` 或通过 `--ckpt` 指定。
+
+可选环境变量：
+
+```bash
+export OPENPCDET_PYTHON=/path/to/python
+export OPENPCDET_ROOT=/path/to/OpenPCDet
+export OPENPCDET_REPO=https://github.com/open-mmlab/OpenPCDet.git
+export TORCH_INDEX_URL=https://download.pytorch.org/whl/cu124
+```
+
+如果另一台机器已经有可用的 OpenPCDet 环境，推荐直接运行：
+
+```bash
+OPENPCDET_PYTHON=/path/to/openpcdet/bin/python \
+bash scripts/run_five_class.sh ~/sust/data ~/SUSTechPOINTS/data
+```
+
+## 当前全链路
+
+```text
+原始 SUST clip
+  -> Step1: LiDAR 推理 + 相机可见度 metadata
+  -> Step1 后置类别分数过滤
+  -> Step2: 类别无关 identity 跟踪 + 第一遍硬过滤 + 同中心去重
+  -> Step2.5: 按 track_id 类别投票 + 第二遍硬过滤 + 短轨迹过滤
+  -> Step3: 公共 yaw + Car 几何 + Truck/NMV 分治精修
+  -> final: 五类规范化 + lidar_top -> base_link
+  -> <clip>_pre/label/*.json
+```
+
+### Step1：LiDAR 推理
+
+`pipeline/step1_lidar_inference.py` 调用 `inference/run_prelabel.py`，读取
+`lidar/lidar_top/*.bin` 的 XYZI 点云，输出：
 
 ```text
 box_lidar = [x, y, z, dx, dy, dz, yaw]
-label.psr.position = [x, y, z]
-label.psr.scale    = [dx, dy, dz]
-label.psr.rotation.z = yaw
+class_name
+score
 ```
 
-`x,y,z` 是 box 中心，`dx,dy,dz` 是沿 box 局部 x/y/z 轴的长度、宽度、高度，
-`yaw` 是绕 `base_link` 局部 z 轴的弧度。final 阶段使用标定旋转矩阵旋转 heading
-并重新计算 yaw；尺寸在刚体变换下保持不变。若外参含 roll/pitch，七参数 box
-只能保存 heading 的 XY 投影，不能表达完整倾斜的 3D 姿态。
-`Vehicle` 在导出时按 `CLASS_MAP` 变为 `obj_type: Car`。
+同时按所有相机计算 box 的可见度、遮挡比例和截断比例，并将结果写入
+`det['visibility']`。Step1 不因为可见度删除检测，保证 identity 阶段能看到完整的模型
+输出。
 
-### world 变换和约束
+推理使用所有类别中最低的阈值获取候选。随后的一次轻量分数过滤在 Step2 之前执行，按
+类别删除低于各自阈值的候选。它只做分数过滤，不做范围、点数或可见度过滤。
 
-`calib.json` 中 `tf2base_link.<sensor>` 表示 `base_from_sensor`。当前
-`CoordinateProvider` 使用：
+### Step2：类别无关 ID 跟踪和第一遍过滤
+
+`pipeline/step2_identity.py` 使用 `tracking/tracker_conservative.py`，跟踪时不把类别
+作为硬约束，因为同一目标在不同帧可能被模型识别成不同类别。
+
+跟踪依据包括世界坐标中心、运动预测、速度、协方差、尺寸和 BEV IoU。静止车辆会建立
+停车位 anchor，动态车辆会按运动轨迹关联，轨迹间也会做保守拼接。Step2 只添加
+`track_id`，不会在跟踪阶段修改 box 的几何字段。
+
+第一遍硬过滤包括：
+
+- 无效 box、未知类别和类别白名单；
+- 类别分数阈值；
+- 标注范围：横向 `|x| <= 40m`，前后范围 `-80m <= y <= 20m`；
+- 点云框内点数 `<= 5`；
+- 相机可见度 `<= 0.05`；
+- 距离自车超过 `20m` 的 Pedestrian；
+- 同帧中心距离 `<= 0.35m` 的重复框。
+
+### Step2.5：按 ID 修正类别
+
+`pipeline/step2_5_class_correction.py` 在 ID 已经稳定后处理类别。它先将别名归一化到：
 
 ```text
-base_from_pose      = tf2base_link.pose
-base_from_lidar_top = tf2base_link.lidar_top
-
-world_from_lidar_top(t)
-    = world_from_pose(t)
-    @ inv(base_from_pose)
-    @ base_from_lidar_top
+Car, Truck, Bus, Pedestrian, Nonmotorized_vehicle
 ```
 
-也就是对一个 top 雷达点依次执行：
+然后以同一个 `track_id` 的全部检测为一组，用出现次数最多的类别作为该轨迹的最终类别，
+并把该 ID 的所有检测统一为这个类别。票数相同时，使用类别分数总和做平票处理。
+
+这一步只修改 `class_name`，保护 `track_id`、`box_lidar`、框数量和帧结构。它不使用 box
+尺寸把 Bus 改成 Truck，也不把非机动车改成 Car。类别稳定后会再跑一遍硬过滤，最后删除
+生命周期不足的轨迹（默认观测帧数 `<= 3` 删除）。
+
+### Step3：公共 yaw 和类别精修
+
+Step3 先对五类执行公共 yaw：动态目标使用运动方向，静止目标使用多帧稳定方向和点云
+轴，行人使用独立的两帧方向策略。公共 yaw 只修改 `box_lidar[6]`。
+
+随后按类别分治：
+
+**Car** 保留原有几何精修：
+
+- 按轨迹估计稳定的 `dx/dy/dz`；
+- 使用点云可见车面做 shrink-only XY 贴合，不因噪点盲目扩大 box；
+- 静止车使用停车位和点云的稳健中心，动态车使用平滑轨迹中心；
+- 使用地面点拟合底部，使用连续车顶点云拟合顶部；
+- 证据不足时回退到轨迹高度和原始中心，并限制单帧移动幅度。
+
+Car 几何只修改 `box_lidar[0:6]`，不修改 yaw、ID、类别或框是否存在。
+
+**Truck** 处理重复和重叠：
+
+- 同帧高 BEV IoU 重叠；
+- 连续多帧中度重叠；
+- 两个 Truck 过近；
+- Truck 与 Car 高 IoU 重复。
+
+合并后以 Truck 代表 ID，Car 重复观测可以转成 Truck，同一帧的重复框删除。
+
+**Nonmotorized_vehicle** 处理大小不一致：
+
+- 按轨迹计算稳健的中位物理尺寸；
+- 小框优先保留检测中心，再补齐统一尺寸；
+- 大框同时修正中心和尺寸；
+- 用修正后的中心轨迹重新更新 yaw。
+
+Bus 和 Pedestrian 在 Step3 只经过公共 yaw，不叠加其他类别的几何规则。
+
+### final：规范化和坐标转换
+
+`filtering/five_class_output.py` 不再执行旧 Step5 的点数过滤、短轨迹过滤或 Car-only
+过滤，只做：
+
+- 五类别名称规范化；
+- 无效类别和无效 box 校验；
+- `lidar_top -> base_link` 的中心和 heading 转换；
+- 写入 `box_frame: "base_link"`。
+
+最终 SUST label 的字段为：
 
 ```text
-lidar_top -> base_link -> pose -> world
+obj_id = track_id
+obj_type = 五类之一
+psr.position = [x, y, z]
+psr.scale = [dx, dy, dz]
+psr.rotation.z = yaw
 ```
 
-`pose_data.txt` 每行只读取前 8 列，格式必须是
-`timestamp_ns, x, y, z, qx, qy, qz, qw`；时间戳按纳秒解释，四元数顺序是
-`x,y,z,w`。代码会在相邻位姿间对平移线性插值、对四元数 SLERP；相邻位姿间隔
-超过 0.6 秒时使用较近的一帧，超出时间范围时使用端点帧。`tf2base_link` 中参与
-计算的矩阵必须是有限的 4x4 矩阵。
+## 坐标系和标定
 
-各步骤对坐标的实际使用是：
-
-1. Step1 从 `lidar_top` 点云推理，输出的 `box_lidar` 原样进入后续流程。
-2. Step2 用 `world_from_lidar_top` 做跨帧 identity、静态/动态判断和 yaw 世界角计算，
-   结果再写回 `lidar_top` 的 `box_lidar`。
-3. Step3 先对五类轨迹做保守几何稳定，再对 Car 在 `lidar_top` 中进行
-   shrink-only XY、地面/车顶 Z 精拟合。
-4. final 阶段保留五类检测，不执行旧 Step4 的尺寸改标、旧 Step5 的
-   Car-only、点数和短链闸门；仅校验类别/box 并转换到 `base_link`。
-5. `label/` 导出直接使用 final 阶段的 `box_lidar`，因此最终坐标是
-   `base_link` 局部帧。
-
-### 当前可见度模块的特别说明
-
-可见度实现按已恢复的远端版本保持不变。`filtering/camera_visibility.py` 当前构造
-的是：
+Step1 到 Step3 的 `box_lidar` 和点云都在 `lidar_top` 局部坐标中。跟踪和 yaw 使用：
 
 ```text
-cam_from_pose = inv(base_from_cam) @ base_from_pose
+world_from_lidar_top
+  = world_from_pose
+  @ inverse(tf2base_link.pose)
+  @ tf2base_link.lidar_top
 ```
 
-因此它假定传入的 box 已经在 `pose` 局部帧；它不读取 `pose_data.txt`。但本仓库的
-Step1 会把 OpenPCDet 直接对 `lidar/lidar_top/*.bin` 的输出传给该模块，并没有在
-Step1 中做 `lidar_top -> pose` 转换。也就是说：
+final 才通过 `tf2base_link.lidar_top` 转成 `base_link`，所以最终 `label/*.json` 使用
+的是 `base_link` 坐标，而不是 `lidar_top` 或 `world`。
 
-- 如果当前数据的 `pose` 与 `lidar_top` 实际是同一坐标帧，这段投影可以直接使用；
-- 如果两者存在平移或旋转差异，Step1 的 visibility 比例和 5% 可见度过滤可能不准；
-- visibility 仍在 box 转成 `base_link` 之前计算；final 阶段只做坐标转换。
-  要修复输入帧契约，必须统一上游 box 的输入帧或修改可见度实现，不能只改 README。
+每个输入 clip 必须带有自己的：
 
-### 更换 base_link 的影响
+```text
+transforms/calib.json
+transforms/pose_data.txt
+```
 
-代码没有把 `base_link` 原点硬编码为 front 或 top 雷达；实际原点由每个 clip 的
-`tf2base_link` 标定决定。final 阶段使用 `tf2base_link.lidar_top` 将 box 从 top
-转换到当前 base。把原点从 front 改到 top 后，应同步重算
-`tf2base_link` 下所有传感器外参，并保持 `pose_data.txt` 仍表示同一个
-`world_from_pose`。若 top 就是新 base 原点，通常 `tf2base_link.lidar_top`
-应为单位阵（以实际标定工具输出为准），此时转换结果数值上基本不变。
+标定文件不会被一键脚本隐式覆盖。若要切换标定，应在每个输入 clip 的
+`transforms/calib.json` 中准备正确的 `tf2base_link`；不要把已经转成 `base_link` 的 box
+提前送回 Step2/Step3 做点云拟合。
 
-不要只改 `pose` 或只改 `lidar_top`，也不要把 final 前的 box 提前转换后继续参与
-Step2--Step3 的 `lidar_top` 点云计算；否则点云拟合、跟踪、yaw 和可见度投影会出现
-偏差。若 `pose_data.txt` 的语义也改成了
-`world_from_lidar_top`，必须同步改写 `CoordinateProvider` 的公式，不能继续直接
-套用当前实现。
+## 手动调试
 
-当前仓库不会转换 `lidar/lidar_top/*.bin`。因此 SUST 接入端必须确认 label 使用
-`base_link`、点云使用 `lidar_top` 是否被支持；仓库本身没有在 label 中额外写入
-坐标系声明。
+环境检查：
 
-## 分步运行
+```bash
+python3 scripts/check_step1_env.py \
+  --cfg models/voxelnext_fiveclass_nuscenes_infer.yaml \
+  --ckpt models/vn5_nuscenes_checkpoint_epoch_12.pth
+```
 
-### Step 1：lidar 推理 + 可见度元数据
-
-使用通过 `scripts/check_step1_env.py` 检查的 OpenPCDet 环境：
+分步执行时，建议使用同一个已通过检查的 Python：
 
 ```bash
 $OPENPCDET_PYTHON pipeline/step1_lidar_inference.py \
-  --clip /path/to/scene_clip
-```
-
-输出：`work/step1_inference/<clip>_raw.json`。此阶段只附加 visibility，不删除框；
-可见度硬过滤在 Step2 完成 ID 后执行。
-
-模型权重和配置文件均位于 `models/`，会随仓库一起跟踪。
-默认使用 `models/vn5_nuscenes_checkpoint_epoch_12.pth` 与
-`models/voxelnext_fiveclass_nuscenes_infer.yaml`；如部署环境不同，可通过
-`--cfg` 和 `--ckpt` 覆盖。
-
-### Step 2：类别无关 identity + 第一遍硬过滤
-
-单条：
-
-```bash
-/home/moga/miniconda3/envs/sustechpoints/bin/python pipeline/step2_identity.py \
-  --in-json work/step1_inference/<clip>_raw.json \
   --clip /path/to/scene_clip \
-  --out-json work/step2_identity/<clip>_step2.json \
-  --out-clip work/step2_identity/data/<clip>_step2
-```
+  --work-root work/step1
 
-批量：
-
-```bash
-/home/moga/miniconda3/envs/sustechpoints/bin/python pipeline/step2_identity_batch.py \
-  --clip-root /path/to/clips --overwrite
-```
-
-Step2 先完成类别无关 ID，再执行第一遍分数、范围、可见度、点数等硬过滤和同中心去重。
-不做类别修正、yaw 或短轨迹删除。
-
-### Step 2.5：类别修正 + 第二遍硬过滤
-
-```bash
-/home/moga/miniconda3/envs/sustechpoints/bin/python pipeline/step2_5_class_correction.py \
-  --step2-json work/step2_identity/<clip>_step2.json \
-  --step2-diagnostics work/step2_identity/<clip>_step2_diagnostics.json \
+$OPENPCDET_PYTHON pipeline/step2_identity.py \
+  --in-json work/step1/<clip>_raw.json \
   --clip /path/to/scene_clip \
-  --out-json work/step2_5_class_correction/<clip>_step2_5.json
-```
+  --out-json work/step2/<clip>_step2.json \
+  --diagnostics work/step2/<clip>_step2_diagnostics.json
 
-Step2.5 只允许修改 `class_name`，按 track 多数票稳定五类语义，然后再次执行同一套
-硬过滤，最后删除生命周期不足的轨迹。`track_id`、box 和帧结构均受保护。
-
-### Step 3：公共 yaw + 类别路由精修
-
-```bash
-/home/moga/miniconda3/envs/sustechpoints/bin/python pipeline/step3_refinement.py \
-  --step2-5-json work/step2_5_class_correction/<clip>_step2_5.json \
-  --step2-5-diagnostics work/step2_5_class_correction/<clip>_step2_5_diagnostics.json \
+$OPENPCDET_PYTHON pipeline/step2_5_class_correction.py \
+  --step2-json work/step2/<clip>_step2.json \
+  --step2-diagnostics work/step2/<clip>_step2_diagnostics.json \
   --clip /path/to/scene_clip \
-  --out-json work/step3_refinement/<clip>_step3.json \
-  --out-clip work/step3_refinement/data/<clip>_step3
-```
+  --out-json work/step2_5/<clip>_step2_5.json \
+  --diagnostics work/step2_5/<clip>_step2_5_diagnostics.json
 
-批量：
-
-```bash
-/home/moga/miniconda3/envs/sustechpoints/bin/python pipeline/step3_refinement_batch.py \
-  --clip-root /path/to/clips --overwrite
-```
-
-如需对已有 Step3 JSON 单独执行五类 final 适配：
-
-```bash
-python pipeline/five_class_postprocess.py \
-  --input-json work/step3_refinement/<clip>_step3.json \
+$OPENPCDET_PYTHON pipeline/step3_refinement.py \
+  --step2-5-json work/step2_5/<clip>_step2_5.json \
+  --step2-5-diagnostics work/step2_5/<clip>_step2_5_diagnostics.json \
   --clip /path/to/scene_clip \
-  --output-json work/final/<clip>_final.json
+  --out-json work/step3/<clip>_step3.json \
+  --diagnostics work/step3/<clip>_step3_diagnostics.json
 ```
 
-Step3 先对所有类别执行公共 yaw，随后保留原有 Car 几何/尺寸精修（通用几何约束、
-shrink-only XY、地面/车顶 Z 拟合）。Truck 随后检查同帧高重叠框、连续近距离框，以及 Truck-Car
-高 BEV IoU 重复框：统一以 Truck 为保留类别合并 track ID，Car 观测会转成
-Truck，并删除合并后同帧的重复框。Nonmotorized_vehicle
-按轨迹计算稳健的中位物理尺寸：小框优先保留检测中心并补齐尺寸，大框同时向轨迹
-中心修正；最后用修正后的中心轨迹更新 yaw。Bus/Pedestrian 保持透传。
-Car 不叠加 Truck/Nonmotorized_vehicle 的新规则；Truck 和 Nonmotorized_vehicle
-只执行各自的新增分治精修。
+端到端入口也可以直接调用，`--preserve-input` 适合调试机批处理：
 
-### 旧 Step 4/Step 5（兼容脚本）
+```bash
+$OPENPCDET_PYTHON run_end_to_end.py \
+  --clip-dir ~/sust/data \
+  --sust-root ~/SUSTechPOINTS/data \
+  --inference-python "$OPENPCDET_PYTHON" \
+  --post-python "$OPENPCDET_PYTHON" \
+  --export-sust --preserve-input --overwrite
+```
 
-`deprecated/pipeline/step4_*`、`step5_*`、`step6_*` 以及旧 Step2/Step3
-保留给旧 Car 流程回放，但不再由
-`run_end_to_end.py` 调用。五类端到端 final 阶段不做尺寸改标、Car-only、
-点数或短链过滤，仅执行类别/box 校验和坐标转换。
-
-旧 Step4 的行为仍是：
+## 目录和测试
 
 ```text
-1. 只检查 class_name == Car 的检测
-2. 计算每条 track 的 max(dx, dy) 中位数
-3. 中位数 >= 6.0m：该 track 的 Car 全部改为 Truck
-4. 其他检测和 box 字段保持不变
+classification/  Step2.5 类别归一化和 track 投票
+filtering/       可见度、硬过滤、final 五类输出
+tracking/        类别无关跟踪、坐标变换、SUST label 映射
+geometry/        yaw、Car 几何、Truck/NMV 精修
+inference/       OpenPCDet LiDAR 推理
+pipeline/        当前 Step1/Step2/Step2.5/Step3 主链路
+deprecated/      旧 Car-only Step2/Step3/Step4/Step5/Step6
+models/          配置和 checkpoint
+scripts/         环境检查与一键入口
+tests/           单元测试
 ```
 
-该旧行为不适用于五类模型。
-
-单条：
+运行后处理单元测试：
 
 ```bash
-/home/moga/miniconda3/envs/sustechpoints/bin/python deprecated/pipeline/step4_car_size_filter.py \
-  --step3-json work/step3_refinement/<clip>_step3.json \
-  --out-json work/step4_car_size_filter/<clip>_step4.json
+python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-批量：
-
-```bash
-/home/moga/miniconda3/envs/sustechpoints/bin/python deprecated/pipeline/step4_car_size_filter_batch.py --overwrite
-```
-
-旧 Step5：最终过滤 + Car-only + box 转换到 base_link
-
-仅旧流程固定只保留最终规范类别为 `Car` 的检测。五类流程请使用
-`pipeline/five_class_postprocess.py` 或端到端入口内置的 final 阶段。
-
-```text
-1. box 内点数 <= 5：删除该检测
-2. 轨迹长度 <= 3 帧：删除该轨迹的全部检测
-3. 删除规范类别不是 `Car` 的检测（内部 `Vehicle` 映射为 `Car`，会保留）
-4. 对剩余 box 应用 lidar_top -> base_link 的静态外参
-```
-
-点数使用原始 `lidar/lidar_top/<frame>.bin` 和转换前的 `box_lidar` 统计；点云文件
-不改写。转换后的检测仍使用兼容字段名 `box_lidar`，同时写入
-`box_frame: "base_link"`。
-
-单条：
-
-```bash
-/home/moga/miniconda3/envs/sustechpoints/bin/python deprecated/pipeline/step5_class_motion_filter.py \
-  --step4-json work/step4_car_size_filter/<clip>_step4.json \
-  --clip work/step3_refinement/data/<clip>_step3 \
-  --out-json work/step5_class_motion_filter/<clip>_step5.json \
-  --out-clip work/step5_class_motion_filter/data/<clip>_step5
-```
-
-可调阈值（默认值为 `5` 和 `3`）：
-
-```bash
---sparsity-max-points 5
---short-track-max-frames 3
-```
-
-批量：
-
-```bash
-/home/moga/miniconda3/envs/sustechpoints/bin/python deprecated/pipeline/step5_class_motion_filter_batch.py --overwrite
-```
-
-### 已有 base_link 检测直接运行 Step3
-
-如果输入 clip 的 `label/*.json` 已经是 `base_link` 坐标，且希望跳过模型推理、只执行
-Step2 + Step3，可以使用专用适配入口。它会临时把 box 逆变换到 `lidar_top`，先重新
-建立跨帧 track，再做点云拟合，最后转回 `base_link` 写入输出 SUST clip，不执行 Step5：
-
-```bash
-python pipeline/step3_base_link_sust.py \
-  --clip-dir /media/zhu/GEN2/test1 \
-  --output-root /home/zhu/桌面/sust/data \
-  --overwrite
-```
-
-该入口只处理存在非空 `lidar/lidar_top/*.bin`、标定和 label 的 clip；空 clip 会被
-报告为无效输入。
-
-### Step 6（兼容脚本）：只保留 Car 标签
-
-端到端流程不再调用 Step6。下面的脚本仍保留给旧的 Car-only JSON 使用；它只删除检测，不改变已经转换到 `base_link` 的框、
-yaw、track_id 或坐标。
-
-单条：
-
-```bash
-/home/moga/miniconda3/envs/sustechpoints/bin/python deprecated/pipeline/step6_car_only_filter.py \
-  --step5-json work/step5_class_motion_filter/<clip>_step5.json \
-  --clip work/step5_class_motion_filter/data/<clip>_step5 \
-  --out-json work/step6_car_only_filter/<clip>_step6.json \
-  --out-clip work/step6_car_only_filter/data/<clip>_step6
-```
-
-批量：
-
-```bash
-/home/moga/miniconda3/envs/sustechpoints/bin/python deprecated/pipeline/step6_car_only_filter_batch.py --overwrite
-```
-
-## 目录说明
-
-```text
-classification/  Step2 类别精修
-filtering/       Step1/Step2 可见度与硬过滤，final 五类输出与坐标转换
-tracking/        保守跟踪器 + 静态优先跟踪器
-geometry/        Step2 yaw，Step3 多类别几何与 Car 地面/车顶精拟合
-inference/       Step1 OpenPCDet 推理脚本
-pipeline/        step1、step2、step2.5、step3 主链路；旧名称仅保留兼容转发
-deprecated/      旧 Step2/Step3/Step4/Step5/Step6 Car 链路
-deprecated/      不再参与当前链路的旧版本/旧预览文件
-tests/           当前链路的单元测试
-models/          推理配置与模型权重
-```
-
-## 测试
-
-```bash
-$OPENPCDET_PYTHON -m unittest discover -s tests -v
-```
+当前仓库测试覆盖跟踪、类别投票、硬过滤、Car 几何、Truck/NMV 精修、坐标转换和 SUST
+输出契约。
