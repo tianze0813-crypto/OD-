@@ -7,92 +7,119 @@ clip，使用五类别 VoxelNeXt 权重推理、跨帧跟踪、类别稳定和�
 当前主链路只使用 Step1、Step2、Step2.5、Step3 和 final；旧的 Step4/Step5/Step6
 已经移到 `deprecated/`，不参与五类别端到端运行。
 
-## 一键运行
+## 批量运行（最常用）
 
-在另一台机器上把仓库和模型文件准备好后，默认只需要执行：
-
-```bash
-cd 五类别预标链路
-bash scripts/run_five_class.sh
-```
-
-默认路径是：
-
-```text
-输入：~/sust/data
-输出：~/SUSTechPOINTS/data
-```
-
-也可以显式传入两个路径，分别表示输入目录和输出目录：
+输入 clip 的父目录即可，脚本会扫描父目录下所有 `lidar/lidar_top/*.bin` 的 clip；
+下面是最常用的批量命令，指定权重并导出到 SUST：
 
 ```bash
-bash scripts/run_five_class.sh \
-  ~/sust/data \
-  ~/SUSTechPOINTS/data
+bash run.sh /path/to/clip_parent ~/SUSTechPOINTS/data --weight epoch20
 ```
 
-只跑原始 Step1 推理（不跟踪、不做后处理）时使用第二个入口：
-
-```bash
-bash scripts/run_raw_inference.sh
-```
-
-它默认把每个 clip 的原始结果保存为 `~/sust/raw_inference/<clip>_raw.json`，默认
-推理阈值为 `0.1`；可用 `--raw-output`、`--score-thresh` 和 `--overwrite` 调整。
-
-两种入口都只保留最终产物。完整链路的 Step1/Step2/Step2.5/Step3 JSON、诊断文件和
-临时 clip 都写入系统临时目录，进程结束后自动删除；原始推理模式也只把 raw JSON
-复制到 `--raw-output`，不会在输入 clip 下生成旁路文件。
-
-输入目录下面的每个子目录都应是一个原始 clip：
-
-```text
-~/sust/data/<clip>/
-├── lidar/lidar_top/*.bin
-├── transforms/calib.json
-├── transforms/pose_data.txt
-└── camera/                  # 可选，按当前 SUST clip 结构提供
-```
-
-输出目录会生成：
+第二参数可以省略，默认使用 `~/SUSTechPOINTS/data`；不写 `--weight` 时使用默认权重。
+导出为：
 
 ```text
 ~/SUSTechPOINTS/data/<clip>_pre/
 └── label/<frame_id>.json
 ```
 
-一键脚本默认使用 `models/vn5_nuscenes_checkpoint_epoch_12.pth`。输入目录中的原始
-clip 不会被改名或写入，结果以 `<clip>_pre` 的副本形式输出，便于反复调试。
+原始 clip 不保留过程文件，中间 JSON、诊断文件和临时 clip 全部自动清理。
 
-常用选项：
+## 本机使用（当前环境已就绪）
 
-```bash
-# 覆盖已经存在的输出
-bash scripts/run_five_class.sh ~/sust/data ~/SUSTechPOINTS/data --overwrite
+### 当前用户所用环境
 
-# 只检查/安装环境，不运行推理
-bash scripts/run_five_class.sh --check-only
+当前用户 `moga` 在本机使用的 conda 环境是 **`openpcdet`**（Python 3.10.20），
+解释器路径为：
 
-# 已经准备好环境时，禁止自动安装
-bash scripts/run_five_class.sh --skip-install
-
-# 使用其他五类别权重
-bash scripts/run_five_class.sh \
-  ~/sust/data ~/SUSTechPOINTS/data \
-  --ckpt models/nusc_frozen20_epoch20.pth
-
-# 临时让全部类别使用同一个阈值
-bash scripts/run_five_class.sh \
-  ~/sust/data ~/SUSTechPOINTS/data \
-  --score-thresh 0.3
-
-# 完整链路只跑验证，不导出最终 clip 到 SUST
-bash scripts/run_five_class.sh \
-  ~/sust/data ~/SUSTechPOINTS/data \
-  --no-export-sust
+```text
+/home/moga/miniconda3/envs/openpcdet/bin/python
 ```
 
-`--score-thresh` 是兼容参数，会覆盖五个类别的阈值。未传该参数时使用当前默认值：
+`run.sh` / `scripts/run_five_class.py` 会按顺序探测候选 Python（`--python`、
+`OPENPCDET_PYTHON`、当前 Python，以及现成的 `openpcdet` / `sustechpoints` conda
+环境），`openpcdet` 已具备 CUDA PyTorch、`spconv`、OpenPCDet 和后处理依赖，因此会被
+自动选中，`run.sh` 默认 `--skip-install`，不会联网重复安装。
+
+实测 CUDA 可用（CUDA 12.4），GPU 为 **NVIDIA RTX A4000**；运行
+`scripts/check_step1_env.py` 返回 `Step1 environment check: OK`，pcdet 源码位于
+`/home/moga/桌面/OpenPcdet/OD预标注/OpenPCDet`。关键版本如下：
+
+| 组件 | 本机版本 |
+| --- | --- |
+| Python | 3.10.20 |
+| PyTorch | 2.5.1+cu124 |
+| torchvision | 0.20.1+cu124 |
+| spconv-cu124 | 2.3.8 |
+| pcdet | 0.6.0+0（editable source） |
+| NumPy | 2.2.6 |
+| SciPy | 1.15.3 |
+| OpenCV | 4.13.0.92 |
+| Pillow | 12.2.0 |
+| Pandas | 2.3.3 |
+| av2 | 0.3.6 |
+| Kornia | 0.8.2 |
+| Numba | 0.66.0 |
+| llvmlite | 0.48.0 |
+| PyYAML | 6.0.3 |
+| easydict | 1.13 |
+| tensorboardX | 2.6.5 |
+| scikit-image | 0.25.2 |
+| tqdm | 4.68.3 |
+| SharedArray | 3.2.4 |
+| pyquaternion | 0.9.9 |
+
+### 一键运行（完整链路，导出到 SUST）
+
+输入 clip 的父目录即可，脚本会扫描父目录下所有 `lidar/lidar_top/*.bin` 的 clip：
+
+```bash
+bash run.sh /media/moga/police/test <sust_data_dir> --weight epoch20
+```
+
+`--weight` 可换为 `epoch12` / `epoch15` / `epoch17` / `epoch20` / `argo2`，
+`waymo` 只能配 `--mode inference`。导出为：
+
+```text
+<sust_data_dir>/<clip>_pre/
+└── label/<frame_id>.json
+```
+
+要同时跑多个权重，给每个权重一个独立的输出根，例如：
+
+```bash
+bash run.sh /media/moga/police/test <sust_data_dir>/epoch12 --weight epoch12
+bash run.sh /media/moga/police/test <sust_data_dir>/epoch15 --weight epoch15
+```
+
+> **导出到 SUST 是可选的，不是必须的。** `run.sh` 的第二个参数就是 SUSTechPOINTS
+> 的数据根目录，路径由使用者按自己的安装来填写（本机为
+> `/home/moga/桌面/SUSTechPOINTS/data`），脚本不会假设一个固定路径。若不想导出到
+> SUST，可改用 `--no-export-sust` 只跑链路、不落盘，或把第二个参数指向任意临时
+> 目录，事后自行拷贝。
+
+> **调试期命名（多权重一次导出对比）。** 这一套链路会把每个 clip 的后处理结果导出为
+> `<clip>_pre/`、原始推理导出为 `<clip>_raw.json`。调试期想同时平铺多个权重到同一个
+> SUST 数据目录且互不覆盖时，把名字加上权重后缀，例如
+> `<clip>_epoch12_pre/`、`<clip>_epoch12_raw.json`、`<clip>_epoch20_pre/`。
+> **正式使用时不加权重、只保留 `_pre` 后缀**（原始推理不落盘为场景）。
+
+### 只跑原始推理（保留 Step1 raw JSON）
+
+```bash
+bash run.sh /media/moga/police/test <sust_data_dir> \
+  --mode inference --raw-output <raw_dir> \
+  --weight epoch20
+```
+
+每个 clip 输出一个 `<clip>_raw.json`，字段包含 `box_lidar`、`class_name`、`score`
+以及相机可见度元数据；调试期按上述约定重命名为 `<clip>_<weight>_raw.json`。原始推理
+使用最低类别阈值，不做范围 / 点数 / 可见度硬过滤。
+
+### 阈值与自检
+
+`--score-thresh` 会覆盖五类阈值，未传时使用默认值：
 
 | 类别 | 默认阈值 |
 | --- | ---: |
@@ -102,25 +129,91 @@ bash scripts/run_five_class.sh \
 | Pedestrian | 0.30 |
 | Nonmotorized_vehicle | 0.30 |
 
-## 自动环境处理
+环境自检：
 
-入口是 `scripts/run_five_class.py`，Shell 文件只是一个方便调用的包装器。脚本按下面
-顺序处理运行环境：
+```bash
+$OPENPCDET_PYTHON scripts/check_step1_env.py \
+  --cfg models/voxelnext_fiveclass_nuscenes_infer.yaml \
+  --ckpt models/vn5_nuscenes_checkpoint_epoch_12.pth
+```
 
-1. 优先检查 `--python`、`OPENPCDET_PYTHON`、已有 `openpcdet`/`sustechpoints` conda
-   环境，以及当前 Python。
-2. 如果找到已经具备 CUDA PyTorch、`spconv`、OpenPCDet 和后处理依赖的环境，直接使用，
-   不重复安装。
-3. 如果没有可用环境且系统安装了 conda，自动创建 `fiveclass-prelabel`（Python 3.10）。
-4. 自动安装 `requirements-step1.txt`、CUDA 版 PyTorch 2.5.1、`spconv-cu124==2.3.8`。
-5. 如果找不到 OpenPCDet 源码，默认克隆官方仓库；也可以提前设置
-   `OPENPCDET_ROOT=/path/to/OpenPCDet`，避免使用自动克隆。
-6. 调用 `scripts/check_step1_env.py` 检查 CUDA、五类别配置、checkpoint head 数量和关键
-   Python 模块，检查通过后才开始推理。
+## 权重选择
 
-自动安装需要网络、pip/conda 权限和 NVIDIA 驱动。没有 NVIDIA GPU 时，后处理代码仍可
-单独测试，但 `inference/run_prelabel.py` 会因模型调用 `.cuda()` 而无法完成推理。模型
-权重不会自动下载，必须存在于仓库 `models/` 或通过 `--ckpt` 指定。
+默认权重是 `models/vn5_nuscenes_checkpoint_epoch_12.pth`，可用
+`bash run.sh --list-weights` 查看：
+
+| 别名 | checkpoint | 可用模式 |
+| --- | --- | --- |
+| `default` / `epoch12` | `vn5_nuscenes_checkpoint_epoch_12.pth` | 完整链路 |
+| `epoch15` | `nusc_frozen20_epoch15.pth` | 完整链路 |
+| `epoch17` | `nusc_frozen20_epoch17.pth` | 完整链路 |
+| `epoch20` | `nusc_frozen20_epoch20.pth` | 完整链路 |
+| `argo2` | `argo2_protected_epoch6.pth` | 完整链路 |
+| `waymo` | `vn_waymo_v2_4gpu_full_epoch10.pth` | 仅 `--mode inference` |
+
+`waymo` 是三类头 checkpoint，只能跑原始推理；其他别名都支持完整链路。也可以直接
+用 `--ckpt /path/to/model.pth` 指定任意权重。
+
+## 从零配置（新机器）
+
+全新机器可按下面步骤手动搭建，也可以直接用一键入口自动安装。运行链路分两部分：
+
+- **Step1 推理**：需要 CUDA 版 PyTorch、匹配 CUDA 的 `spconv`、OpenPCDet 源码
+  (`pcdet`)、相机可见度依赖。
+- **Step2/Step2.5/Step3/final**：使用标准 Python 数值和图像库，见
+  [requirements-step1.txt](requirements-step1.txt)。
+
+### 手动搭建
+
+1. 安装 Miniconda/Anaconda，并准备好 NVIDIA 驱动 + CUDA 12.4（与 torch 匹配）。
+2. 创建并激活 Python 3.10 环境：
+
+```bash
+conda create -n openpcdet python=3.10 pip -y
+conda activate openpcdet
+```
+
+3. 安装 CUDA 版 PyTorch 2.5.1 与匹配的 spconv：
+
+```bash
+pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124
+pip install spconv-cu124==2.3.8
+```
+
+4. 安装后处理依赖：
+
+```bash
+pip install -r requirements-step1.txt
+```
+
+5. 安装 OpenPCDet（源码目录须含 `pcdet/` 与 `setup.py`）：
+
+```bash
+git clone --depth 1 https://github.com/open-mmlab/OpenPCDet.git
+pip install -e ./OpenPCDet
+```
+
+6. 自检：
+
+```bash
+python scripts/check_step1_env.py \
+  --cfg models/voxelnext_fiveclass_nuscenes_infer.yaml \
+  --ckpt models/vn5_nuscenes_checkpoint_epoch_12.pth
+```
+
+### 自动入口
+
+`scripts/run_five_class.py` / `scripts/run_five_class.sh` 会：
+
+1. 探测 `--python`、`OPENPCDET_PYTHON`、现成 `openpcdet`/`sustechpoints` 环境及当前 Python。
+2. 找到已具备依赖的环境直接使用；否则创建 `fiveclass-prelabel`（Python 3.10）。
+3. 自动安装 `requirements-step1.txt`、torch 2.5.1、`spconv-cu124==2.3.8`。
+4. 找不到 OpenPCDet 源码时克隆官方仓库。
+5. 运行 `check_step1_env.py`，检查通过后才开始推理。
+
+```bash
+bash scripts/run_five_class.sh ~/sust/data ~/SUSTechPOINTS/data
+```
 
 可选环境变量：
 
@@ -131,12 +224,17 @@ export OPENPCDET_REPO=https://github.com/open-mmlab/OpenPCDet.git
 export TORCH_INDEX_URL=https://download.pytorch.org/whl/cu124
 ```
 
-如果另一台机器已经有可用的 OpenPCDet 环境，推荐直接运行：
+已有 OpenPCDet 环境时推荐显式指定：
 
 ```bash
 OPENPCDET_PYTHON=/path/to/openpcdet/bin/python \
 bash scripts/run_five_class.sh ~/sust/data ~/SUSTechPOINTS/data
 ```
+
+新环境按 `requirements-step1.txt` 安装的版本与本机 `openpcdet` 环境不完全一致（例如
+NumPy 1.26.4、Kornia 0.6.12），两者都能跑通当前链路。Step1 要求
+`torch.cuda.is_available()` 为真；没有 NVIDIA GPU 时只能测后处理，不能跑模型推理。
+模型权重不会自动下载，须放进 `models/` 或用 `--ckpt` 指定。
 
 ## 当前全链路
 
@@ -339,6 +437,7 @@ $OPENPCDET_PYTHON run_end_to_end.py \
 ## 目录和测试
 
 ```text
+run.sh            本机依赖就绪时的一键端到端入口
 classification/  Step2.5 类别归一化和 track 投票
 filtering/       可见度、硬过滤、final 五类输出
 tracking/        类别无关跟踪、坐标变换、SUST label 映射

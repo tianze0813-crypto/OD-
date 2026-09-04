@@ -44,6 +44,9 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cfg", type=Path, default=DEFAULT_CFG)
     parser.add_argument("--ckpt", type=Path, default=DEFAULT_CKPT)
+    parser.add_argument("--mode", choices=("full", "inference"), default="full",
+                        help="full chain requires the five-class layout; "
+                             "raw inference accepts any config/checkpoint pair")
     return parser.parse_args()
 
 
@@ -90,10 +93,10 @@ def main() -> int:
 
             cfg_from_yaml_file(str(args.cfg), cfg)
             classes = tuple(str(name) for name in cfg.CLASS_NAMES)
-            if classes != EXPECTED_CLASSES:
+            if args.mode == "full" and classes != EXPECTED_CLASSES:
                 errors.append(
-                    "config classes do not match the five-class checkpoint: "
-                    f"{classes}"
+                    "full-chain config classes do not match the five-class "
+                    f"checkpoint: {classes}"
                 )
 
             checkpoint = torch.load(
@@ -108,9 +111,14 @@ def main() -> int:
                     for key in state
                     if key.startswith("dense_head.heads_list.")
                 }
-                if heads != {str(i) for i in range(len(EXPECTED_CLASSES))}:
+                head_groups = getattr(
+                    cfg.MODEL.DENSE_HEAD, "CLASS_NAMES_EACH_HEAD", [])
+                expected_heads = {
+                    str(i) for i in range(len(head_groups) if head_groups else 0)
+                }
+                if heads != expected_heads:
                     errors.append(
-                        "checkpoint head count is incompatible with five classes: "
+                        "checkpoint head count does not match config classes: "
                         f"{sorted(heads)}"
                     )
                 print(

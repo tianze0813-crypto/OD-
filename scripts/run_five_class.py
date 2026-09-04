@@ -30,6 +30,47 @@ DEFAULT_ENV_NAME = "fiveclass-prelabel"
 REQUIRED_MODULES = ("numpy", "scipy", "cv2", "PIL", "pandas", "av2",
                     "kornia", "yaml", "torch", "spconv", "pcdet")
 
+# Curated aliases for the local checkpoints.  ``waymo`` has a three-class
+# head layout and can only be run in raw inference mode; the other presets are
+# compatible with the five-class full chain.
+WEIGHT_PRESETS = {
+    "default": (
+        DEFAULT_CKPT,
+        DEFAULT_CFG,
+        "full",
+    ),
+    "epoch12": (
+        DEFAULT_CKPT,
+        DEFAULT_CFG,
+        "full",
+    ),
+    "epoch15": (
+        ROOT / "models" / "nusc_frozen20_epoch15.pth",
+        DEFAULT_CFG,
+        "full",
+    ),
+    "epoch17": (
+        ROOT / "models" / "nusc_frozen20_epoch17.pth",
+        DEFAULT_CFG,
+        "full",
+    ),
+    "epoch20": (
+        ROOT / "models" / "nusc_frozen20_epoch20.pth",
+        DEFAULT_CFG,
+        "full",
+    ),
+    "argo2": (
+        ROOT / "models" / "argo2_protected_epoch6.pth",
+        DEFAULT_CFG,
+        "full",
+    ),
+    "waymo": (
+        ROOT / "models" / "vn_waymo_v2_4gpu_full_epoch10.pth",
+        ROOT / "models" / "voxelnext_v2_waymo_infer.yaml",
+        "inference",
+    ),
+}
+
 
 def _print(message: str) -> None:
     print(f"[five-class] {message}", flush=True)
@@ -42,6 +83,51 @@ def _run(command: list[str], *, check: bool = True,
         [str(value) for value in command], check=check,
         text=True, capture_output=capture,
     )
+
+
+def _print_weight_table() -> None:
+    print("可用权重别名：")
+    print(f"{'别名':<10} {'checkpoint':<40} {'适用模式':<10}")
+    for alias, (ckpt, _cfg, mode) in WEIGHT_PRESETS.items():
+        print(f"{alias:<10} {ckpt.name:<40} {mode:<10}")
+
+
+def _resolve_weight(
+    weight: str | None,
+    ckpt: Path | None,
+    cfg: Path | None,
+) -> tuple[Path, Path, str]:
+    """Resolve a curated weight alias or an explicit checkpoint.
+
+    Returns ``(checkpoint, config, supported_mode)``.
+    """
+    if weight is None:
+        selected_ckpt = (ckpt or DEFAULT_CKPT).expanduser().resolve()
+        selected_cfg = (cfg or DEFAULT_CFG).expanduser().resolve()
+        for _alias, (preset_ckpt, _preset_cfg, mode) in WEIGHT_PRESETS.items():
+            if selected_ckpt.name == preset_ckpt.name and mode == "inference":
+                return selected_ckpt, selected_cfg, mode
+        return selected_ckpt, selected_cfg, "full"
+    if ckpt is not None:
+        raise RuntimeError("--weight and --ckpt are mutually exclusive")
+
+    key = weight.lower()
+    if Path(weight).suffix.lower() == ".pth":
+        key = Path(weight).name.lower()
+    for alias, (preset_ckpt, preset_cfg, mode) in WEIGHT_PRESETS.items():
+        candidates = {
+            alias.lower(),
+            preset_ckpt.name.lower(),
+            preset_ckpt.stem.lower(),
+        }
+        if key in candidates:
+            return (
+                preset_ckpt.expanduser().resolve(),
+                (cfg or preset_cfg).expanduser().resolve(),
+                mode,
+            )
+    available = ", ".join(WEIGHT_PRESETS)
+    raise RuntimeError(f"unknown weight alias: {weight} (available: {available})")
 
 
 def _probe(python: Path) -> dict[str, Any]:
@@ -61,7 +147,7 @@ try:
 except Exception as exc:
     result["torch_error"] = str(exc)
 print(json.dumps(result))
-''' % {"modules": repr(REQUIRED_MODULES)}
+''' % {"modules": REQUIRED_MODULES}
     result = subprocess.run(
         [str(python), "-c", code], text=True, capture_output=True,
     )
@@ -159,8 +245,10 @@ def _find_openpcdet_root(explicit: Path | None) -> Path | None:
         home / "OpenPCDet",
         home / "openpcdet",
         home / "桌面" / "OpenPCDet",
+        home / "桌面" / "OpenPcdet" / "OD预标注" / "OpenPCDet",
         home / "桌面" / "OD预标注" / "OpenPCDet",
         ROOT.parent / "OpenPCDet",
+        ROOT.parent / "OpenPcdet" / "OD预标注" / "OpenPCDet",
     ])
     for candidate in candidates:
         if (candidate / "pcdet").is_dir() and (candidate / "setup.py").is_file():
@@ -220,9 +308,12 @@ def _install_runtime(python: Path, openpcdet_root: Path | None) -> Path | None:
     return openpcdet_root
 
 
-def _check_environment(python: Path, cfg: Path, ckpt: Path) -> None:
+def _check_environment(
+    python: Path, cfg: Path, ckpt: Path, *, mode: str
+) -> None:
     result = _run([python, str(ROOT / "scripts" / "check_step1_env.py"),
-                   "--cfg", str(cfg), "--ckpt", str(ckpt)], check=False)
+                   "--cfg", str(cfg), "--ckpt", str(ckpt), "--mode", mode],
+                  check=False)
     if result.returncode:
         raise RuntimeError("Step1 environment check failed; see the diagnostics above")
 
@@ -233,6 +324,7 @@ def _is_clip(path: Path) -> bool:
 
 
 def _collect_clips(input_root: Path) -> list[Path]:
+    """Scan the clip parent directory for all raw clip subdirectories."""
     if not input_root.is_dir():
         raise RuntimeError(f"input directory does not exist: {input_root}")
     clips = [path.resolve() for path in sorted(input_root.iterdir())
@@ -241,6 +333,11 @@ def _collect_clips(input_root: Path) -> list[Path]:
         raise RuntimeError(
             f"no raw clips found under {input_root}; expected child directories "
             "containing lidar/lidar_top/*.bin")
+    seen: set[str] = set()
+    for clip in clips:
+        if clip.name in seen:
+            raise RuntimeError(f"duplicate clip name in batch: {clip.name}")
+        seen.add(clip.name)
     return clips
 
 
@@ -263,8 +360,13 @@ def _parse_args() -> argparse.Namespace:
                         help="OpenPCDet checkout containing pcdet/ and setup.py")
     parser.add_argument("--env-name", default=DEFAULT_ENV_NAME,
                         help="conda environment created when no ready env exists")
-    parser.add_argument("--cfg", type=Path, default=DEFAULT_CFG)
-    parser.add_argument("--ckpt", type=Path, default=DEFAULT_CKPT)
+    parser.add_argument("--cfg", type=Path)
+    parser.add_argument("--ckpt", type=Path)
+    parser.add_argument("--weight", default=None,
+                        help="权重别名：default/epoch12, epoch15, epoch17, "
+                             "epoch20, argo2, waymo；可用 --list-weights 查看")
+    parser.add_argument("--list-weights", action="store_true",
+                        help="列出可用权重别名后退出")
     parser.add_argument("--score-thresh", type=float,
                         help="override all category thresholds")
     parser.add_argument("--overwrite", action="store_true",
@@ -276,7 +378,8 @@ def _parse_args() -> argparse.Namespace:
     export_group.add_argument("--no-export-sust", dest="export_sust",
                               action="store_false",
                               help="run full chain in a temporary output and discard it")
-    parser.add_argument("--skip-install", action="store_true",
+    parser.add_argument("--skip-install", "--local-only", "--no-install",
+                        dest="skip_install", action="store_true",
                         help="fail instead of installing missing dependencies")
     parser.add_argument("--check-only", action="store_true",
                         help="check/install the runtime without running inference")
@@ -342,10 +445,19 @@ def _run_full_pipeline(python: Path, clips: list[Path], cfg: Path,
 
 def main() -> int:
     args = _parse_args()
+    if args.list_weights:
+        _print_weight_table()
+        return 0
+
+    ckpt, cfg, weight_mode = _resolve_weight(args.weight, args.ckpt, args.cfg)
+    if args.mode == "full" and weight_mode == "inference":
+        raise RuntimeError(
+            "waymo weight uses a three-class head and only supports "
+            "--mode inference; use a five-class weight for the full chain"
+        )
+
     input_root = args.input_root.expanduser().resolve()
     output_root = args.output_root.expanduser().resolve()
-    cfg = args.cfg.expanduser().resolve()
-    ckpt = args.ckpt.expanduser().resolve()
     if input_root == output_root:
         raise RuntimeError("input_root and output_root must be different directories")
     if not cfg.is_file():
@@ -388,7 +500,7 @@ def main() -> int:
             raise RuntimeError("selected Python environment is incomplete; see probes above")
     else:
         openpcdet_root = _install_runtime(python, openpcdet_root)
-    _check_environment(python, cfg, ckpt)
+    _check_environment(python, cfg, ckpt, mode=args.mode)
     if args.check_only:
         _print("environment check complete")
         return 0

@@ -83,6 +83,11 @@ def collect_clips(args):
         clips.extend(sorted(p for p in root.iterdir() if is_clip_dir(p)))
     if not clips:
         raise SystemExit("请至少给一个 --clip 或 --clip-dir")
+    seen: set[str] = set()
+    for clip in clips:
+        if clip.name in seen:
+            raise SystemExit(f"同一批存在同名 clip：{clip.name}")
+        seen.add(clip.name)
     return clips
 
 
