@@ -159,7 +159,7 @@ def main():
     # the legacy Step5 point/lifecycle or Car-only filters.
     parser.add_argument("--sparsity-max-points", type=int, default=5,
                         help=argparse.SUPPRESS)
-    parser.add_argument("--short-track-max-frames", type=int, default=3,
+    parser.add_argument("--short-track-max-frames", type=int, default=4,
                         help=argparse.SUPPRESS)
     parser.add_argument("--car-only", "--step6-car-only", dest="car_only",
                         action="store_true", help=argparse.SUPPRESS)

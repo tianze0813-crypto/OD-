@@ -15,6 +15,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
+import numpy as np
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -52,6 +54,103 @@ def _assert_class_only(before: Sequence[Mapping[str, Any]],
             "protected_fields": ["track_id", "box_lidar", "box_presence"]}
 
 
+def static_rotating_car_track_ids(
+        frames: Sequence[Mapping[str, Any]],
+        coords: tracking.CoordinateProvider,
+        *,
+        center_gate: float = 0.6,
+        min_frames: int = 6,
+        min_total_rotation: float = 1.0,
+        min_steps: int = 3,
+        max_reversal_fraction: float = 0.30,
+        step_gate: float = 0.12,
+) -> tuple[set[int], Dict[str, Any]]:
+    """Find stationary Car tracks whose heading keeps rotating.
+
+    A track qualifies when all of its observations are ``Car``, the world XY
+    center span stays within ``center_gate`` (so the position is fixed), and
+    the world heading rotates continuously (enough accumulated signed
+    rotation and few direction reversals).  Such an ID is treated as a
+    detection artifact and is removed as a whole.
+    """
+    by_id: dict[int, list[tuple[int, np.ndarray, float]]] = {}
+    for frame in frames:
+        ts = int(frame["frame_id"])
+        wf = coords.world_from_lidar(ts)
+        if wf is None:
+            continue
+        for det in frame.get("detections", []):
+            if det.get("track_id") is None or det.get("class_name") != "Car":
+                continue
+            box = det.get("box_lidar")
+            if not tracking.finite_box(det):
+                continue
+            center = tracking.center_world(box, wf)
+            yaw = tracking.yaw_world(float(box[6]), wf)
+            by_id.setdefault(int(det["track_id"]), []).append(
+                (int(ts), center, yaw))
+
+    dropped: set[int] = set()
+    details: List[Dict[str, Any]] = []
+    for track_id, items in by_id.items():
+        items = sorted(items, key=lambda value: value[0])
+        centers = np.asarray([center[:2] for _, center, _ in items],
+                             dtype=np.float64)
+        yaws = [yaw for _, _, yaw in items]
+        if len(centers) < min_frames:
+            continue
+        centroid = np.median(centers, axis=0)
+        span = float(np.max(np.linalg.norm(centers - centroid, axis=1)))
+        if span > center_gate:
+            continue
+        deltas = [tracking.wrap_angle(yaws[index] - yaws[index - 1])
+                  for index in range(1, len(yaws))]
+        total = float(sum(abs(delta) for delta in deltas))
+        abs_steps = int(sum(1 for delta in deltas if abs(delta) >= step_gate))
+        signs = [1 if delta >= 0.0 else -1 for delta in deltas
+                 if abs(delta) >= step_gate]
+        reversals = int(sum(1 for index in range(1, len(signs))
+                            if signs[index] != signs[index - 1]))
+        reversal_fraction = reversals / max(len(signs) - 1, 1)
+        if (total >= min_total_rotation and abs_steps >= min_steps
+                and reversal_fraction <= max_reversal_fraction):
+            dropped.add(track_id)
+            details.append({
+                "track_id": track_id,
+                "observations": len(centers),
+                "center_span": round(span, 4),
+                "total_rotation": round(total, 4),
+                "abs_steps": abs_steps,
+                "reversal_fraction": round(reversal_fraction, 4),
+            })
+    return dropped, {
+        "enabled": True,
+        "dropped_track_ids": sorted(dropped),
+        "tracks_dropped": len(dropped),
+        "details": details,
+        "config": {
+            "center_gate": center_gate,
+            "min_frames": min_frames,
+            "min_total_rotation": min_total_rotation,
+            "min_steps": min_steps,
+            "max_reversal_fraction": max_reversal_fraction,
+            "step_gate": step_gate,
+        },
+    }
+
+
+def _drop_track_ids(frames: Sequence[Mapping[str, Any]],
+                    ids: set[int]) -> int:
+    ids = set(ids)
+    removed = 0
+    for frame in frames:
+        old = frame.get("detections", [])
+        frame["detections"] = [d for d in old if d.get("track_id") not in ids]
+        removed += len(old) - len(frame["detections"])
+        frame["num_detections"] = len(frame["detections"])
+    return removed
+
+
 def run(
         step2_json: Path,
         step2_diagnostics: Path,
@@ -63,6 +162,13 @@ def run(
         hard_filter_config: HardFilterConfig = HardFilterConfig(),
         class_config: ClassRefinementConfig = ClassRefinementConfig(),
         min_lifecycle: int = 4,
+        static_rotation_enabled: bool = True,
+        rot_center_gate: float = 0.6,
+        rot_min_frames: int = 6,
+        rot_min_total: float = 1.0,
+        rot_min_steps: int = 3,
+        rot_max_reversal: float = 0.30,
+        rot_step_gate: float = 0.12,
 ) -> Dict[str, Any]:
     source = json.loads(Path(step2_json).read_text(encoding="utf-8"))
     if not isinstance(source, list):
@@ -74,6 +180,19 @@ def run(
     class_correction = finalize_model_track_classes(
         frames, tracking.TARGET_CLASSES)
     class_only_check = _assert_class_only(before_class, frames)
+
+    static_rotation = {"enabled": False}
+    if static_rotation_enabled:
+        coords = tracking.CoordinateProvider(Path(clip))
+        rotating_ids, static_rotation = static_rotating_car_track_ids(
+            frames, coords,
+            center_gate=float(rot_center_gate),
+            min_frames=int(rot_min_frames),
+            min_total_rotation=float(rot_min_total),
+            min_steps=int(rot_min_steps),
+            max_reversal_fraction=float(rot_max_reversal),
+            step_gate=float(rot_step_gate))
+        _drop_track_ids(frames, rotating_ids)
 
     # The second filter sees canonical classes and is therefore the final
     # authority on which detections enter annotation export.
@@ -90,6 +209,7 @@ def run(
         "input_detections": _count(source),
         "stage_order": [
             "track_class_canonicalization_and_majority_vote",
+            "static_car_rotating_filter",
             "hard_filters_pass_2",
             "short_track_filter",
         ],
@@ -99,6 +219,7 @@ def run(
                                              previous.get("hard_filters", {})),
         "class_correction": class_correction,
         "class_only_check": class_only_check,
+        "static_car_rotating_filter": static_rotation,
         "hard_filters": second_filter,
         "hard_filters_pass_2": second_filter,
         "short_track_filter": short_track_filter,
@@ -164,17 +285,33 @@ def main() -> None:
     parser.add_argument("--sparsity-max-points", type=int, default=10)
     parser.add_argument("--visibility-min-ratio", type=float, default=0.05)
     parser.add_argument("--pedestrian-max-distance", type=float, default=20.0)
+    parser.add_argument("--disable-static-rotation-filter", action="store_true",
+                        help="turn off the static Car rotating-yaw filter")
+    parser.add_argument("--rot-center-gate", type=float, default=0.6)
+    parser.add_argument("--rot-min-frames", type=int, default=6)
+    parser.add_argument("--rot-min-total", type=float, default=1.0)
+    parser.add_argument("--rot-min-steps", type=int, default=3)
+    parser.add_argument("--rot-max-reversal", type=float, default=0.30)
+    parser.add_argument("--rot-step-gate", type=float, default=0.12)
     parser.add_argument("--keep-classes",
                         default=",".join(tracking.TARGET_CLASSES))
     args = parser.parse_args()
     diagnostics = run(
         args.step2_json, args.step2_diagnostics, args.clip, args.out_json,
         args.out_clip, args.diagnostics,
-        hard_filter_config=_hard_config(args), min_lifecycle=args.min_lifecycle)
+        hard_filter_config=_hard_config(args), min_lifecycle=args.min_lifecycle,
+        static_rotation_enabled=not args.disable_static_rotation_filter,
+        rot_center_gate=args.rot_center_gate,
+        rot_min_frames=args.rot_min_frames,
+        rot_min_total=args.rot_min_total,
+        rot_min_steps=args.rot_min_steps,
+        rot_max_reversal=args.rot_max_reversal,
+        rot_step_gate=args.rot_step_gate)
     print(json.dumps({
         "class_changed": diagnostics["class_correction"]["detections_changed"],
         "hard_filter_removed": diagnostics["hard_filters_pass_2"]["detections_removed"],
         "short_tracks_removed": diagnostics["short_track_filter"]["tracks_dropped"],
+        "static_rotating_removed": diagnostics["static_car_rotating_filter"].get("tracks_dropped", 0),
         "final_detections": diagnostics["final_detections"],
     }, ensure_ascii=False, indent=2))
 
