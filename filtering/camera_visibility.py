@@ -126,7 +126,55 @@ def _ratio_in_camera(hull, idx, hulls, depths, cam, occl_tol):
     return visible / total, occluded / total, truncated / total
 
 
-def compute_frame_visibility(dets, cams, occl_tol=0.3):
+def _load_lidar_xyz(clip_root, frame_id) -> np.ndarray:
+    """Read one lidar_top xyzi frame, return the Nx3 XYZ points."""
+    path = Path(clip_root) / "lidar" / "lidar_top" / f"{frame_id}.bin"
+    if not path.is_file():
+        raise FileNotFoundError(f"lidar frame not found: {path}")
+    values = np.fromfile(path, dtype=np.float32)
+    if values.size % 4 != 0:
+        raise ValueError(f"lidar frame is not xyzi float32: {path}")
+    return values.reshape(-1, 4)[:, :3]
+
+
+def _points_in_box(points, box) -> np.ndarray:
+    """Return the XYZ points inside the box volume (box_lidar local frame)."""
+    x, y, z, dx, dy, dz, yaw = (float(v) for v in box[:7])
+    c, s = math.cos(-yaw), math.sin(-yaw)
+    px = (points[:, 0] - x) * c - (points[:, 1] - y) * s
+    py = (points[:, 0] - x) * s + (points[:, 1] - y) * c
+    mask = (
+        (np.abs(px) <= dx / 2.0)
+        & (np.abs(py) <= dy / 2.0)
+        & (np.abs(points[:, 2] - z) <= dz / 2.0)
+    )
+    return points[mask]
+
+
+def point_occlusion_from_pc(points_in_box, box) -> float:
+    """Occlusion degree (0..1) from the point-cloud height ratio.
+
+    For the nearest layer (no nearer box in the image) the camera box-overlap
+    method reports ``occluded=0`` even when the target is partly hidden by
+    non-box geometry.  This uses the LiDAR points inside the box: the vertical
+    span of the measured points over the box height (dz).  A fully visible
+    surface spans nearly the whole height; a partly hidden one leaves a gap.
+    """
+    dz = float(box[5])
+    if points_in_box is None or points_in_box.shape[0] == 0:
+        return 1.0
+    if dz <= 0.0:
+        return 0.0
+    zs = points_in_box[:, 2]
+    span = float(np.max(zs) - np.min(zs))
+    height_ratio = float(np.clip(span / dz, 0.0, 1.0))
+    return 1.0 - height_ratio
+
+
+def compute_frame_visibility(dets, cams, occl_tol=0.3,
+                             points=None, use_point_occlusion=True,
+                             point_occlusion_trigger=0.01,
+                             full_vis_ratio=0.9):
     """为帧内每个 det 写回 det['visibility']，返回统计。"""
     boxes = [d["box_lidar"] for d in dets]
     n = len(boxes)
@@ -158,6 +206,23 @@ def compute_frame_visibility(dets, cams, occl_tol=0.3):
             ratio, occ, trunc = _ratio_in_camera(hull, i, hulls, depths, cam, occl_tol)
             if best is None or ratio > best[0]:
                 best = (ratio, occ, trunc, name)
+        # Nearest layer: no nearer box occludes it in the image, so the camera
+        # method reports a fully visible target.  Complement it with the LiDAR
+        # point-cloud height ratio to catch occlusion by non-box objects.
+        if (best is not None and use_point_occlusion
+                and points is not None
+                and float(best[1]) <= point_occlusion_trigger):
+            box = d["box_lidar"]
+            ratio, occ, trunc, name = best
+            visible_ratio = 1.0 - point_occlusion_from_pc(
+                _points_in_box(points, box), box)
+            if visible_ratio > full_vis_ratio:
+                # 可见度高于阈值视为完全可见（顶部/底部小空隙不算遮挡）。
+                occ = 0.0
+                ratio = max(0.0, 1.0 - float(trunc))
+            else:
+                occ = max(float(occ), 1.0 - visible_ratio)
+                ratio = max(0.0, 1.0 - float(trunc) - occ)
         if best is None:
             vis = {"tag": 2, "ratio": 0.0, "occluded": 0.0, "truncated": 1.0, "best_cam": None}
         else:
@@ -184,7 +249,10 @@ def compute_clip_visibility(out_frames, clip_root, args):
     for frame in out_frames:
         if not frame["detections"]:
             continue
-        fstats = compute_frame_visibility(frame["detections"], cams, args.vis_occl_tol)
+        frame_id = str(frame["frame_id"])
+        frame_points = _load_lidar_xyz(clip_root, frame_id)
+        fstats = compute_frame_visibility(
+            frame["detections"], cams, args.vis_occl_tol, points=frame_points)
         for k in ("checked", "tag1", "tag2"):
             stats[k] += fstats[k]
         stats["frames"] += 1
@@ -217,7 +285,9 @@ def filter_raw_frames(frames, clip_root, drop_below, occl_tol=0.3):
         dets = frame["detections"]
         if not dets:
             continue
-        fstats = compute_frame_visibility(dets, cams, occl_tol)
+        frame_id = str(frame["frame_id"])
+        frame_points = _load_lidar_xyz(clip_root, frame_id)
+        fstats = compute_frame_visibility(dets, cams, occl_tol, points=frame_points)
         for k in ("checked", "tag1", "tag2"):
             stats[k] += fstats[k]
         stats["frames"] += 1
