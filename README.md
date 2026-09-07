@@ -238,7 +238,42 @@ NumPy 1.26.4、Kornia 0.6.12），两者都能跑通当前链路。Step1 要求
 
 ## 当前全链路
 
-## Car + 非 Car 混合分支
+### 当前分支运行命令
+
+当前分支是 `hybrid-main-car-expd-noncar`，入口脚本会对每个输入 clip 串行执行
+`main` Car 链路和 expD 非 Car 链路，最后写出一个合并后的预标注 clip。
+
+在仓库根目录执行：
+
+```bash
+cd /path/to/五类别预标链路
+bash hybrid_run.sh /path/to/clip_parent /path/to/SUSTechPOINTS/data \
+  --skip-install --overwrite
+```
+
+其中：
+
+- `/path/to/clip_parent` 是原始 clip 的父目录，下面应直接放置包含
+  `lidar/lidar_top/*.bin` 和 `transforms/` 的 clip 目录；
+- `/path/to/SUSTechPOINTS/data` 是最终输出目录，不能与输入父目录相同；
+- `--skip-install` 表示只使用已有的 CUDA/OpenPCDet 环境，不自动安装依赖；
+- `--overwrite` 表示已有 `<clip>_pre` 时覆盖重跑。
+
+如果环境探测不到正确的 Python，可显式指定推理环境：
+
+```bash
+OPENPCDET_PYTHON=/path/to/openpcdet/bin/python \
+bash hybrid_run.sh /path/to/clip_parent /path/to/SUSTechPOINTS/data \
+  --skip-install --overwrite
+```
+
+输出位置为：
+
+```text
+/path/to/SUSTechPOINTS/data/<clip>_pre/label/<frame_id>.json
+```
+
+### Car + 非 Car 混合分支
 
 分支 `hybrid-main-car-expd-noncar` 提供串行混合入口：先用 `main_chain/` 中固化的
 `main` Waymo 链路
