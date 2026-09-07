@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""Step 5 batch: final Car-only filtering and box conversion."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from filtering.final_filter import FinalFilterConfig
+from pipeline.step5_class_motion_filter import run
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--step4-work-root", type=Path,
+                        default=PROJECT_ROOT / "work" / "step4_car_size_filter")
+    parser.add_argument("--step3-work-root", type=Path, default=None,
+                        help="兼容旧流程：直接读取 Step3 JSON")
+    parser.add_argument("--clip-root", type=Path,
+                        default=PROJECT_ROOT / "work" / "step3_car_box_fit" / "data")
+    parser.add_argument("--out-root", type=Path,
+                        default=PROJECT_ROOT / "work" / "step5_class_motion_filter" / "data")
+    parser.add_argument("--work-root", type=Path,
+                        default=PROJECT_ROOT / "work" / "step5_class_motion_filter")
+    parser.add_argument("--suffix", type=str, default="_step5")
+    parser.add_argument("--sparsity-max-points", type=int, default=5,
+                        help="remove boxes containing this many points or fewer")
+    parser.add_argument("--short-track-max-frames", type=int, default=3,
+                        help="remove tracks observed in this many frames or fewer")
+    parser.add_argument("--overwrite", action="store_true")
+    args = parser.parse_args()
+
+    if args.step3_work_root is not None:
+        input_root = args.step3_work_root
+        input_suffix = "_step3.json"
+    else:
+        input_root = args.step4_work_root
+        input_suffix = "_step4.json"
+    input_jsons = sorted(input_root.glob(f"*{input_suffix}"))
+    if not input_jsons:
+        raise SystemExit(f"no *{input_suffix} found under {input_root}")
+    args.work_root.mkdir(parents=True, exist_ok=True)
+    args.out_root.mkdir(parents=True, exist_ok=True)
+
+    config = FinalFilterConfig(
+        max_points_in_box=args.sparsity_max_points,
+        max_track_length=args.short_track_max_frames,
+    )
+    summaries = []
+    for index, input_json in enumerate(input_jsons, start=1):
+        clip_name = input_json.name[:-len(input_suffix)]
+        clip = args.clip_root / f"{clip_name}_step3"
+        if not clip.is_dir():
+            raise SystemExit(f"missing step-3 clip for {clip_name}: {clip}")
+        out_json = args.work_root / f"{clip_name}_step5.json"
+        diagnostics = args.work_root / f"{clip_name}_step5_diagnostics.json"
+        out_clip = args.out_root / f"{clip_name}{args.suffix}"
+        if (out_clip.exists() or out_json.exists()) and not args.overwrite:
+            raise SystemExit(f"output exists, pass --overwrite: {out_clip}")
+        print(f"[{index}/{len(input_jsons)}] {clip_name}", flush=True)
+        result = run(input_json, clip, out_json, out_clip, diagnostics, config)
+        summaries.append({
+            "clip": clip_name,
+            "out_clip": str(out_clip),
+            "out_json": str(out_json),
+            "diagnostics": str(diagnostics),
+            "before_detections": result["before_detections"],
+            "after_detections": result["after_detections"],
+            "point_filter_removed": result["point_filter_removed"],
+            "short_track_removed": result["short_track_removed"],
+            "car_only_removed": result["car_only_removed"],
+            "boxes_converted": result["boxes_converted"],
+        })
+
+    summary_path = args.work_root / "batch_summary.json"
+    summary_path.write_text(
+        json.dumps(summaries, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8")
+    print(json.dumps({"clips": summaries, "summary": str(summary_path)},
+                     ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()

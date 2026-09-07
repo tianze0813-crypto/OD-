@@ -6,12 +6,12 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
-import tarfile
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+MAIN_CHAIN_ROOT = PROJECT_ROOT / "main_chain"
 
 
 def _run(command: List[Any]) -> None:
@@ -20,18 +20,18 @@ def _run(command: List[Any]) -> None:
     subprocess.run([str(value) for value in command], check=True)
 
 
-def _export_main_source(destination: Path) -> Path:
-    """Materialize the repository's local ``main`` ref without changing HEAD."""
-    destination.mkdir(parents=True, exist_ok=True)
-    archive = destination.parent / "main-source.tar"
-    with archive.open("wb") as stream:
-        subprocess.run(
-            ["git", "archive", "--format=tar", "main"],
-            cwd=PROJECT_ROOT, stdout=stream, check=True)
-    with tarfile.open(archive, "r:") as tar:
-        tar.extractall(destination)
-    archive.unlink()
-    return destination
+def _main_source() -> Path:
+    """Return the vendored main snapshot committed in this hybrid branch."""
+    required = (
+        MAIN_CHAIN_ROOT / "run_end_to_end.py",
+        MAIN_CHAIN_ROOT / "pipeline" / "step1_lidar_inference.py",
+        MAIN_CHAIN_ROOT / "models" / "vn_waymo_v2_4gpu_full_epoch10.pth",
+    )
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise RuntimeError(
+            "main_chain is incomplete; missing: " + ", ".join(missing))
+    return MAIN_CHAIN_ROOT
 
 
 def _read_main_labels(final_clip: Path) -> Dict[str, List[Dict[str, Any]]]:
@@ -55,7 +55,7 @@ def run(
         python: Path, clip: Path, work_root: Path, *, overwrite: bool = True,
 ) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, Any]]:
     """Run ``main`` on an isolated copy of one clip and keep only its labels."""
-    main_source = _export_main_source(work_root / "main_source")
+    main_source = _main_source()
     main_input = work_root / "main_input" / clip.name
     shutil.copytree(clip, main_input)
     command = [

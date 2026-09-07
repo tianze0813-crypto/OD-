@@ -240,7 +240,8 @@ NumPy 1.26.4、Kornia 0.6.12），两者都能跑通当前链路。Step1 要求
 
 ## Car + 非 Car 混合分支
 
-分支 `hybrid-main-car-expd-noncar` 提供串行混合入口：先用 `main` 的 Waymo 链路
+分支 `hybrid-main-car-expd-noncar` 提供串行混合入口：先用 `main_chain/` 中固化的
+`main` Waymo 链路
 生成并固定 Car 结果，再用当前分支的 `expD_e8.pth` 只保留 Truck、Bus、Pedestrian
 和 Nonmotorized_vehicle，最后按 `frame_id` 合并为一个 `<clip>_pre`。D 权重链路会在
 Step2 前丢弃 Car，并跳过 Car 专用几何拟合；两次推理不会并行占用 GPU。
@@ -249,6 +250,7 @@ Step2 前丢弃 Car，并跳过 Car 专用几何拟合；两次推理不会并�
 bash hybrid_run.sh <clip_parent> <sust_data_dir> --skip-install --overwrite
 ```
 
+`main_chain/` 是 `main` 分支的完整快照，入口不依赖本地是否存在 `main` Git 引用。
 入口默认使用当前用户环境探测结果和仓库内两个 checkpoint，不写死其他电脑的用户路径。
 中间 raw JSON、诊断文件和两条链路的临时结果在合并后自动清理，只保留最终 SUST clip。
 
