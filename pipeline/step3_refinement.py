@@ -88,6 +88,7 @@ def run(
         car_config: CarBoxFitConfig = CarBoxFitConfig(),
         truck_config: TruckOverlapConfig = TruckOverlapConfig(),
         nonmotorized_config: NonmotorizedSizeConfig = NonmotorizedSizeConfig(),
+        car_refinement_enabled: bool = True,
 ) -> Dict[str, Any]:
     source = json.loads(Path(step2_5_json).read_text(encoding="utf-8"))
     if not isinstance(source, list):
@@ -109,9 +110,18 @@ def run(
     # Match the reviewed police-pipeline Car route: feed the post-yaw boxes
     # directly into the dedicated shrink-only point-cloud fitter. In
     # particular, do not move or resize Car boxes in the generic stage first.
-    car_output, car_diagnostics = apply_car_box_fit(
-        yawed, coords, Path(clip), tracking_diagnostics,
-        static_yaw_diagnostics, car_config)
+    if car_refinement_enabled:
+        car_output, car_diagnostics = apply_car_box_fit(
+            yawed, coords, Path(clip), tracking_diagnostics,
+            static_yaw_diagnostics, car_config)
+    else:
+        car_output = yawed
+        car_diagnostics = {
+            "enabled": False,
+            "reason": "hybrid expD route retains non-Car classes only",
+            "car_tracks": 0,
+            "car_boxes": 0,
+        }
 
     # Generic track-level center, size, and ground stabilization belongs only
     # to the other four classes. Truck and NMV receive their specialized rules
@@ -148,7 +158,8 @@ def run(
         "input_detections": _count(source),
         "stage_order": [
             "public_yaw_static_and_dynamic",
-            "class_route_car_box_fit_only",
+            *( ["class_route_car_box_fit_only"]
+               if car_refinement_enabled else []),
             "generic_geometry_other_four_classes",
             "class_route_truck_overlap_id_merge",
             "class_route_nonmotorized_size_center_yaw",
@@ -157,7 +168,8 @@ def run(
         "static_yaw_stabilization": static_yaw_diagnostics,
         "yaw_integrated": yaw_diagnostics,
         "class_routes": {
-            "Car": "apply_car_box_fit_only",
+            "Car": ("apply_car_box_fit_only" if car_refinement_enabled
+                    else "skipped_non_car_hybrid_route"),
             "Truck": "generic_geometry_then_overlap_id_merge",
             "Bus": "generic_geometry",
             "Pedestrian": "generic_geometry",
@@ -205,10 +217,13 @@ def main() -> None:
     parser.add_argument("--out-json", type=Path, required=True)
     parser.add_argument("--out-clip", type=Path)
     parser.add_argument("--diagnostics", type=Path)
+    parser.add_argument("--skip-car-refinement", action="store_true",
+                        help="skip the Car-only geometry fitter")
     args = parser.parse_args()
     diagnostics = run(
         args.step2_5_json, args.step2_5_diagnostics, args.clip,
-        args.out_json, args.out_clip, args.diagnostics)
+        args.out_json, args.out_clip, args.diagnostics,
+        car_refinement_enabled=not args.skip_car_refinement)
     print(json.dumps({
         "yaw_boxes_by_mode": diagnostics["yaw_integrated"].get("boxes_by_mode", {}),
         "car_refinement": diagnostics["car_refinement"],

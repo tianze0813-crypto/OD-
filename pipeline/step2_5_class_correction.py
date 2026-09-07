@@ -225,6 +225,12 @@ def run(
         "input_detections": _count(source),
         "stage_order": [
             "track_class_canonicalization_and_majority_vote",
+            "hard_filters_pass_2",
+            "static_car_rotating_filter",
+            "short_track_filter",
+        ],
+        "execution_order": [
+            "track_class_canonicalization_and_majority_vote",
             "static_car_rotating_filter",
             "hard_filters_pass_2",
             "short_track_filter",
