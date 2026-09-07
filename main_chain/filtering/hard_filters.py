@@ -27,6 +27,7 @@ class HardFilterConfig:
     point_occlusion_trigger: float = 0.01
     point_occlusion_full_vis_ratio: float = 0.9
     pedestrian_max_distance: float = 20.0
+    nonmotorized_max_distance: float = 60.0
     keep_classes: Tuple[str, ...] = (
         "Vehicle", "Car", "Truck", "Pedestrian", "Cyclist"
     )
@@ -128,6 +129,10 @@ def apply_hard_filters(frames: List[Dict[str, Any]], clip: Path,
                         and math.hypot(float(box[0]), float(box[1]))
                         > config.pedestrian_max_distance):
                     reasons.append("distant_pedestrian")
+                if (class_name == "Nonmotorized_vehicle"
+                        and math.hypot(float(box[0]), float(box[1]))
+                        > config.nonmotorized_max_distance):
+                    reasons.append("distant_nonmotorized")
                 if point_count_by_index[detection_index] <= config.sparsity_max_points:
                     reasons.append("sparse_points")
                 if (float(det.get("visibility", {}).get("ratio", 0.0))

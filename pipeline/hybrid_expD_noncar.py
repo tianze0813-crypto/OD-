@@ -135,7 +135,8 @@ def run(raw_json: Path, clip: Path, out_json: Path,
         hard_filter_config=hard_config,
         class_config=ClassRefinementConfig(),
         min_lifecycle=int(short_track_max_frames),
-        static_rotation_enabled=False,
+        static_rotation_enabled=True,
+        static_rotation_classes=("Truck", "Bus"),
     )
 
     step3_json = work_root / (Path(out_json).stem + "_step3.json")

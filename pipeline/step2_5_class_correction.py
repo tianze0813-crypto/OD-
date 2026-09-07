@@ -58,6 +58,7 @@ def static_rotating_car_track_ids(
         frames: Sequence[Mapping[str, Any]],
         coords: tracking.CoordinateProvider,
         *,
+        classes: Sequence[str] = ("Car",),
         center_gate: float = 3.0,
         overlap_gate: float = 0.35,
         yaw_gate: float = 1.30,
@@ -65,7 +66,7 @@ def static_rotating_car_track_ids(
         min_flips: int = 2,
         min_frames: int = 5,
 ) -> tuple[set[int], Dict[str, Any]]:
-    """Find stationary Car tracks whose heading spins in place (false positive).
+    """Find stationary vehicle tracks whose heading spins in place (false positive).
 
     A moving turn also shows a large yaw spread, so the center alone is not
     enough.  Wrap every observed box of a track into a world frame and require
@@ -81,7 +82,7 @@ def static_rotating_car_track_ids(
         if wf is None:
             continue
         for det in frame.get("detections", []):
-            if det.get("track_id") is None or det.get("class_name") != "Car":
+            if det.get("track_id") is None or det.get("class_name") not in classes:
                 continue
             box = det.get("box_lidar")
             if not tracking.finite_box(det):
@@ -179,6 +180,7 @@ def run(
         class_config: ClassRefinementConfig = ClassRefinementConfig(),
         min_lifecycle: int = 4,
         static_rotation_enabled: bool = True,
+        static_rotation_classes: Tuple[str, ...] = ("Car",),
         rot_center_gate: float = 3.0,
         rot_overlap_gate: float = 0.35,
         rot_yaw_gate: float = 1.30,
@@ -202,6 +204,7 @@ def run(
         coords = tracking.CoordinateProvider(Path(clip))
         rotating_ids, static_rotation = static_rotating_car_track_ids(
             frames, coords,
+            classes=tuple(static_rotation_classes),
             center_gate=float(rot_center_gate),
             overlap_gate=float(rot_overlap_gate),
             yaw_gate=float(rot_yaw_gate),

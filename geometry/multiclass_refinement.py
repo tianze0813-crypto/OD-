@@ -28,6 +28,7 @@ from tracking import tracker_conservative as tracking
 
 @dataclass(frozen=True)
 class TruckOverlapConfig:
+    high_iou_absorb: float = 0.80
     high_iou: float = 0.50
     moderate_iou: float = 0.25
     max_center_distance: float = 1.10
@@ -94,7 +95,7 @@ def merge_overlapping_truck_tracks(
             continue
         for detection_index, det in enumerate(frame.get("detections", [])):
             if (det.get("track_id") is None
-                    or det.get("class_name") not in {"Truck", "Car"}
+                    or det.get("class_name") not in {"Truck", "Bus", "Car"}
                     or not tracking.finite_box(det)):
                 continue
             box = det["box_lidar"]
@@ -148,7 +149,7 @@ def merge_overlapping_truck_tracks(
                 if left["track_id"] == right["track_id"]:
                     continue
                 classes = {left["class_name"], right["class_name"]}
-                if classes not in ({"Truck"}, {"Truck", "Car"}):
+                if not classes <= {"Truck", "Bus", "Car"}:
                     continue
                 center_distance = float(np.linalg.norm(
                     left["center"][:2] - right["center"][:2]))
@@ -166,6 +167,12 @@ def merge_overlapping_truck_tracks(
                     "center_distance": round(center_distance, 4),
                     "relative_size_delta": round(size_delta, 4),
                 }
+                # Very high same-frame overlap is the same physical vehicle
+                # regardless of class; the longest-lifecycle track is kept.
+                if iou >= config.high_iou_absorb:
+                    pair_evidence[pair].append(evidence)
+                    pair_rules[pair].add("high_iou_absorb")
+                    continue
                 if classes == {"Truck", "Car"}:
                     if (center_distance <= config.cross_class_max_center_distance
                             and size_delta <= config.cross_class_max_relative_size_delta
@@ -190,23 +197,26 @@ def merge_overlapping_truck_tracks(
 
     accepted: List[Tuple[Tuple[int, int], List[Dict[str, Any]]]] = []
     for pair, evidence in sorted(pair_evidence.items()):
-        classes = {track_classes.get(track_id) for track_id in pair}
-        if classes == {"Truck", "Car"}:
-            accepted_by_rule = "truck_car_high_iou" in pair_rules[pair]
+        if "high_iou_absorb" in pair_rules[pair]:
+            accepted_by_rule = True
         else:
-            strong = [item for item in evidence
-                      if item["bev_iou"] >= config.high_iou]
-            moderate = [item for item in evidence
-                        if item["bev_iou"] >= config.moderate_iou
-                        and item["center_distance"] <= config.max_center_distance
-                        and item["relative_size_delta"] <= config.max_relative_size_delta]
-            near = [item for item in evidence
-                    if item["center_distance"] <= config.near_truck_max_distance
-                    and item["relative_size_delta"] <= config.near_truck_max_relative_size_delta]
-            accepted_by_rule = (
-                bool(strong)
-                or len(moderate) >= int(config.moderate_overlap_frames)
-                or len(near) >= int(config.near_truck_frames))
+            classes = {track_classes.get(track_id) for track_id in pair}
+            if classes == {"Truck", "Car"}:
+                accepted_by_rule = "truck_car_high_iou" in pair_rules[pair]
+            else:
+                strong = [item for item in evidence
+                          if item["bev_iou"] >= config.high_iou]
+                moderate = [item for item in evidence
+                            if item["bev_iou"] >= config.moderate_iou
+                            and item["center_distance"] <= config.max_center_distance
+                            and item["relative_size_delta"] <= config.max_relative_size_delta]
+                near = [item for item in evidence
+                        if item["center_distance"] <= config.near_truck_max_distance
+                        and item["relative_size_delta"] <= config.near_truck_max_relative_size_delta]
+                accepted_by_rule = (
+                    bool(strong)
+                    or len(moderate) >= int(config.moderate_overlap_frames)
+                    or len(near) >= int(config.near_truck_frames))
         if accepted_by_rule:
             accepted.append((pair, evidence))
             union(*pair)
@@ -216,11 +226,19 @@ def merge_overlapping_truck_tracks(
         components[root(track_id)].append(track_id)
     representative: Dict[int, int] = {}
     for members in components.values():
-        trucks = [track_id for track_id in members
-                  if track_classes.get(track_id) == "Truck"]
-        if not trucks:
+        if len(members) <= 1:
             continue
-        keep = max(trucks, key=lambda track_id: ranks[track_id])
+        # Keep the longest-lifecycle track (most observations) as
+        # representative; break lifecycle ties by class weight then score.
+        class_weight = {"Truck": 3, "Bus": 2, "Car": 1}
+
+        def member_rank(track_id: int) -> Tuple[int, int, float, int]:
+            return (int(ranks[track_id][0]),
+                    class_weight.get(track_classes.get(track_id), 1),
+                    float(ranks[track_id][1]),
+                    -int(track_id))
+
+        keep = max(members, key=member_rank)
         for track_id in members:
             representative[track_id] = keep
 
@@ -239,11 +257,12 @@ def merge_overlapping_truck_tracks(
             if track_id is None or int(track_id) not in representative:
                 continue
             keep = representative[int(track_id)]
-            if keep == int(track_id) and det.get("class_name") != "Car":
+            if keep == int(track_id):
                 continue
             det["track_id"] = keep
-            if det.get("class_name") == "Car":
-                det["class_name"] = "Truck"
+            rep_class = track_classes[keep]
+            if det.get("class_name") != rep_class:
+                det["class_name"] = rep_class
                 class_converted += 1
 
     representative_size_values: Dict[int, List[np.ndarray]] = defaultdict(list)
@@ -260,22 +279,21 @@ def merge_overlapping_truck_tracks(
     for frame_index, frame in enumerate(frames):
         groups: Dict[int, List[int]] = defaultdict(list)
         for index, det in enumerate(frame.get("detections", [])):
-            if det.get("class_name") == "Truck" and det.get("track_id") is not None:
+            if (det.get("class_name") in {"Truck", "Bus", "Car"}
+                    and det.get("track_id") is not None):
                 groups[int(det["track_id"])].append(index)
         remove_indices = set()
         for track_id, indices in groups.items():
             if len(indices) <= 1:
                 continue
 
-            def rank(index: int) -> Tuple[float, float, float, float]:
+            def rank(index: int) -> Tuple[float, float, float]:
                 det = frame["detections"][index]
                 size_error = float(np.linalg.norm(
                     _physical_size(det["box_lidar"])
                     - representative_size.get(track_id,
                                               _physical_size(det["box_lidar"]))))
-                source_class = original_class_by_detection.get(id(det), "Truck")
-                class_priority = 1.0 if source_class == "Truck" else 0.0
-                return (class_priority, float(det.get("score", 0.0)), -size_error,
+                return (float(det.get("score", 0.0)), -size_error,
                         -float(index))
 
             keep_index = max(indices, key=rank)
@@ -299,7 +317,8 @@ def merge_overlapping_truck_tracks(
 
     return {
         "policy": {
-            "class": "Truck/Car",
+            "class": "Truck/Bus/Car",
+            "high_iou_absorb": config.high_iou_absorb,
             "high_iou": config.high_iou,
             "moderate_iou": config.moderate_iou,
             "max_center_distance": config.max_center_distance,
@@ -321,7 +340,8 @@ def merge_overlapping_truck_tracks(
             for source, target in sorted(remap.items())],
         "class_id_remaps": [
             {"from_track_id": source, "to_track_id": target,
-             "from_class": track_classes.get(source), "to_class": "Truck"}
+             "from_class": track_classes.get(source),
+             "to_class": track_classes.get(target)}
             for source, target in sorted(remap.items())],
         "overlap_pairs": [
             {"track_ids": list(pair), "rules": sorted(pair_rules[pair]),
@@ -590,10 +610,13 @@ def verify_multiclass_refinement(
 
     Truck refinement may remap IDs, promote swallowed Car observations to
     Truck, and remove duplicate boxes, but every surviving vehicle detection
-    keeps its score, complete box geometry, and non-track metadata.
+    keeps its score, complete box geometry, and non-track metadata.  Bus is
+    now part of the vehicle pool: a high-IoU duplicate may be absorbed into a
+    Truck/Bus/Car representative (class may be promoted to the representative
+    class) while its geometry and score are preserved for survivors.
     Nonmotorized refinement may replace ``box_lidar[:7]`` while preserving its
-    class, ID, and all non-geometry metadata. Bus and Pedestrian are strict
-    pass-throughs; Car is unchanged unless swallowed by a Truck merge.
+    class, ID, and all non-geometry metadata. Pedestrian is a strict
+    pass-through; Car is unchanged unless swallowed by a Truck merge.
     """
     if len(before) != len(after):
         raise AssertionError("multiclass refinement changed frame count")
@@ -617,11 +640,11 @@ def verify_multiclass_refinement(
         # a Truck component, so it is checked below with the vehicle pool.
         left_protected = [
             det for det in left_dets
-            if det.get("class_name") in {"Bus", "Pedestrian"}
+            if det.get("class_name") == "Pedestrian"
         ]
         right_protected = [
             det for det in right_dets
-            if det.get("class_name") in {"Bus", "Pedestrian"}
+            if det.get("class_name") == "Pedestrian"
         ]
         if left_protected != right_protected:
             raise AssertionError(
@@ -657,39 +680,35 @@ def verify_multiclass_refinement(
             return value
 
         left_vehicle = [det for det in left_dets
-                        if det.get("class_name") in {"Car", "Truck"}]
+                        if det.get("class_name") in {"Car", "Truck", "Bus"}]
         remaining_vehicle = [
             {"class_name": str(det.get("class_name")),
              "signature": vehicle_signature(det)}
             for det in left_vehicle
         ]
         for right in (det for det in right_dets
-                      if det.get("class_name") in {"Car", "Truck"}):
+                      if det.get("class_name") in {"Car", "Truck", "Bus"}):
             candidate = vehicle_signature(right)
             allowed = [index for index, item in enumerate(remaining_vehicle)
-                       if item["signature"] == candidate
-                       and (right.get("class_name") == item["class_name"]
-                            or (right.get("class_name") == "Truck"
-                                and item["class_name"] == "Car"))]
+                       if item["signature"] == candidate]
             if not allowed:
                 raise AssertionError(
-                    "Truck/Car refinement changed a protected detection field")
-            # Prefer a native Truck source when both classes have the same box.
+                    "Truck/Bus/Car refinement changed a protected detection field")
             keep_index = next((index for index in allowed
-                               if remaining_vehicle[index]["class_name"] == "Truck"),
-                              allowed[0])
+                               if remaining_vehicle[index]["class_name"]
+                               == right.get("class_name")), allowed[0])
             source_class = remaining_vehicle.pop(keep_index)["class_name"]
-            if source_class == "Car" and right.get("class_name") == "Truck":
+            if source_class != right.get("class_name"):
                 vehicle_converted += 1
             checked += 1
-        truck_removed += sum(item["class_name"] == "Truck"
-                             for item in remaining_vehicle)
+        truck_removed += len(remaining_vehicle)
 
     return {
         "passed": True,
         "detections_checked": checked,
         "truck_boxes_removed": truck_removed,
-        "vehicle_boxes_converted_car_to_truck": vehicle_converted,
+        "vehicle_boxes_converted_to_representative_class": vehicle_converted,
         "nonmotorized_boxes_checked": nmv_boxes,
-        "policy": "Truck ID/duplicate merge plus Nonmotorized size/center/yaw",
+        "policy": ("Truck/Bus/Car ID/duplicate merge plus "
+                   "Nonmotorized size/center/yaw"),
     }

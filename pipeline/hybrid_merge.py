@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import copy
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import Any, Dict, List, Mapping, Sequence
 
 from tracking import tracker_conservative as tracking
@@ -15,22 +15,156 @@ NON_CAR_CLASSES = frozenset({
 })
 
 
+def _label_to_box(label: Mapping[str, Any]) -> List[float]:
+    """Rebuild box_lidar [x,y,z,dx,dy,dz,yaw] from a SUST label (base_link)."""
+    p = label["psr"]["position"]
+    s = label["psr"]["scale"]
+    rz = label["psr"]["rotation"]["z"]
+    return [float(p["x"]), float(p["y"]), float(p["z"]),
+            float(s["x"]), float(s["y"]), float(s["z"]), float(rz)]
+
+
+def _absorb_high_iou_cross_class(
+        main_labels: Mapping[str, Sequence[Mapping[str, Any]]],
+        expd_frames: Sequence[Mapping[str, Any]],
+        high_iou: float = 0.8,
+) -> tuple[Dict[str, List[Mapping[str, Any]]], List[Mapping[str, Any]],
+           Dict[str, Any]]:
+    """Absorb same-frame Car vs Truck/Bus with BEV IoU >= high_iou.
+
+    Both inputs are already in base_link.  For every frame a Car label and a
+    Truck/Bus detection are merged into one object; the longer-lifecycle side
+    (more observed frames) is kept and the other is dropped across all frames.
+    """
+    expd_by_frame = _frame_index(expd_frames)
+    car_life: Counter[str] = Counter()
+    expd_life: Counter[str] = Counter()
+    for labels in main_labels.values():
+        for label in labels:
+            if str(label.get("obj_type")) == "Car":
+                car_life[str(label.get("obj_id"))] += 1
+    for frame in expd_frames:
+        for det in frame.get("detections", []):
+            if (tracking.canonical_class_name(det.get("class_name", ""))
+                    in {"Truck", "Bus"} and det.get("track_id") is not None):
+                expd_life[str(det.get("track_id"))] += 1
+
+    pair_frames: Dict[Tuple[str, str], List[str]] = defaultdict(list)
+    for frame_id, expd_frame in expd_by_frame.items():
+        car_boxes: List[Tuple[str, List[float]]] = []
+        for label in main_labels.get(frame_id, []):
+            if str(label.get("obj_type")) != "Car":
+                continue
+            try:
+                car_boxes.append((str(label.get("obj_id")), _label_to_box(label)))
+            except (KeyError, TypeError, ValueError):
+                continue
+        for det in expd_frame.get("detections", []):
+            canonical = tracking.canonical_class_name(det.get("class_name", ""))
+            if canonical not in {"Truck", "Bus"} or det.get("track_id") is None:
+                continue
+            expd_box = det["box_lidar"]
+            for car_id, car_box in car_boxes:
+                iou = tracking.bev_iou(
+                    car_box[:3], car_box[3:6], car_box[6],
+                    expd_box[:3], expd_box[3:6], expd_box[6])
+                if iou >= high_iou:
+                    pair_frames[(car_id, str(det["track_id"]))].append(frame_id)
+
+    parent: Dict[str, str] = {}
+
+    def root(node: str) -> str:
+        value = node
+        while parent.get(value, value) != value:
+            value = parent[value]
+        while parent.get(node, node) != node:
+            parent[node], node = value, parent[node]
+        return value
+
+    def union(left: str, right: str) -> None:
+        a, b = root(left), root(right)
+        if a != b:
+            parent[b] = a
+
+    for car_id, track_id in pair_frames:
+        a, b = "car:" + car_id, "expd:" + track_id
+        parent.setdefault(a, a)
+        parent.setdefault(b, b)
+        union(a, b)
+
+    components: Dict[str, List[str]] = defaultdict(list)
+    for node in list(parent):
+        components[root(node)].append(node)
+
+    life = {"car:" + key: value for key, value in car_life.items()}
+    life.update({"expd:" + key: value for key, value in expd_life.items()})
+    absorbed_car: set[str] = set()
+    absorbed_expd: set[str] = set()
+    absorbed_pairs: List[Dict[str, str]] = []
+    for members in components.values():
+        if len(members) <= 1:
+            continue
+        best = max(members, key=lambda node: (life.get(node, 0), node))
+        for member in members:
+            if member == best:
+                continue
+            kind, _, identifier = member.partition(":")
+            if kind == "car":
+                absorbed_car.add(identifier)
+            else:
+                absorbed_expd.add(identifier)
+            absorbed_pairs.append({"absorbed": member, "kept": best})
+
+    filtered_main = {
+        frame_id: [
+            label for label in labels
+            if str(label.get("obj_id")) not in absorbed_car
+        ]
+        for frame_id, labels in main_labels.items()
+    }
+    filtered_expd: List[Mapping[str, Any]] = []
+    for frame in expd_frames:
+        kept = [
+            det for det in frame.get("detections", [])
+            if not (tracking.canonical_class_name(det.get("class_name", ""))
+                    in {"Truck", "Bus"}
+                    and str(det.get("track_id")) in absorbed_expd)
+        ]
+        out = dict(frame)
+        out["detections"] = kept
+        out["num_detections"] = len(kept)
+        filtered_expd.append(out)
+
+    return filtered_main, filtered_expd, {
+        "pipeline": "hybrid_high_iou_absorb",
+        "threshold": high_iou,
+        "candidate_pairs": len(pair_frames),
+        "absorbed_car_obj_ids": sorted(absorbed_car),
+        "absorbed_expd_track_ids": sorted(absorbed_expd),
+        "car_absorbed": len(absorbed_car),
+        "expd_absorbed": len(absorbed_expd),
+        "absorbed_pairs": absorbed_pairs,
+    }
+
+
 def merge_label_frames(
         main_labels: Mapping[str, Sequence[Mapping[str, Any]]],
         expd_frames: Sequence[Mapping[str, Any]],
 ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Merge already-exported main Car labels with expD frame detections."""
-    expd_by_frame = _frame_index(expd_frames)
-    if set(main_labels) != set(expd_by_frame):
+    filtered_main, filtered_expd, absorb_stats = _absorb_high_iou_cross_class(
+        main_labels, expd_frames)
+    expd_by_frame = _frame_index(filtered_expd)
+    if set(filtered_main) != set(expd_by_frame):
         raise ValueError(
             "hybrid frame IDs differ: "
-            f"missing_main={sorted(set(expd_by_frame) - set(main_labels))}, "
-            f"missing_expD={sorted(set(main_labels) - set(expd_by_frame))}")
+            f"missing_main={sorted(set(expd_by_frame) - set(filtered_main))}, "
+            f"missing_expD={sorted(set(filtered_main) - set(expd_by_frame))}")
 
     output: List[Dict[str, Any]] = []
     used_ids = {
         str(label.get("obj_id"))
-        for labels in main_labels.values() for label in labels
+        for labels in filtered_main.values() for label in labels
         if label.get("obj_id") is not None
     }
     used_ints: set[int] = set()
@@ -42,7 +176,7 @@ def merge_label_frames(
 
     source_ids = sorted({
         int(det.get("track_id"))
-        for frame in expd_frames for det in frame.get("detections", [])
+        for frame in filtered_expd for det in frame.get("detections", [])
         if det.get("track_id") is not None
     })
     id_map: Dict[str, str] = {}
@@ -64,7 +198,7 @@ def merge_label_frames(
 
     class_counts: Counter[str] = Counter()
     expd_count = 0
-    for frame_id, car_labels in main_labels.items():
+    for frame_id, car_labels in filtered_main.items():
         expd_frame = expd_by_frame[frame_id]
         labels = [copy.deepcopy(dict(label)) for label in car_labels]
         for label in labels:
@@ -84,7 +218,7 @@ def merge_label_frames(
             expd_count += 1
         output.append({"frame_id": frame_id, "labels": labels})
 
-    main_count = sum(len(labels) for labels in main_labels.values())
+    main_count = sum(len(labels) for labels in filtered_main.values())
     return output, {
         "pipeline": "hybrid_merge",
         "frames": len(output),
@@ -96,6 +230,7 @@ def merge_label_frames(
             "source_track_ids": sorted(source_ids),
             "remapped_track_ids": id_map,
         },
+        "high_iou_absorb": absorb_stats,
         "policy": {
             "main_classes": ["Car"],
             "expd_classes": sorted(NON_CAR_CLASSES),
