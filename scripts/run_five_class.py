@@ -25,7 +25,7 @@ DEFAULT_INPUT_ROOT = Path.home() / "sust" / "data"
 DEFAULT_OUTPUT_ROOT = Path.home() / "SUSTechPOINTS" / "data"
 DEFAULT_RAW_ROOT = Path.home() / "sust" / "raw_inference"
 DEFAULT_CFG = ROOT / "models" / "voxelnext_fiveclass_nuscenes_infer.yaml"
-DEFAULT_CKPT = ROOT / "models" / "vn5_nuscenes_checkpoint_epoch_12.pth"
+DEFAULT_CKPT = ROOT / "models" / "expD_e8.pth"
 DEFAULT_ENV_NAME = "fiveclass-prelabel"
 REQUIRED_MODULES = ("numpy", "scipy", "cv2", "PIL", "pandas", "av2",
                     "kornia", "yaml", "torch", "spconv", "pcdet")
@@ -40,6 +40,11 @@ WEIGHT_PRESETS = {
         "full",
     ),
     "epoch12": (
+        ROOT / "models" / "vn5_nuscenes_checkpoint_epoch_12.pth",
+        DEFAULT_CFG,
+        "full",
+    ),
+    "expD": (
         DEFAULT_CKPT,
         DEFAULT_CFG,
         "full",

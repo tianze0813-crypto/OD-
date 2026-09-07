@@ -139,12 +139,12 @@ $OPENPCDET_PYTHON scripts/check_step1_env.py \
 
 ## 权重选择
 
-默认权重是 `models/vn5_nuscenes_checkpoint_epoch_12.pth`，可用
-`bash run.sh --list-weights` 查看：
+默认权重是 `models/expD_e8.pth`，可用 `bash run.sh --list-weights` 查看：
 
 | 别名 | checkpoint | 可用模式 |
 | --- | --- | --- |
-| `default` / `epoch12` | `vn5_nuscenes_checkpoint_epoch_12.pth` | 完整链路 |
+| `default` / `expD` | `expD_e8.pth` | 完整链路 |
+| `epoch12` | `vn5_nuscenes_checkpoint_epoch_12.pth` | 完整链路 |
 | `epoch15` | `nusc_frozen20_epoch15.pth` | 完整链路 |
 | `epoch17` | `nusc_frozen20_epoch17.pth` | 完整链路 |
 | `epoch20` | `nusc_frozen20_epoch20.pth` | 完整链路 |
