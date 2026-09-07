@@ -75,5 +75,6 @@ def run(
         "source_clip_copy": str(main_input),
         "frames": len(labels),
         "car_detections": sum(len(value) for value in labels.values()),
+        "final_detections": sum(len(value) for value in labels.values()),
         "output_classes": ["Car"],
     }

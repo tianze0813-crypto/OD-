@@ -332,6 +332,9 @@ def _collect_clips(input_root: Path) -> list[Path]:
     """Scan the clip parent directory for all raw clip subdirectories."""
     if not input_root.is_dir():
         raise RuntimeError(f"input directory does not exist: {input_root}")
+    # Accept a single clip directory directly, or a parent holding many clips.
+    if _is_clip(input_root):
+        return [input_root.resolve()]
     clips = [path.resolve() for path in sorted(input_root.iterdir())
              if _is_clip(path) and not path.name.endswith("_pre")]
     if not clips:

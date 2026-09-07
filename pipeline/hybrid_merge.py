@@ -33,22 +33,34 @@ def merge_label_frames(
         for labels in main_labels.values() for label in labels
         if label.get("obj_id") is not None
     }
-    source_ids = {
-        str(det.get("track_id"))
+    used_ints: set[int] = set()
+    for value in used_ids:
+        try:
+            used_ints.add(int(value))
+        except ValueError:
+            pass
+
+    source_ids = sorted({
+        int(det.get("track_id"))
         for frame in expd_frames for det in frame.get("detections", [])
         if det.get("track_id") is not None
-    }
+    })
     id_map: Dict[str, str] = {}
-    for source_id in sorted(source_ids):
-        candidate = source_id
+    next_id = max(used_ints, default=0) + 1
+    for source_id in source_ids:
+        candidate = str(source_id)
         if candidate in used_ids:
-            candidate = f"expd_{source_id}"
-            suffix = 2
-            while candidate in used_ids:
-                candidate = f"expd_{source_id}_{suffix}"
-                suffix += 1
-        id_map[source_id] = candidate
-        used_ids.add(candidate)
+            # Colliding expD tracks get a fresh plain id (no expd_ prefix).
+            while next_id in used_ints:
+                next_id += 1
+            candidate = str(next_id)
+            used_ints.add(next_id)
+            used_ids.add(candidate)
+            next_id += 1
+        else:
+            used_ints.add(source_id)
+            used_ids.add(candidate)
+        id_map[str(source_id)] = candidate
 
     class_counts: Counter[str] = Counter()
     expd_count = 0

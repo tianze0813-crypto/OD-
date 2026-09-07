@@ -76,11 +76,23 @@ class HybridPipelineTest(unittest.TestCase):
         self.assertEqual([label["obj_type"] for label in output[0]["labels"]],
                          ["Car", "Truck"])
         self.assertEqual([label["obj_id"] for label in output[0]["labels"]],
-                         ["1", "expd_1"])
+                         ["1", "2"])
         self.assertEqual(stats["merged_detections"], 2)
 
     def test_hybrid_defaults_do_not_reference_moga_paths(self):
-        self.assertNotIn("moga", str(hybrid_launcher.EXPD_CFG))
+        # Defaults must be derived from this checkout root (ROOT), not from a
+        # hardcoded personal home folder.  The checkout itself may live under a
+        # directory named "moga", so only the launcher source is checked.
+        root = Path(hybrid_launcher.__file__).resolve().parents[1]
+        self.assertEqual(
+            hybrid_launcher.EXPD_CFG,
+            root / "models" / "voxelnext_fiveclass_nuscenes_infer.yaml")
+        self.assertEqual(
+            hybrid_launcher.EXPD_CKPT,
+            root / "models" / "expD_e8.pth")
+        source = Path(hybrid_launcher.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("/home/moga", source)
+        self.assertNotIn("moga/", source)
 
     def test_runner_is_serial_and_writes_one_merged_clip(self):
         events = []

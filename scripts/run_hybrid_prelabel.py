@@ -49,6 +49,9 @@ def _is_clip(path: Path) -> bool:
 def _collect_clips(input_root: Path) -> List[Path]:
     if not input_root.is_dir():
         raise RuntimeError(f"input directory does not exist: {input_root}")
+    # Accept a single clip directory directly, or a parent holding many clips.
+    if _is_clip(input_root):
+        return [input_root.resolve()]
     clips = [path.resolve() for path in sorted(input_root.iterdir())
              if _is_clip(path) and not path.name.endswith("_pre")]
     if not clips:
@@ -68,7 +71,7 @@ def _probe(python: Path) -> Dict[str, Any]:
         "result={'python':sys.executable,'modules':{},'cuda':False}; "
         "result['modules']={n:bool(importlib.util.find_spec(n)) for n in modules}; "
         "\ntry:\n import torch; result['cuda']=bool(torch.cuda.is_available())\n"
-        "except Exception as exc: result['torch_error']=str(exc); "
+        "except Exception as exc: result['torch_error']=str(exc)\n"
         "print(json.dumps(result))"
     )
     result = subprocess.run([str(python), "-c", code], text=True,
@@ -141,7 +144,8 @@ def _write_labels(frames: List[Dict[str, Any]], clip: Path) -> int:
 
 def _run_raw(python: Path, clip: Path, cfg: Path, ckpt: Path,
              work_root: Path, name: str, score_thresh: float) -> Path:
-    output = work_root / f"{name}_raw.json"
+    # step1_lidar_inference.py writes <clip.name>_raw.json under work_root.
+    output = work_root / f"{clip.name}_raw.json"
     _run([
         python, ROOT / "pipeline" / "step1_lidar_inference.py",
         "--clip", clip, "--work-root", work_root,
