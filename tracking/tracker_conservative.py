@@ -36,6 +36,8 @@ from scipy.optimize import linear_sum_assignment
 
 
 STATIC_CLASSES = {"Vehicle", "Car", "Truck"}
+# Public class vocabulary used by the hybrid pipeline's class refinement.
+TARGET_CLASSES = ("Car", "Truck", "Bus", "Pedestrian", "Nonmotorized_vehicle")
 VEHICLE_CLASSES = STATIC_CLASSES | {"Bus", "Other Vehicle"}
 CLASS_MAP = {
     "car": "Car", "truck": "Truck", "bus": "Bus",
@@ -45,6 +47,18 @@ CLASS_MAP = {
     "Car": "Car", "Truck": "Truck", "Vehicle": "Car",
     "Pedestrian": "Pedestrian", "Cyclist": "Nonmotorized_vehicle",
 }
+
+
+def canonical_class_name(value: Any) -> str | None:
+    """Map model aliases to the five classes emitted by SUST labels."""
+    text = str(value).strip()
+    if not text:
+        return None
+    direct = CLASS_MAP.get(text)
+    if direct in TARGET_CLASSES:
+        return direct
+    folded = CLASS_MAP.get(text.casefold())
+    return folded if folded in TARGET_CLASSES else None
 
 
 def wrap_angle(a: float) -> float:
