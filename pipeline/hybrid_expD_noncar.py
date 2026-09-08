@@ -81,15 +81,15 @@ def _hard_config(*, sparsity_max_points: int,
     )
 
 
-def drop_spinning_truck_bus(
+def drop_spinning_vehicle(
         frames: List[Dict[str, Any]], *,
         yaw_gate: float = 1.10,
         step_gate: float = 0.80,
         min_flips: int = 1,
         min_frames: int = 4,
-        classes: tuple[str, ...] = ("Truck", "Bus"),
+        classes: tuple[str, ...] = ("Truck", "Bus", "Nonmotorized_vehicle"),
 ) -> tuple[set[int], Dict[str, Any]]:
-    """Drop Truck/Bus tracks whose refined yaw spins erratically.
+    """Drop vehicle tracks whose refined yaw spins erratically.
 
     After the shared yaw pass a false track often keeps jumping between
     headings each frame (a large pi-periodic yaw spread plus sudden
@@ -149,7 +149,7 @@ def drop_spinning_truck_bus(
         removed += len(old) - len(frame["detections"])
         frame["num_detections"] = len(frame["detections"])
     return dropped, {
-        "pipeline": "hybrid_drop_spinning_truck_bus",
+        "pipeline": "hybrid_drop_spinning_vehicle",
         "dropped_track_ids": sorted(dropped),
         "tracks_dropped": len(dropped),
         "boxes_removed": removed,
@@ -220,7 +220,7 @@ def run(raw_json: Path, clip: Path, out_json: Path,
         class_config=ClassRefinementConfig(),
         min_lifecycle=int(short_track_max_frames),
         static_rotation_enabled=True,
-        static_rotation_classes=("Truck", "Bus"),
+        static_rotation_classes=("Truck", "Bus", "Nonmotorized_vehicle"),
     )
 
     step3_json = work_root / (Path(out_json).stem + "_step3.json")
@@ -235,7 +235,7 @@ def run(raw_json: Path, clip: Path, out_json: Path,
     )
 
     processed = json.loads(step3_json.read_text(encoding="utf-8"))
-    _spin_dropped, spin_stats = drop_spinning_truck_bus(processed)
+    _spin_dropped, spin_stats = drop_spinning_vehicle(processed)
     diagnostics["spinning_truck_bus"] = spin_stats
     output, final_diag = apply_five_class_output(
         processed, tracking.CoordinateProvider(Path(clip)))

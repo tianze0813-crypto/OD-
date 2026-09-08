@@ -55,6 +55,28 @@ bash run.sh <clip_parent> <sust_root> --overwrite
 bash hybrid_run.sh /home/moga/桌面/test /home/moga/桌面/SUSTechPOINTS/data/ --overwrite
 ```
 
+## 批量遍历 police/0903 的 step2 clip
+
+`/media/moga/police/0903/<scene>/step2/scene_*_clipN/` 是分阶段的 SUST clip
+（每个场景下有 `step1/step2/step3`，预测数据在 `step2` 下的 `scene_*_clipN/`）。
+下面的 for 循环会逐个遍历这些 clip 并跑混合链路：
+
+```bash
+DATA_ROOT=/media/moga/police/0903
+SUST=/home/moga/桌面/SUSTechPOINTS/data
+
+for scene in "$DATA_ROOT"/*/; do
+  for clip in "${scene%/}"/step2/scene_*_clip*/; do
+    [ -d "$clip" ] || continue                       # 只处理目录，跳过 .zip
+    echo "== 处理 ${clip%/} =="
+    bash hybrid_run.sh "$clip" "$SUST" --overwrite
+  done
+done
+```
+
+只想跑某个场景时，上面的外层 for 可改成 `for scene in "$DATA_ROOT"/*scene名*/; do`；
+想跳过已生成的 `*_pre`，把 `--overwrite` 去掉即可（输出已存在会报错，不想中断就先删除旧 `_pre`）。
+
 ## 导出到 SUST（可选）
 
 第二个参数就是 SUSTechPOINTS 数据根目录，**默认导出**为

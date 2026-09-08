@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from pipeline.hybrid_expD_noncar import _noncar_filter, drop_spinning_truck_bus
+from pipeline.hybrid_expD_noncar import _noncar_filter, drop_spinning_vehicle
 from pipeline.hybrid_merge import merge_frames, merge_label_frames
 
 
@@ -79,7 +79,7 @@ class HybridPipelineTest(unittest.TestCase):
                          ["1", "2"])
         self.assertEqual(stats["merged_detections"], 2)
 
-    def test_drop_spinning_truck_bus_removes_erratic_tracks_only(self):
+    def test_drop_spinning_vehicle_removes_erratic_tracks_only(self):
         def frames_for(entries):
             frames = []
             for track_id, yaws in entries.items():
@@ -101,7 +101,7 @@ class HybridPipelineTest(unittest.TestCase):
                   43: [-0.65, -0.64, -0.78, -0.69, -0.78, -0.63, -0.78]}
         frames = frames_for(spinning) + frames_for(stable)
 
-        dropped, stats = drop_spinning_truck_bus(frames)
+        dropped, stats = drop_spinning_vehicle(frames)
 
         self.assertEqual(stats["dropped_track_ids"], [33, 50])
         self.assertEqual(stats["tracks_dropped"], 2)
