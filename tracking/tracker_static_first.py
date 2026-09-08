@@ -2,11 +2,10 @@
 """Static-first, clip-local BEV identity association.
 
 Tracking is deliberately split into two independent passes. Persistent
-positions are discovered from the full clip in world coordinates before any
-ID exists, without consulting semantic class labels. Observations assigned to
-those positions receive one immutable slot identity. Every remaining
-observation is handled by the ordinary motion tracker from
-:mod:`tracker_conservative`.
+Vehicle/Car/Truck positions are discovered from the full clip in world
+coordinates before any ID exists. Observations assigned to those positions
+receive one immutable slot identity. Every remaining observation is handled
+by the ordinary motion tracker from :mod:`tracker_conservative`.
 
 The identity stage only adds ``track_id``. It never changes a raw box, class,
 score, or frame count, and never creates a box for a missed detection.
@@ -114,6 +113,8 @@ class StaticFirstTracker:
         duplicate_slot_iou_gate: float = 0.35,
         duplicate_slot_max_weak_fraction: float = 0.5,
         topology_gap_max_frames: int = 3,
+        stop_frames: int = 10,
+        stop_step_gate: float = 0.30,
     ):
         self.coords = coords
         self.slot_evidence_radius = float(slot_evidence_radius)
@@ -140,6 +141,8 @@ class StaticFirstTracker:
         self.duplicate_slot_max_weak_fraction = float(
             duplicate_slot_max_weak_fraction)
         self.topology_gap_max_frames = int(topology_gap_max_frames)
+        self.stop_frames = int(stop_frames)
+        self.stop_step_gate = float(stop_step_gate)
         self.slots: List[StaticSlot] = []
         self.motion_tracker: Optional[tracking.ConservativeTracker] = None
         self.diagnostics: Dict[str, Any] = {
@@ -175,10 +178,9 @@ class StaticFirstTracker:
                 ))
         self.diagnostics["frames"] = len(frames)
         self.diagnostics["detections"] = sum(len(x) for x in by_frame)
-        # Static evidence is geometry-driven.  Do not use semantic labels to
-        # decide which detections may contribute to an identity or slot.
         self.diagnostics["static_observations"] = sum(
-            len(items) for items in by_frame)
+            1 for items in by_frame for o in items
+            if o.detection.get("class_name") in STATIC_CLASSES)
         return by_frame
 
     @staticmethod
@@ -298,7 +300,10 @@ class StaticFirstTracker:
 
     def _discover_candidates(self, frames: Sequence[Dict[str, Any]],
                              by_frame: Sequence[Sequence[tracking.Observation]]) -> List[SlotCandidate]:
-        observations = [o for items in by_frame for o in items]
+        observations = [
+            o for items in by_frame for o in items
+            if o.detection.get("class_name") in STATIC_CLASSES
+        ]
         if not observations:
             return []
         xy = np.asarray([o.world[:2] for o in observations], dtype=np.float64)
@@ -309,6 +314,10 @@ class StaticFirstTracker:
             by_seen_frame: Dict[int, int] = {}
             for member_index in neighbor_ids:
                 obs = observations[member_index]
+                if not tracking.class_compatible(
+                        obs.detection.get("class_name", ""),
+                        seed.detection.get("class_name", "")):
+                    continue
                 if not size_compatible(obs.size, seed.size):
                     continue
                 if tracking.angle_distance(obs.yaw, seed.yaw, modulo_pi=True) > self.slot_yaw_gate:
@@ -326,6 +335,10 @@ class StaticFirstTracker:
             by_seen_frame = {}
             for member_index in refined_ids:
                 obs = observations[member_index]
+                if not tracking.class_compatible(
+                        obs.detection.get("class_name", ""),
+                        seed.detection.get("class_name", "")):
+                    continue
                 if not size_compatible(obs.size, seed.size):
                     continue
                 if tracking.angle_distance(obs.yaw, seed.yaw, modulo_pi=True) > self.slot_yaw_gate:
@@ -484,6 +497,9 @@ class StaticFirstTracker:
         return slots
 
     def _slot_cost(self, obs: tracking.Observation, slot: StaticSlot) -> float:
+        class_name = obs.detection.get("class_name", "")
+        if class_name not in STATIC_CLASSES or not tracking.class_compatible(class_name, slot.class_name):
+            return 1e9
         distance = float(np.linalg.norm(obs.world[:2] - slot.center))
         if distance > self.slot_match_radius:
             return 1e9
@@ -505,7 +521,8 @@ class StaticFirstTracker:
         assigned_detection_ids: set[int] = set()
         for frame_index, observations in enumerate(by_frame):
             eligible = [o for o in observations
-                        if o.detection.get("track_id") is None]
+                        if (o.detection.get("class_name") in STATIC_CLASSES
+                            and o.detection.get("track_id") is None)]
             if not eligible or not self.slots:
                 continue
             costs = np.full((len(eligible), len(self.slots)), 1e9, dtype=np.float64)
@@ -593,6 +610,8 @@ class StaticFirstTracker:
                 cross = abs(float(np.dot(delta, cross_axis)))
                 if (along > self.duplicate_slot_along_gate
                         or cross > self.duplicate_slot_cross_gate):
+                    continue
+                if not tracking.class_compatible(left.class_name, right.class_name):
                     continue
                 if (tracking.angle_distance(left.yaw, right.yaw, modulo_pi=True)
                         > self.slot_yaw_gate):
@@ -752,6 +771,10 @@ class StaticFirstTracker:
                 gap = (start.timestamp - end.timestamp) / 1e9
                 if gap <= 0.0 or gap > 1.2 or self._near_parking_region(start.world):
                     continue
+                if not tracking.class_compatible(
+                        end.detection.get("class_name", ""),
+                        start.detection.get("class_name", "")):
+                    continue
                 size_delta = float(np.linalg.norm(end.size - start.size)) / max(
                     float(np.linalg.norm(end.size)), 1.0)
                 if size_delta > 0.45:
@@ -823,7 +846,10 @@ class StaticFirstTracker:
         """Anisotropic row gate: strict between spaces, tolerant across them."""
         if slot.row_axis is None:
             return None
-        if not size_compatible(obs.size, slot.size, max_delta=0.8):
+        class_name = obs.detection.get("class_name", "")
+        if (class_name not in STATIC_CLASSES
+                or not tracking.class_compatible(class_name, slot.class_name)
+                or not size_compatible(obs.size, slot.size, max_delta=0.8)):
             return None
         yaw_delta = tracking.angle_distance(obs.yaw, slot.yaw, modulo_pi=True)
         if yaw_delta > 0.70:
@@ -928,7 +954,7 @@ class StaticFirstTracker:
                 if tid in static_ids:
                     claimed.add(tid)
                     continue
-                if not tracking.finite_box(det):
+                if det.get("class_name") not in STATIC_CLASSES or not tracking.finite_box(det):
                     continue
                 box = det["box_lidar"]
                 dynamic_obs.append(tracking.Observation(
@@ -1101,6 +1127,42 @@ class StaticFirstTracker:
                 "max_gap_frames": self.topology_gap_max_frames}
 
     @staticmethod
+    def _explicit_stop(items: Sequence[tracking.Observation],
+                       stop_frames: int = 10,
+                       step_gate: float = 0.30,
+                       ) -> Tuple[bool, Optional[np.ndarray],
+                                  Optional[int], Optional[int]]:
+        """True if the track dwells (>= stop_frames near-zero-motion frames).
+
+        Returns ``(stopped, dwell_center_xy, dwell_start_ts, dwell_end_ts)``.
+        """
+        ordered = sorted(items, key=lambda value: value.timestamp)
+        if len(ordered) < 2:
+            return False, None, None, None
+        centers = np.asarray([value.world[:2] for value in ordered],
+                             dtype=np.float64)
+        steps = np.linalg.norm(np.diff(centers, axis=0), axis=1)
+        best_duration, best_start, best_end = 0.0, None, None
+        run_start = None
+        for index, step in enumerate(steps):
+            interval = max((ordered[index + 1].timestamp - ordered[index].timestamp) / 1e9, 0.0)
+            if float(step) < float(step_gate):
+                if run_start is None:
+                    run_start = index
+                duration = (ordered[index + 1].timestamp - ordered[run_start].timestamp) / 1e9
+                if duration > best_duration:
+                    best_duration, best_start, best_end = duration, run_start, index
+            else:
+                run_start = None
+        required_duration = max(float(stop_frames) * 0.2, 1.0)
+        if best_duration < required_duration or best_start is None or best_end is None:
+            return False, None, None, None
+        dwell = centers[best_start:best_end + 2]
+        start_ts = int(ordered[best_start].timestamp)
+        end_ts = int(ordered[best_end + 1].timestamp)
+        return True, dwell.mean(axis=0), start_ts, end_ts
+
+    @staticmethod
     def _radial_departure(items: Sequence[tracking.Observation], center: np.ndarray) -> Tuple[bool, Optional[int]]:
         if len(items) < 4:
             return False, None
@@ -1154,6 +1216,133 @@ class StaticFirstTracker:
         grouped = self._all_tracks(frames)
         static_ids = {int(slot.track_id) for slot in self.slots}
         dynamic = {tid: items for tid, items in grouped.items() if tid not in static_ids}
+        # Model A: a dynamic trajectory that emerges with an explicit stop
+        # (dwell >= stop_frames near-zero-motion frames) at a slot is bound to
+        # that slot's immutable id.  This makes its approach and parked frames
+        # share one id, so dynamic->static no longer breaks the id.  A slot is
+        # claimed once (no two vehicles share a slot).
+        stop_bound_slots: set[int] = set()
+        stop_binds = []
+        for tid, items in sorted(dynamic.items()):
+            stopped, dwell_center, dwell_start, dwell_end = self._explicit_stop(
+                items, self.stop_frames, self.stop_step_gate)
+            if not stopped or dwell_center is None:
+                continue
+            best = None
+            for slot in self.slots:
+                if int(slot.track_id) in stop_bound_slots:
+                    continue
+                ref = copy.deepcopy(items[-1])
+                ref.world = np.r_[dwell_center, items[-1].world[2]]
+                cost = self._slot_cost(ref, slot)
+                if cost < 1e8 and (best is None or cost < best[0]):
+                    best = (cost, slot)
+            if best is None:
+                continue
+            _, slot = best
+            # Occupancy guard: a slot is only bound if it is not concurrently
+            # held by another vehicle while this track is moving.  Its own
+            # parked frames (within the dwell window) are excluded.
+            moving_intervals = [
+                (int(items[0].timestamp), int(dwell_start)),
+                (int(dwell_end), int(items[-1].timestamp)),
+            ]
+            conflict = any(
+                start <= obs.timestamp <= end
+                for obs in slot.matched
+                for start, end in moving_intervals)
+            if conflict:
+                continue
+            stop_bound_slots.add(int(slot.track_id))
+            slot_track_id = int(slot.track_id)
+            for frame in frames:
+                for det in frame.get("detections", []):
+                    if det.get("track_id") == tid:
+                        det["track_id"] = slot_track_id
+            stop_binds.append({
+                "dynamic_track_id": tid,
+                "bound_slot_id": slot.slot_id,
+                "bound_track_id": slot_track_id,
+                "observations": len(items),
+            })
+        if stop_binds:
+            bound_tids = {item["dynamic_track_id"] for item in stop_binds}
+            dynamic = {tid: track_items
+                       for tid, track_items in dynamic.items()
+                       if tid not in bound_tids}
+        # Arrival bind (Model A): a dynamic trajectory whose end is spatially at
+        # a slot and is immediately followed by the slot's parked frames is that
+        # same vehicle parking, so bind it to the slot's immutable id.  This
+        # covers dynamic->static->dynamic where the moving segment ends before
+        # the parked dwell (which is a separate static slot fragment).
+        arrival_bound_slots: set[int] = set()
+        arrival_binds = []
+        for tid, items in sorted(dynamic.items()):
+            end = items[-1]
+            # Parking is the reverse of departure: require a sustained inward
+            # approach so a passing track cannot claim a parked slot.
+            if not any(self._radial_ingress(items, slot.center)
+                       for slot in self.slots):
+                continue
+            # Mirror the departure bridge: a moving track that ends just before
+            # a slot's parked frames and bridges to them (distance / size / yaw
+            # / gap) is the same vehicle parking, so bind it to the slot id.
+            best = None
+            for slot in self.slots:
+                if int(slot.track_id) in arrival_bound_slots:
+                    continue
+                slot_items = grouped.get(int(slot.track_id), [])
+                later = [o for o in slot_items
+                         if o.timestamp > end.timestamp]
+                if not later:
+                    continue
+                gap = (later[0].timestamp - end.timestamp) / 1e9
+                if gap > 1.5:
+                    continue
+                if not self._radial_ingress(items, slot.center):
+                    continue
+                bridge_distance = float(np.linalg.norm(
+                    end.world[:2] - later[0].world[:2]))
+                # The final dynamic frame is often lost during deceleration;
+                # allow a wider spatial bridge to the first stable parked box.
+                bridge_gate = 1.0 + 5.0 * gap
+                size_delta = float(np.linalg.norm(
+                    end.size - later[0].size)) / max(
+                        float(np.linalg.norm(end.size)), 1.0)
+                yaw_delta = tracking.angle_distance(
+                    end.yaw, later[0].yaw, modulo_pi=True)
+                if (bridge_distance > bridge_gate
+                        or size_delta > 0.35 or yaw_delta > 0.65):
+                    continue
+                conflict = any(
+                    items[0].timestamp < o.timestamp < end.timestamp
+                    for o in slot_items)
+                if conflict:
+                    continue
+                if best is None or bridge_distance < best[0]:
+                    best = (bridge_distance, slot)
+            if best is None:
+                continue
+            _, slot = best
+            slot_items = grouped.get(int(slot.track_id), [])
+            arrival_bound_slots.add(int(slot.track_id))
+            slot_track_id = int(slot.track_id)
+            for frame in frames:
+                for det in frame.get("detections", []):
+                    if det.get("track_id") == tid:
+                        det["track_id"] = slot_track_id
+            arrival_binds.append({
+                "dynamic_track_id": tid,
+                "bound_slot_id": slot.slot_id,
+                "bound_track_id": slot_track_id,
+                "observations": len(items),
+                "bridge_distance": round(float(best[0]), 3),
+            })
+        if arrival_binds:
+            arrival_tids = {item["dynamic_track_id"] for item in arrival_binds}
+            dynamic = {tid: track_items
+                       for tid, track_items in dynamic.items()
+                       if tid not in arrival_tids}
         departures = []
         ingresses = []
         rejected_departures = []
@@ -1303,8 +1492,12 @@ class StaticFirstTracker:
                     departure["later_occupancy_track_id"] = replacement_id
         return next_id, {"departures": departures, "ingresses": ingresses,
                          "rejected_departures": rejected_departures,
+                         "stop_binds": stop_binds,
+                         "arrival_binds": arrival_binds,
                          "departure_count": len(departures),
                          "ingress_count": len(ingresses),
+                         "stop_bind_count": len(stop_binds),
+                         "arrival_bind_count": len(arrival_binds),
                          "rejected_departure_count": len(rejected_departures)}
 
     def process(self, frames: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
@@ -1358,7 +1551,6 @@ class StaticFirstTracker:
         self.diagnostics["slot_details"] = [{
             "slot_id": s.slot_id,
             "track_id": s.track_id,
-            "class_name": s.class_name,
             "center": [round(float(x), 4) for x in s.center],
             "yaw": round(float(s.yaw), 5),
             "size": [round(float(x), 4) for x in s.size],

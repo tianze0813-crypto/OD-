@@ -35,37 +35,16 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 
-STATIC_CLASSES = {"Vehicle", "Car", "Truck", "Bus"}
-VEHICLE_CLASSES = STATIC_CLASSES | {"Other Vehicle"}
-TARGET_CLASSES = (
-    "Car", "Truck", "Bus", "Pedestrian", "Nonmotorized_vehicle"
-)
+STATIC_CLASSES = {"Vehicle", "Car", "Truck"}
+VEHICLE_CLASSES = STATIC_CLASSES | {"Bus", "Other Vehicle"}
 CLASS_MAP = {
     "car": "Car", "truck": "Truck", "bus": "Bus",
-    "construction_vehicle": "Truck", "Construction_vehicle": "Truck",
-    "trailer": "Truck", "Trailer": "Truck",
+    "construction_vehicle": "Engineering_vehicle",
     "pedestrian": "Pedestrian", "bicycle": "Nonmotorized_vehicle",
-    "motorcycle": "Nonmotorized_vehicle", "cyclist": "Nonmotorized_vehicle",
-    "Cyclist": "Nonmotorized_vehicle",
-    "nonmotorized_vehicle": "Nonmotorized_vehicle",
-    "nonmotorized vehicle": "Nonmotorized_vehicle",
+    "motorcycle": "Nonmotorized_vehicle", "Cyclist": "Nonmotorized_vehicle",
     "Car": "Car", "Truck": "Truck", "Vehicle": "Car",
-    "Bus": "Bus", "Pedestrian": "Pedestrian",
-    "Cyclist": "Nonmotorized_vehicle",
-    "Nonmotorized_vehicle": "Nonmotorized_vehicle",
+    "Pedestrian": "Pedestrian", "Cyclist": "Nonmotorized_vehicle",
 }
-
-
-def canonical_class_name(value: Any) -> str | None:
-    """Map model aliases to the five classes emitted by SUST labels."""
-    text = str(value).strip()
-    if not text:
-        return None
-    direct = CLASS_MAP.get(text)
-    if direct in TARGET_CLASSES:
-        return direct
-    folded = CLASS_MAP.get(text.casefold())
-    return folded if folded in TARGET_CLASSES else None
 
 
 def wrap_angle(a: float) -> float:
@@ -415,6 +394,47 @@ class ConservativeTracker:
     def _cost(self, tr: Track, obs: Observation, predicted: np.ndarray,
               covariance: np.ndarray, dt: float,
               static_mode: bool = False) -> Tuple[float, str]:
+        # Once a track has a clear recent direction, reject a single
+        # significant step directly backwards.  This prevents a detector
+        # jitter or ID swap from contaminating the track with one reverse
+        # frame; stationary jitter remains below the displacement gates.
+        if not static_mode and len(tr.observations) >= 3:
+            prior = tr.observations[-3].world[:2]
+            previous = tr.observations[-2].world[:2]
+            current = tr.observations[-1].world[:2]
+            prior_direction = previous - prior
+            direction = current - previous
+            candidate_step = obs.world[:2] - current
+            prior_norm = float(np.linalg.norm(prior_direction))
+            direction_norm = float(np.linalg.norm(direction))
+            step_norm = float(np.linalg.norm(candidate_step))
+            coherent = (prior_norm >= 0.35 and direction_norm >= 0.35
+                        and float(np.dot(prior_direction, direction))
+                        >= 0.25 * prior_norm * direction_norm)
+            if coherent and step_norm >= 0.30:
+                backward = float(np.dot(candidate_step, direction))
+                if backward < -0.25 * direction_norm * step_norm:
+                    return 1e9, "reverse_step_gate"
+        if not static_mode and len(tr.observations) >= 3:
+            # Compare speeds in metres/second using each observation's real
+            # timestamp. This remains valid across missed detections.
+            recent = tr.observations[-3:]
+            speeds = []
+            for left, right in zip(recent, recent[1:]):
+                interval = (right.timestamp - left.timestamp) / 1e9
+                if interval > 1e-3:
+                    speeds.append(float(np.linalg.norm(
+                        right.world[:2] - left.world[:2])) / interval)
+            candidate_dt = (obs.timestamp - tr.last_ts) / 1e9
+            candidate_speed = (float(np.linalg.norm(
+                obs.world[:2] - tr.last_world[:2])) / candidate_dt
+                              if candidate_dt > 1e-3 else 0.0)
+            if speeds and candidate_dt > 1e-3:
+                prior_speed = speeds[-1]
+                # A gradual slowdown is allowed; an isolated jump is not.
+                allowed_delta = max(5.0, 1.25 * prior_speed)
+                if abs(candidate_speed - prior_speed) > allowed_delta:
+                    return 1e9, "speed_continuity_gate"
         dxy = float(np.linalg.norm((obs.world - predicted)[:2]))
         if static_mode:
             if tr.slot_anchor is None:
@@ -441,9 +461,8 @@ class ConservativeTracker:
                        self.dynamic_base_gate + self.dynamic_max_velocity * max(dt - 0.1, 0.0))
             if dxy > gate:
                 return 1e9, "distance_gate"
-        # Identity association is deliberately class-blind.  The detector can
-        # flicker between the five semantic labels, while position, motion,
-        # size and IoU provide the stable evidence needed for annotation IDs.
+        if not class_compatible(obs.detection.get("class_name", ""), tr.class_name):
+            return 1e9, "class_gate"
         scale_delta = float(np.linalg.norm(obs.size - tr.size) / max(float(np.linalg.norm(tr.size)), 1.0))
         if scale_delta > 1.35 and dxy > 0.75:
             return 1e9, "size_gate"
@@ -510,7 +529,7 @@ class ConservativeTracker:
         return matches, used_obs
 
     def _maybe_lock_static(self, tr: Track) -> None:
-        if tr.is_static or len(tr.observations) < self.min_static_hits:
+        if tr.is_static or tr.class_name not in STATIC_CLASSES or len(tr.observations) < self.min_static_hits:
             return
         times = [o.timestamp for o in tr.observations]
         duration = (max(times) - min(times)) / 1e9
@@ -624,6 +643,8 @@ class ConservativeTracker:
                 start_obs = start.observations[0]
                 gap = (start_obs.timestamp - end_obs.timestamp) / 1e9
                 if gap <= 0.0 or gap > max_gap_sec:
+                    continue
+                if not class_compatible(end.class_name, start.class_name):
                     continue
                 vs = self._endpoint_velocity(start.observations, at_end=False)
                 pred_fwd = end_obs.world[:2] + ve * gap
