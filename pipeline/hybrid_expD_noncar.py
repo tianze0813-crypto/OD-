@@ -7,6 +7,7 @@ import argparse
 import copy
 import json
 import sys
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -80,6 +81,89 @@ def _hard_config(*, sparsity_max_points: int,
     )
 
 
+def drop_spinning_truck_bus(
+        frames: List[Dict[str, Any]], *,
+        yaw_gate: float = 1.10,
+        step_gate: float = 0.80,
+        min_flips: int = 1,
+        min_frames: int = 4,
+        classes: tuple[str, ...] = ("Truck", "Bus"),
+) -> tuple[set[int], Dict[str, Any]]:
+    """Drop Truck/Bus tracks whose refined yaw spins erratically.
+
+    After the shared yaw pass a false track often keeps jumping between
+    headings each frame (a large pi-periodic yaw spread plus sudden
+    ``step_gate`` heading flips).  It runs on the FINAL yaw and does not
+    require the centre to stay put, so a moving but spinning track is removed
+    as a whole.
+    """
+    by_id: Dict[int, List[tuple[int, float]]] = defaultdict(list)
+    for frame in frames:
+        for det in frame.get("detections", []):
+            canonical = tracking.canonical_class_name(det.get("class_name", ""))
+            if (canonical not in classes or det.get("track_id") is None
+                    or not tracking.finite_box(det)):
+                continue
+            by_id[int(det["track_id"])].append(
+                (int(frame["frame_id"]), float(det["box_lidar"][6])))
+
+    dropped: set[int] = set()
+    details: List[Dict[str, Any]] = []
+    for track_id, items in by_id.items():
+        items = sorted(items, key=lambda value: value[0])
+        yaws = [yaw for _, yaw in items]
+        if len(yaws) < int(min_frames):
+            continue
+        yaw_span = 0.0
+        for left in range(len(yaws)):
+            for right in range(left + 1, len(yaws)):
+                yaw_span = max(
+                    yaw_span, tracking.angle_distance(
+                        yaws[left], yaws[right], modulo_pi=True))
+        if yaw_span < float(yaw_gate):
+            continue
+        deltas = [
+            tracking.angle_distance(yaws[index], yaws[index - 1],
+                                    modulo_pi=True)
+            for index in range(1, len(yaws))
+        ]
+        flips = int(sum(1 for delta in deltas if delta >= float(step_gate)))
+        if flips < int(min_flips):
+            continue
+        dropped.add(track_id)
+        details.append({
+            "track_id": track_id,
+            "observations": len(yaws),
+            "yaw_span": round(float(yaw_span), 4),
+            "big_yaw_steps": flips,
+        })
+
+    removed = 0
+    for frame in frames:
+        old = frame.get("detections", [])
+        frame["detections"] = [
+            det for det in old
+            if not (det.get("track_id") is not None
+                    and int(det["track_id"]) in dropped)
+        ]
+        removed += len(old) - len(frame["detections"])
+        frame["num_detections"] = len(frame["detections"])
+    return dropped, {
+        "pipeline": "hybrid_drop_spinning_truck_bus",
+        "dropped_track_ids": sorted(dropped),
+        "tracks_dropped": len(dropped),
+        "boxes_removed": removed,
+        "details": details,
+        "config": {
+            "yaw_gate": yaw_gate,
+            "step_gate": step_gate,
+            "min_flips": min_flips,
+            "min_frames": min_frames,
+            "classes": list(classes),
+        },
+    }
+
+
 def run(raw_json: Path, clip: Path, out_json: Path,
         diagnostics_path: Path | None = None,
         *, sparsity_max_points: int = 10,
@@ -151,6 +235,8 @@ def run(raw_json: Path, clip: Path, out_json: Path,
     )
 
     processed = json.loads(step3_json.read_text(encoding="utf-8"))
+    _spin_dropped, spin_stats = drop_spinning_truck_bus(processed)
+    diagnostics["spinning_truck_bus"] = spin_stats
     output, final_diag = apply_five_class_output(
         processed, tracking.CoordinateProvider(Path(clip)))
     leaked = [

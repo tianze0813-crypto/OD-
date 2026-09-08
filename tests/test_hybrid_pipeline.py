@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from pipeline.hybrid_expD_noncar import _noncar_filter
+from pipeline.hybrid_expD_noncar import _noncar_filter, drop_spinning_truck_bus
 from pipeline.hybrid_merge import merge_frames, merge_label_frames
 
 
@@ -78,6 +78,38 @@ class HybridPipelineTest(unittest.TestCase):
         self.assertEqual([label["obj_id"] for label in output[0]["labels"]],
                          ["1", "2"])
         self.assertEqual(stats["merged_detections"], 2)
+
+    def test_drop_spinning_truck_bus_removes_erratic_tracks_only(self):
+        def frames_for(entries):
+            frames = []
+            for track_id, yaws in entries.items():
+                for index, yaw in enumerate(yaws):
+                    frames.append({
+                        "frame_id": str(index),
+                        "detections": [{
+                            "track_id": track_id, "class_name": "Bus",
+                            "score": 0.8,
+                            "box_lidar": [0, 0, 1, 10, 2, 3, yaw],
+                        }],
+                        "num_detections": 1,
+                    })
+            return frames
+
+        spinning = {50: [1.33, -2.87, 2.2, 2.98, 2.65, 1.2, 2.68, 2.63, 0.4],
+                    33: [-0.52, -0.3, -0.54, -0.62, -1.58, -0.47]}
+        stable = {24: [-0.62, -0.57, -0.55, -0.63, -0.6, -0.61, -0.62],
+                  43: [-0.65, -0.64, -0.78, -0.69, -0.78, -0.63, -0.78]}
+        frames = frames_for(spinning) + frames_for(stable)
+
+        dropped, stats = drop_spinning_truck_bus(frames)
+
+        self.assertEqual(stats["dropped_track_ids"], [33, 50])
+        self.assertEqual(stats["tracks_dropped"], 2)
+        survivors = {
+            det["track_id"]
+            for frame in frames for det in frame.get("detections", [])
+        }
+        self.assertEqual(survivors, set(stable))
 
     def test_hybrid_defaults_do_not_reference_moga_paths(self):
         # Defaults must be derived from this checkout root (ROOT), not from a
