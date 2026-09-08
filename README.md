@@ -88,7 +88,11 @@ done
   bash run.sh <clip> /tmp/foo --no-export-sust --overwrite
   ```
 
-- `hybrid_run.sh` 始终导出；不需要落盘时把 `<sust_root>` 指向任意临时目录即可。
+- **不导出**：`hybrid_run.sh` 加 `--no-export-sust`，只跑链路、不落盘：
+
+  ```bash
+  bash hybrid_run.sh <clip> /tmp/foo --no-export-sust --overwrite
+  ```
 - 输出已存在时需加 `--overwrite`（先删再生成）。
 
 ## 权重

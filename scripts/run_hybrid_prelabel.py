@@ -158,14 +158,18 @@ def _run_raw(python: Path, clip: Path, cfg: Path, ckpt: Path,
 
 
 def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
-             drop_vis_below: float, score_threshold: float | None,
+             export_sust: bool = True, drop_vis_below: float,
+             score_threshold: float | None,
              short_track_max_frames: int) -> Dict[str, Any]:
     base = clip.name
-    destination = output_root / f"{base}_pre"
-    if destination.exists():
-        if not overwrite:
-            raise RuntimeError(f"output exists, pass --overwrite: {destination}")
-        shutil.rmtree(destination)
+    destination: Path | None = None
+    if export_sust:
+        destination = output_root / f"{base}_pre"
+        if destination.exists():
+            if not overwrite:
+                raise RuntimeError(
+                    f"output exists, pass --overwrite: {destination}")
+            shutil.rmtree(destination)
 
     with tempfile.TemporaryDirectory(prefix=f"hybrid_{base}_") as temp:
         work = Path(temp)
@@ -192,16 +196,22 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
         )
         expd_frames = json.loads(expd_json.read_text(encoding="utf-8"))
         merged, merge_diag = merge_label_frames(main_labels, expd_frames)
+        merged_label_count = sum(len(frame["labels"]) for frame in merged)
 
-    shutil.copytree(clip, destination)
-    try:
-        labels = _write_labels(merged, destination)
-    except Exception:
-        shutil.rmtree(destination, ignore_errors=True)
-        raise
+    if export_sust:
+        shutil.copytree(clip, destination)
+        try:
+            labels = _write_labels(merged, destination)
+        except Exception:
+            shutil.rmtree(destination, ignore_errors=True)
+            raise
+    else:
+        # 只跑链路、不落盘到 SUST：临时结果随上面的 TemporaryDirectory 清理。
+        labels = merged_label_count
+        destination = None
     return {
         "input_clip": str(clip),
-        "final_clip": str(destination),
+        "final_clip": str(destination) if destination is not None else None,
         "labels": labels,
         "main": {
             "final_detections": main_result["final_detections"],
@@ -226,6 +236,14 @@ def main() -> int:
     parser.add_argument("--drop-vis-below", type=float, default=0.05)
     parser.add_argument("--score-threshold", type=float)
     parser.add_argument("--short-track-max-frames", type=int, default=4)
+    export_group = parser.add_mutually_exclusive_group()
+    export_group.add_argument("--export-sust", dest="export_sust",
+                              action="store_true",
+                              help="write the merged <clip>_pre into output_root")
+    export_group.add_argument("--no-export-sust", dest="export_sust",
+                              action="store_false",
+                              help="run the chain without writing to SUST")
+    parser.set_defaults(export_sust=True)
     args = parser.parse_args()
     input_root = args.input_root.expanduser().resolve()
     output_root = args.output_root.expanduser().resolve()
@@ -249,13 +267,15 @@ def main() -> int:
             "automatic installation is not enabled by hybrid runner; "
             "prepare the OpenPCDet environment and pass --python")
 
-    output_root.mkdir(parents=True, exist_ok=True)
+    if args.export_sust:
+        output_root.mkdir(parents=True, exist_ok=True)
     clips = _collect_clips(input_root)
     summaries = []
     for index, clip in enumerate(clips, 1):
         _print(f"clip [{index}/{len(clips)}]: {clip.name}")
         summaries.append(run_clip(
             python, clip, output_root, overwrite=args.overwrite,
+            export_sust=args.export_sust,
             drop_vis_below=args.drop_vis_below,
             score_threshold=args.score_threshold,
             short_track_max_frames=args.short_track_max_frames,
