@@ -22,7 +22,6 @@ Python 3.10.20，CUDA 12.4，RTX A4000），无需手动安装依赖。
 
 ```bash
 bash hybrid_run.sh <clip> <sust_root> --overwrite
-bash run.sh <clip> <sust_root> --overwrite
 ```
 
 本机示例：
@@ -46,7 +45,6 @@ bash hybrid_run.sh \
 
 ```bash
 bash hybrid_run.sh <clip_parent> <sust_root> --overwrite
-bash run.sh <clip_parent> <sust_root> --overwrite
 ```
 
 本机示例：
@@ -74,35 +72,38 @@ for scene in "$DATA_ROOT"/*/; do
 done
 ```
 
+不想落盘到 SUST（只跑链路、不导出）时，给 `hybrid_run.sh` 加 `--no-export-sust`：
+
+```bash
+for scene in "$DATA_ROOT"/*/; do
+  for clip in "${scene%/}"/step2/scene_*_clip*/; do
+    [ -d "$clip" ] || continue
+    echo "== 处理（不导出）${clip%/} =="
+    bash hybrid_run.sh "$clip" "$SUST" --overwrite --no-export-sust
+  done
+done
+```
+
 只想跑某个场景时，上面的外层 for 可改成 `for scene in "$DATA_ROOT"/*scene名*/; do`；
 想跳过已生成的 `*_pre`，把 `--overwrite` 去掉即可（输出已存在会报错，不想中断就先删除旧 `_pre`）。
 
 ## 导出到 SUST（可选）
 
 第二个参数就是 SUSTechPOINTS 数据根目录，**默认导出**为
-`<sust_root>/<clip>_pre/`。
+`<sust_root>/<clip>_pre/`。**不导出**时给 `hybrid_run.sh` 加 `--no-export-sust`，
+只跑链路、不落盘（`output_root` 不会被创建）：
 
-- **不导出**：`run.sh` 加 `--no-export-sust`，只跑链路、不落盘：
+```bash
+bash hybrid_run.sh <clip> /tmp/foo --no-export-sust --overwrite
+```
 
-  ```bash
-  bash run.sh <clip> /tmp/foo --no-export-sust --overwrite
-  ```
-
-- **不导出**：`hybrid_run.sh` 加 `--no-export-sust`，只跑链路、不落盘：
-
-  ```bash
-  bash hybrid_run.sh <clip> /tmp/foo --no-export-sust --overwrite
-  ```
 - 输出已存在时需加 `--overwrite`（先删再生成）。
 
 ## 权重
 
-默认权重为 `models/expD_e8.pth`，`run.sh` 可用 `--weight` 切换别名，`waymo` 只能配
-`--mode inference`。查看可用别名：
-
-```bash
-bash run.sh --list-weights
-```
+默认权重为 `models/expD_e8.pth`（非 Car 四类），Car 由 `main_chain/` 的 Waymo 权重
+（`main_chain/models/vn_waymo_v2_4gpu_full_epoch10.pth`）生成。二者都在仓库 `models/`
+与 `main_chain/models/` 下，无需手动切换。
 
 若 `models/*.pth` 只有 133 字节，说明是 Git LFS 指针，先 `git lfs pull`，或用真实
 权重覆盖后再跑。
@@ -110,7 +111,6 @@ bash run.sh --list-weights
 ## 目录
 
 ```text
-run.sh              五类别一键入口（单模型，可开关 SUST 导出）
 hybrid_run.sh       本分支混合入口（main-Car + expD-非Car）
 main_chain/         main 分支快照（Waymo Car 链路）
 pipeline/           当前 Step1/Step2/Step2.5/Step3 主链路
