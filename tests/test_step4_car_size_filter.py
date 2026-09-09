@@ -1,9 +1,13 @@
+import json
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from filtering.car_size_filter import (
     LargeCarFilterConfig,
     apply_large_car_to_truck,
 )
+from pipeline.step4_car_size_filter import run as run_step4
 
 
 def frame(frame_id, detections):
@@ -62,6 +66,37 @@ class LargeCarFilterTest(unittest.TestCase):
             d["class_name"] == "Truck"
             for f in output for d in f["detections"]))
         self.assertEqual(stats["large_car_detections_relabelled"], 3)
+
+    def test_step4_relabels_then_removes_non_car(self):
+        source = [
+            frame(0, [
+                detection("Car", 1, 6.3),
+                detection("Car", 2, 4.6),
+                detection("Truck", 3, 8.0),
+                detection("Pedestrian", 4, 1.0, width=0.8),
+            ]),
+            frame(1, [
+                detection("Car", 1, 6.1),
+                detection("Car", 2, 4.7),
+            ]),
+        ]
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            step3_json = root / "clip_step3.json"
+            out_json = root / "clip_step4.json"
+            diagnostics = root / "clip_step4_diagnostics.json"
+            step3_json.write_text(
+                json.dumps(source, ensure_ascii=False), encoding="utf-8")
+            result = run_step4(step3_json, out_json, diagnostics)
+            output = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertEqual(
+            [[d["class_name"] for d in f["detections"]] for f in output],
+            [["Car"], ["Car"]])
+        self.assertEqual(result["large_car_tracks_relabelled"], 1)
+        self.assertEqual(result["large_car_detections_relabelled"], 2)
+        self.assertEqual(result["after_detections"], 2)
+        self.assertEqual(result["classes_removed"]["Truck"], 3)
+        self.assertEqual(result["classes_removed"]["Pedestrian"], 1)
 
 
 if __name__ == "__main__":

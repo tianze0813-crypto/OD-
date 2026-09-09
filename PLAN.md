@@ -3,7 +3,8 @@
 > 目标仓库：`/home/moga/桌面/OD-main-0909`
 > 基线：`OD--main` 在 2026-09-08 12:55 的快照（已建本地 git，baseline commit）
 > 原则：**纯静态完全冻结；只改纯动态与动静结合；不做摄像头红绿灯识别；运动遮挡导致的 ID 断暂不处理。**
-> 状态：**设计文档，未开始改代码。**
+> 状态：**已实现并通过测试；5 个验收 clip 最终 labels / IDs 与基线一致（静态零漂移）。**
+> 实现说明见本文件第 18 节。
 
 ---
 
@@ -521,3 +522,51 @@ scene_crossroad_my_record_20260827_164838_clip6
 4. **第二遍 box fit 导致混合轨迹尺寸跳变**：分段处理，记录边界差异。
 5. **旧 ID 继承导致同帧重复**：继承后必须逐帧去重，重复时降级发新 ID。
 6. **槽位释放漏检**：宁可不继承（发新 ID），也不跨车复用旧 ID。
+
+---
+
+## 18. 实现状态（2026-09-09）
+
+### 已实现
+
+- `region/` 移植并落地：`dynamic_region.py`、`region_mask.py`、`traffic_light.py`、
+  `direction_phase.py`、`parking_region.py`。
+- `DynamicRegionConfig`：默认 `buffer_radius=0`；静态 slot footprint 默认不挖洞；
+  稳定方向两端各 30m 延伸；硬静态 slot 剔除关闭，保留 50% overlap 假高速保护。
+- `step4_car_size_filter.py`：先 `Car→Truck`，再删除 Truck / 非 Car。
+- `region/retrack.py`：
+  - 动态候选筛选 / 区域 mask / 区域外冻结；
+  - 区域内运动-only 重跟踪（`use_yaw=False`，物理门限保留）；
+  - ID 继承（静态锚 > 高速旧 ID > 新 ID；多合一投票；同帧唯一；合并连续性检查）；
+  - 槽位释放（显式 departure / arrival / stop_bind，或物理连续驶离/驶入）；
+  - 方向级四相位（含冻结轨迹作为相位上下文）；
+  - 相位感知拼接（waiting_red / green start / yielding，动态片段可并入冻结目标）；
+  - 动态段第二遍 box fit，静态段保留 Step3 box；
+  - `static_freeze` 断言：区域外检测逐字段不变，违反直接报错。
+- `step4_5_region_phase_retrack.py` + batch。
+- `run_end_to_end.py`：串入 step4.5，新增 `--keep-intermediate` / `--work-root`。
+- step2 yaw：
+  - `apply_motion_yaw=False`，动态段保留 detector yaw；
+  - `stabilize_static_yaw` 增加逐观测静止判定，纯静态停车行为保持不变；
+  - `ConservativeTracker` 新增 `use_yaw` 开关（默认 True，step4.5 用 False）。
+- README / batch 脚本同步更新。
+
+### 验证
+
+- 单元测试：`98 tests, OK`。
+- 5 个验收 clip（`~/桌面/new/`）全链路：
+  - step1 推理 → step2 → step3 → step4 → step4.5 → step5；
+  - `090400_clip1/2`、`163412_clip1`、`164838_clip5_pre`、`164838_clip6`
+    最终 labels / IDs 与基线一致；
+  - `static_freeze.passed=True`（全部 clip）；
+  - `run_end_to_end.py --keep-intermediate` 单 clip 端到端跑通。
+
+### 已知取舍
+
+- 5 个验收 clip 上最终 labels / IDs 与基线一致，说明这些 clip 的动静切换
+  在 step2 后已基本稳定；step4.5 的能力由单测覆盖（槽位释放、相位拼接、
+  静态冻结）。
+- 动态 detector yaw 有时比基线 motion heading 噪声大；当前按“动态 yaw
+  保留 detector 原始值”的决策执行，若后续发现某类急转弯 detector yaw
+  不可信，可在 step2 增加“确认转弯”平滑，而不是恢复整段 motion heading。
+- 运动遮挡 gap 不主动 stitching，避免两车变一车；需要时再单独评估。

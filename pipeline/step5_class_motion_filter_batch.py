@@ -18,8 +18,12 @@ from pipeline.step5_class_motion_filter import run
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--step45-work-root", type=Path,
+                        default=PROJECT_ROOT / "work" / "step4_5",
+                        help="Step 4.5 output root (preferred)")
     parser.add_argument("--step4-work-root", type=Path,
-                        default=PROJECT_ROOT / "work" / "step4_car_size_filter")
+                        default=PROJECT_ROOT / "work" / "step4_car_size_filter",
+                        help="兼容：直接读取 Step4 JSON（跳过 step4.5）")
     parser.add_argument("--step3-work-root", type=Path, default=None,
                         help="兼容旧流程：直接读取 Step3 JSON")
     parser.add_argument("--clip-root", type=Path,
@@ -39,6 +43,9 @@ def main() -> None:
     if args.step3_work_root is not None:
         input_root = args.step3_work_root
         input_suffix = "_step3.json"
+    elif args.step45_work_root.is_dir():
+        input_root = args.step45_work_root
+        input_suffix = "_step45.json"
     else:
         input_root = args.step4_work_root
         input_suffix = "_step4.json"

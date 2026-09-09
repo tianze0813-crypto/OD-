@@ -344,7 +344,8 @@ class ConservativeTracker:
                  static_speed: float = 0.8, static_reacquire_radius: float = 2.25,
                  departure_radius: float = 2.5, departure_frames: int = 3,
                  dynamic_max_gap: float = 1.8, dynamic_base_gate: float = 1.6,
-                 dynamic_max_velocity: float = 28.0, dynamic_max_gate: float = 9.0):
+                 dynamic_max_velocity: float = 28.0, dynamic_max_gate: float = 9.0,
+                 use_yaw: bool = True):
         self.coords = coords
         self.min_static_hits = int(min_static_hits)
         self.min_static_duration = float(min_static_duration)
@@ -357,6 +358,7 @@ class ConservativeTracker:
         self.dynamic_base_gate = float(dynamic_base_gate)
         self.dynamic_max_velocity = float(dynamic_max_velocity)
         self.dynamic_max_gate = float(dynamic_max_gate)
+        self.use_yaw = bool(use_yaw)
         self.next_id = 1
         self.next_slot = 1
         self.tracks: Dict[int, Track] = {}
@@ -466,7 +468,6 @@ class ConservativeTracker:
         scale_delta = float(np.linalg.norm(obs.size - tr.size) / max(float(np.linalg.norm(tr.size)), 1.0))
         if scale_delta > 1.35 and dxy > 0.75:
             return 1e9, "size_gate"
-        yaw_delta = angle_distance(obs.yaw, tr.last_yaw, modulo_pi=True)
         innovation = obs.world[:2] - predicted[:2]
         innovation_cov = covariance[:2, :2] + np.eye(2) * 0.35 ** 2
         try:
@@ -475,14 +476,23 @@ class ConservativeTracker:
             return 1e9, "covariance_gate"
         if mahalanobis2 > 13.82:  # chi-square(2), 99.9%; hard probabilistic gate
             return 1e9, "mahalanobis_gate"
-        iou = bev_iou(predicted, tr.size, tr.last_yaw, obs.world, obs.size, obs.yaw)
-        if dt <= 0.5 and dxy > 0.8 and iou < 0.01 and mahalanobis2 > 6.0:
-            return 1e9, "iou_gate"
+        if self.use_yaw:
+            yaw_delta = angle_distance(obs.yaw, tr.last_yaw, modulo_pi=True)
+            iou = bev_iou(predicted, tr.size, tr.last_yaw,
+                          obs.world, obs.size, obs.yaw)
+            if dt <= 0.5 and dxy > 0.8 and iou < 0.01 and mahalanobis2 > 6.0:
+                return 1e9, "iou_gate"
+        else:
+            # Step 4.5 dynamic re-tracking is motion-only: identity must not
+            # depend on detector yaw, which can be unstable during turns.
+            yaw_delta = 0.0
+            iou = 0.0
         # A box heading is symmetric modulo pi. Position uncertainty and IoU
         # dominate; size and yaw only resolve close, dense-scene alternatives.
         cost = math.sqrt(max(0.0, mahalanobis2)) / math.sqrt(13.82)
         cost += 0.55 * min(scale_delta, 2.0) + 0.25 * (1.0 - iou)
-        cost += 0.10 * (yaw_delta / math.pi)
+        if self.use_yaw:
+            cost += 0.10 * (yaw_delta / math.pi)
         cost += 0.02 * max(0.0, dt)
         cost -= min(0.04, max(0.0, float(obs.detection.get("score", 0.0))) * 0.02)
         return cost, "static_anchor" if static_mode else "motion"

@@ -25,18 +25,25 @@
 
 如果 `<clip>_pre` 已存在，需要加 `--overwrite`。
 
-中间 JSON 全部写入系统临时目录，跑完自动删除；不再生成 `work/`，也不再复制
-中间 `_step2/_step3` clip。
+中间 JSON 默认写入系统临时目录，跑完自动删除；加 `--keep-intermediate`
+可把它们保留在 `--work-root`（默认 `work/end_to_end`）下，便于逐步归因。
 
-端到端脚本的有效链路如下，Step5 已包含最终 Car-only 过滤：
+端到端脚本的有效链路如下，Step4 已完成 Car-only，Step4.5 只在动态区域内
+重做 only-car 跟踪 / ID 继承 / 方向级相位拼接，Step5 做最终过滤与导出：
 
 ```text
 原始 clip
   -> step1  lidar 推理 + 相机可见度预过滤
-  -> step2  identity / class / hard-filter / yaw
+  -> step2  identity / class / hard-filter / yaw（动态段保留 detector yaw）
   -> step3  Car box XY 拟合 + 地面/车顶 Z 拟合
-  -> step4  将轨迹稳健长度 >= 6m 的 Car 统一标记为 Truck
-  -> step5 最终点数/短链过滤 + Car-only + box 转换到 base_link
+  -> step4  Car→Truck 尺寸闸门，然后只保留 Car
+  -> step4.5 动态区域（swept box + 稳定方向 30m 延伸，无 buffer）
+              -> 区域外静态 ID / box 冻结
+              -> 区域内运动-only 重跟踪
+              -> ID 继承 + 槽位释放检查
+              -> 方向级四相位感知拼接
+              -> 动态段第二遍 box fit
+  -> step5 最终点数/短链过滤 + Car-only 兜底 + box 转换到 base_link
   -> SUST clip
 ```
 
@@ -228,25 +235,26 @@ Step3 会先完成 shrink-only XY 拟合和静态轨迹尺寸平滑，再用最�
 锚点。短边缘段和普通单次跳变保持原值。
 ```
 
-### Step 4：大尺寸 Car 转 Truck
+### Step 4：Car → Truck 尺寸闸门 + Car-only
 
-Step4 不做点云拟合或坐标变换，只对 Step3 输出按轨迹稳健尺寸做一次类别闸门：
+Step4 不做点云拟合或坐标变换，顺序固定：
 
 ```text
 1. 只检查 class_name == Car 的检测
 2. 计算每条 track 的 max(dx, dy) 中位数
 3. 中位数 >= 6.0m：该 track 的 Car 全部改为 Truck
-4. 其他检测和 box 字段保持不变
+4. 删除所有规范类别不是 Car 的检测（Truck / Bus / Pedestrian /
+   Nonmotorized_vehicle 等）
 ```
 
-这样的大尺寸 Car 会在后续 Step5 的 Car-only 阶段被删除。
+只有 Car 进入 Step4.5。
 
 单条：
 
 ```bash
 /home/moga/miniconda3/envs/sustechpoints/bin/python pipeline/step4_car_size_filter.py \
-  --step3-json work/step3_car_box_fit/<clip>_step3.json \
-  --out-json work/step4_car_size_filter/<clip>_step4.json
+  --step3-json work/step3/<clip>_step3.json \
+  --out-json work/step4/<clip>_step4.json
 ```
 
 批量：
@@ -255,15 +263,58 @@ Step4 不做点云拟合或坐标变换，只对 Step3 输出按轨迹稳健尺�
 /home/moga/miniconda3/envs/sustechpoints/bin/python pipeline/step4_car_size_filter_batch.py --overwrite
 ```
 
-### Step 5：最终过滤 + Car-only + box 转换到 base_link
+### Step 4.5：动态区域 / 重跟踪 / ID 继承 / 相位拼接
 
-Step5 固定只保留最终规范类别为 `Car` 的检测。它先执行两项终检，再进行 Car-only
-过滤，最后转换保留 box 的坐标：
+Step4.5 是全链路唯一会修改 Car ID 的阶段，原则是**区域外静态完全冻结**：
+
+```text
+1. 用 Step4 的 car-only 轨迹（高速证据：>=5 m/s、>=15 m、>=3 帧）
+   建动态区域；只用 swept box，无 buffer；
+   沿稳定方向在轨迹两端各延伸 30m（覆盖停止线 / 排队 / 起步段）
+2. 区域外 / 无高速证据的检测保持 Step4 的 ID 和 box 不变
+3. 只在动态区域内对候选检测做运动-only 关联（关联不用 yaw）
+   并保留 reverse / 速度 / 加速度 / 距离物理门限
+4. ID 继承：静态锚 ID > 高速主轨迹旧 ID > 新 ID；
+   多合一按观测数投票；同帧不重复；一个旧 ID 不主动拆成两条
+5. 槽位释放：旧车明确离开 / 物理连续驶离后才允许新车继承 slot ID；
+   没有证据时宁可不继承，也不跨车复用
+6. 用重跟踪后的轨迹建方向级四相位
+   （右转常绿、掉头按左转、同轴直行/左转互斥）
+7. 相位感知拼接：waiting_red / 绿灯起步 / 右转 yielding 的碎片按方向、
+   停止线、空间桥接和物理连续性保守合并
+8. 只对动态 / 重跟踪段再跑一遍 box fit；静态冻结段保留 Step3 结果
+```
+
+单条：
+
+```bash
+/home/moga/miniconda3/envs/sustechpoints/bin/python pipeline/step4_5_region_phase_retrack.py \
+  --step4-json work/step4/<clip>_step4.json \
+  --clip /path/to/<clip> \
+  --step2-diagnostics work/step2/<clip>_step2_diagnostics.json \
+  --out-json work/step4_5/<clip>_step45.json \
+  --diagnostics work/step4_5/<clip>_step45_diagnostics.json
+```
+
+批量：
+
+```bash
+/home/moga/miniconda3/envs/sustechpoints/bin/python pipeline/step4_5_region_phase_retrack_batch.py --overwrite
+```
+
+诊断字段包括 `dynamic_region` / `selection` / `retracking` /
+`id_inheritance` / `phase_stitching` / `box_fit` / `static_freeze`。
+`static_freeze.passed=False` 会直接报错，避免误改静态。
+
+### Step 5：最终过滤 + box 转换到 base_link
+
+Step5 先执行两项终检，再做 Car-only 兜底（Step4 后通常为空），最后转换保留
+box 的坐标：
 
 ```text
 1. box 内点数 <= 5：删除该检测
 2. 轨迹长度 <= 3 帧：删除该轨迹的全部检测
-3. 删除规范类别不是 `Car` 的检测（内部 `Vehicle` 映射为 `Car`，会保留）
+3. 删除规范类别不是 Car 的检测
 4. 对剩余 box 应用 lidar_top -> base_link 的静态外参
 ```
 
@@ -275,10 +326,10 @@ Step5 固定只保留最终规范类别为 `Car` 的检测。它先执行两项�
 
 ```bash
 /home/moga/miniconda3/envs/sustechpoints/bin/python pipeline/step5_class_motion_filter.py \
-  --step4-json work/step4_car_size_filter/<clip>_step4.json \
-  --clip work/step3_car_box_fit/data/<clip>_step3 \
-  --out-json work/step5_class_motion_filter/<clip>_step5.json \
-  --out-clip work/step5_class_motion_filter/data/<clip>_step5
+  --step4-json work/step4_5/<clip>_step45.json \
+  --clip /path/to/<clip> \
+  --out-json work/step5/<clip>_step5.json \
+  --out-clip work/step5/data/<clip>_step5
 ```
 
 可调阈值（默认值为 `5` 和 `3`）：
@@ -339,8 +390,9 @@ classification/  Step2 类别精修
 filtering/       Step1/Step2 可见度与硬过滤，Step4/Step5 最终类别与点数过滤
 tracking/        保守跟踪器 + 静态优先跟踪器
 geometry/        Step2 yaw，Step3 Car box 与地面/车顶拟合
+region/          动态区域、区域 mask、方向级四相位、step4.5 重跟踪/ID 继承
 inference/       Step1 OpenPCDet 推理脚本
-pipeline/        step1、step2、step3、step4、step5 主链路；step6 为兼容入口
+pipeline/        step1、step2、step3、step4、step4.5、step5 主链路；step6 为兼容入口
 archive/         不再参与当前链路的旧版本/旧预览文件
 tests/           当前链路的单元测试
 models/          推理配置与模型权重
