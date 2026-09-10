@@ -35,10 +35,12 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 
-STATIC_CLASSES = {"Vehicle", "Car", "Truck"}
+# Stationary slot identity is vehicle-only.  All other classes
+# (Pedestrian, Nonmotorized_vehicle, ...) use the dynamic pass.
+STATIC_CLASSES = {"Vehicle", "Car", "Truck", "Bus"}
 # Public class vocabulary used by the hybrid pipeline's class refinement.
 TARGET_CLASSES = ("Car", "Truck", "Bus", "Pedestrian", "Nonmotorized_vehicle")
-VEHICLE_CLASSES = STATIC_CLASSES | {"Bus", "Other Vehicle"}
+VEHICLE_CLASSES = STATIC_CLASSES | {"Other Vehicle"}
 CLASS_MAP = {
     "car": "Car", "truck": "Truck", "bus": "Bus",
     "construction_vehicle": "Engineering_vehicle",

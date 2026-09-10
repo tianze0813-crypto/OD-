@@ -2,9 +2,9 @@
 """Static-first, clip-local BEV identity association.
 
 Tracking is deliberately split into two independent passes. Persistent
-Vehicle/Car/Truck positions are discovered from the full clip in world
-coordinates before any ID exists. Observations assigned to those positions
-receive one immutable slot identity. Every remaining observation is handled
+Vehicle/Car/Truck/Bus positions are discovered from the full clip in world
+coordinates before any ID exists.  Observations assigned to those positions
+receive one immutable slot identity.  Every remaining observation is handled
 by the ordinary motion tracker from :mod:`tracker_conservative`.
 
 The identity stage only adds ``track_id``. It never changes a raw box, class,

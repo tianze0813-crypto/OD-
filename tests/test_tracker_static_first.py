@@ -27,6 +27,11 @@ def detection(x, y, score=0.9):
             "box_lidar": [float(x), float(y), 0.0, 4.5, 2.0, 1.6, 0.0]}
 
 
+def bus_detection(x, y, score=0.9):
+    return {"class_name": "Bus", "score": score,
+            "box_lidar": [float(x), float(y), 0.0, 10.5, 2.5, 3.4, 0.0]}
+
+
 def frames(rows):
     return [{"frame_id": str(i * 200000000), "num_points": 0,
              "num_detections": len(items), "detections": items}
@@ -183,18 +188,32 @@ class StaticFirstTrackerTest(unittest.TestCase):
         self.assertIn("slot_remains_occupied", {
             x["reason"] for x in coordination["rejected_departures"]})
 
-    def test_static_pass_is_class_blind(self):
+    def test_static_pass_is_vehicle_only(self):
+        """Static slots are vehicle-only; a pedestrian uses the dynamic pass."""
         rows = [[detection(0.0, 0.0), {
             "class_name": "Pedestrian", "score": 0.9,
             "box_lidar": [4.0, 0.0, 0.0, 0.8, 0.8, 1.7, 0.0],
         }] for _ in range(8)]
         _source, output, diagnostics = self.run_tracker(rows)
-        self.assertEqual(diagnostics["static_slots"], 2)
+        # Only the Vehicle contributes a static slot.  The pedestrian is
+        # still tracked, but by the dynamic pass, so no static slot for it.
+        self.assertEqual(diagnostics["static_slots"], 1)
         vehicle_ids = {f["detections"][0]["track_id"] for f in output}
         pedestrian_ids = {f["detections"][1]["track_id"] for f in output}
         self.assertEqual(len(vehicle_ids), 1)
         self.assertEqual(len(pedestrian_ids), 1)
         self.assertNotEqual(vehicle_ids, pedestrian_ids)
+
+    def test_bus_gets_a_static_slot(self):
+        rows = [[detection(0.0, 0.0), bus_detection(0.0, 10.0)]
+                for _ in range(8)]
+        _source, output, diagnostics = self.run_tracker(rows)
+        self.assertEqual(diagnostics["static_slots"], 2)
+        vehicle_ids = {f["detections"][0]["track_id"] for f in output}
+        bus_ids = {f["detections"][1]["track_id"] for f in output}
+        self.assertEqual(len(vehicle_ids), 1)
+        self.assertEqual(len(bus_ids), 1)
+        self.assertNotEqual(vehicle_ids, bus_ids)
 
     def test_short_filter_still_runs_after_both_passes(self):
         rows = [[detection(0.0, 0.0)] for _ in range(8)]
