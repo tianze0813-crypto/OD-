@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""串行运行 main-Car + expD-non-Car 并合并为一个 SUST 预标注结果。"""
+"""串行运行 main-Car + VOD-non-Car 并合并为一个 SUST 预标注结果。"""
 
 from __future__ import annotations
 
@@ -24,8 +24,11 @@ from pipeline.hybrid_merge import merge_label_frames
 
 
 DEFAULT_OUTPUT_ROOT = Path.home() / "SUSTechPOINTS" / "data"
-EXPD_CFG = ROOT / "models" / "voxelnext_fiveclass_nuscenes_infer.yaml"
-EXPD_CKPT = ROOT / "models" / "expD_e8.pth"
+NONCAR_CFG = ROOT / "models" / "voxelnext_fiveclass_nuscenes_infer.yaml"
+# Final production non-Car weight: VOD 2-class fine-tune, epoch 12
+# (checkpoint stores epoch 6).  The older expD_e8.pth remains available via
+# --noncar-ckpt but is no longer the default.
+NONCAR_CKPT = ROOT / "models" / "vod_2cls_ft_e12.pth"
 REQUIRED_MODULES = ("numpy", "scipy", "cv2", "PIL", "pandas", "av2",
                     "kornia", "yaml", "torch", "spconv", "pcdet")
 
@@ -160,11 +163,21 @@ def _run_raw(python: Path, clip: Path, cfg: Path, ckpt: Path,
 def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
              export_sust: bool = True, drop_vis_below: float,
              score_threshold: float | None,
-             short_track_max_frames: int) -> Dict[str, Any]:
+             short_track_max_frames: int,
+             noncar_cfg: Path = NONCAR_CFG,
+             noncar_ckpt: Path = NONCAR_CKPT,
+             output_tag: str = "",
+             raw_score_threshold: float = 0.3,
+             class_score_thresholds: Dict[str, float] | None = None,
+             pedestrian_max_distance: float = 20.0,
+             nonmotorized_max_distance: float = 60.0,
+             sparsity_max_points: int = 10) -> Dict[str, Any]:
     base = clip.name
+    tag = output_tag.strip("_-")
+    output_name = f"{base}_{tag}_pre" if tag else f"{base}_pre"
     destination: Path | None = None
     if export_sust:
-        destination = output_root / f"{base}_pre"
+        destination = output_root / output_name
         if destination.exists():
             if not overwrite:
                 raise RuntimeError(
@@ -177,15 +190,13 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
         main_labels, main_result = run_main_car(
             python, clip, work / "main", overwrite=True)
 
-        _print(f"{base}: 2/2 expD inference + non-Car chain")
-        # The non-Car route has no reason to carry sub-0.3 model noise into
-        # identity tracking.  An explicit lower override still gets a low
-        # inference threshold and is applied by its category filter below.
-        expd_raw_threshold = (0.1 if score_threshold is not None
-                              and score_threshold < 0.3 else 0.3)
+        _print(f"{base}: 2/2 non-Car inference + chain "
+               f"({noncar_ckpt.name})")
+        _print(f"{base}: non-Car raw threshold={raw_score_threshold:.3f}, "
+               f"class thresholds={class_score_thresholds or 'default'}")
         expd_raw = _run_raw(
-            python, clip, EXPD_CFG, EXPD_CKPT, work / "expd", "expd",
-            expd_raw_threshold)
+            python, clip, noncar_cfg, noncar_ckpt, work / "expd", "expd",
+            raw_score_threshold)
         expd_json = work / "expd_noncar.json"
         expd_diag = work / "expd_noncar_diagnostics.json"
         expd_result = run_expd_noncar(
@@ -193,6 +204,10 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
             visibility_min_ratio=drop_vis_below,
             short_track_max_frames=short_track_max_frames,
             score_threshold=score_threshold,
+            class_score_thresholds=class_score_thresholds,
+            pedestrian_max_distance=pedestrian_max_distance,
+            nonmotorized_max_distance=nonmotorized_max_distance,
+            sparsity_max_points=sparsity_max_points,
         )
         expd_frames = json.loads(expd_json.read_text(encoding="utf-8"))
         merged, merge_diag = merge_label_frames(main_labels, expd_frames)
@@ -217,6 +232,13 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
             "final_detections": main_result["final_detections"],
         },
         "expD": {
+            "checkpoint": str(noncar_ckpt),
+            "config": str(noncar_cfg),
+            "raw_score_threshold": float(raw_score_threshold),
+            "class_score_thresholds": dict(class_score_thresholds or {}),
+            "pedestrian_max_distance": float(pedestrian_max_distance),
+            "nonmotorized_max_distance": float(nonmotorized_max_distance),
+            "sparsity_max_points": int(sparsity_max_points),
             "raw_json": "temporary (cleaned after merge)",
             "final_detections": expd_result["final_detections"],
         },
@@ -236,6 +258,27 @@ def main() -> int:
     parser.add_argument("--drop-vis-below", type=float, default=0.05)
     parser.add_argument("--score-threshold", type=float)
     parser.add_argument("--short-track-max-frames", type=int, default=4)
+    parser.add_argument("--noncar-raw-threshold", type=float,
+                        help="non-Car raw inference score cutoff "
+                             "(default: min of class thresholds)")
+    parser.add_argument("--truck-score-threshold", type=float,
+                        help="default 0.4 when --score-threshold is unset")
+    parser.add_argument("--bus-score-threshold", type=float,
+                        help="default 0.4 when --score-threshold is unset")
+    parser.add_argument("--pedestrian-score-threshold", type=float,
+                        help="default 0.1 when --score-threshold is unset")
+    parser.add_argument("--nonmotorized-score-threshold", type=float,
+                        help="default 0.1 when --score-threshold is unset")
+    parser.add_argument("--pedestrian-max-distance", type=float, default=20.0)
+    parser.add_argument("--nonmotorized-max-distance", type=float, default=60.0)
+    parser.add_argument("--sparsity-max-points", type=int, default=10)
+    parser.add_argument("--noncar-cfg", type=Path, default=NONCAR_CFG,
+                        help="non-Car inference config (default: expD config)")
+    parser.add_argument("--noncar-ckpt", type=Path, default=NONCAR_CKPT,
+                        help="non-Car checkpoint (default: expD_e8.pth)")
+    parser.add_argument("--output-tag", type=str, default="",
+                        help="insert a tag before _pre in the exported clip "
+                             "name, e.g. vod_e12 -> <clip>_vod_e12_pre")
     export_group = parser.add_mutually_exclusive_group()
     export_group.add_argument("--export-sust", dest="export_sust",
                               action="store_true",
@@ -247,11 +290,50 @@ def main() -> int:
     args = parser.parse_args()
     input_root = args.input_root.expanduser().resolve()
     output_root = args.output_root.expanduser().resolve()
+    noncar_cfg = args.noncar_cfg.expanduser().resolve()
+    noncar_ckpt = args.noncar_ckpt.expanduser().resolve()
+    output_tag = args.output_tag.strip("_-")
     if input_root == output_root:
         raise RuntimeError("input_root and output_root must differ")
-    _validate_weight(EXPD_CKPT)
-    if not EXPD_CFG.is_file():
-        raise RuntimeError(f"config not found: {EXPD_CFG}")
+
+    class_names = ("Truck", "Bus", "Pedestrian", "Nonmotorized_vehicle")
+    explicit = {
+        "Truck": args.truck_score_threshold,
+        "Bus": args.bus_score_threshold,
+        "Pedestrian": args.pedestrian_score_threshold,
+        "Nonmotorized_vehicle": args.nonmotorized_score_threshold,
+    }
+    if args.score_threshold is not None:
+        base = {name: float(args.score_threshold) for name in class_names}
+    else:
+        base = {
+            "Truck": 0.4,
+            "Bus": 0.4,
+            "Pedestrian": 0.1,
+            "Nonmotorized_vehicle": 0.1,
+        }
+    class_thresholds: Dict[str, float] = {
+        name: float(explicit[name]) if explicit[name] is not None else base[name]
+        for name in class_names
+    }
+    if args.noncar_raw_threshold is not None:
+        noncar_raw_threshold = float(args.noncar_raw_threshold)
+    elif any(value is not None for value in explicit.values()):
+        noncar_raw_threshold = min(class_thresholds.values())
+    elif args.score_threshold is not None:
+        noncar_raw_threshold = (0.1 if args.score_threshold < 0.3 else 0.3)
+    else:
+        noncar_raw_threshold = 0.3
+    noncar_raw_threshold = min(noncar_raw_threshold,
+                              min(class_thresholds.values()))
+    _print(f"non-Car raw threshold={noncar_raw_threshold:.3f}, "
+           f"class thresholds={class_thresholds}, "
+           f"pedestrian_max_distance={args.pedestrian_max_distance}, "
+           f"nonmotorized_max_distance={args.nonmotorized_max_distance}, "
+           f"sparsity_max_points={args.sparsity_max_points}")
+    _validate_weight(noncar_ckpt)
+    if not noncar_cfg.is_file():
+        raise RuntimeError(f"config not found: {noncar_cfg}")
 
     python = None
     for candidate in _python_candidates(args.python):
@@ -279,6 +361,14 @@ def main() -> int:
             drop_vis_below=args.drop_vis_below,
             score_threshold=args.score_threshold,
             short_track_max_frames=args.short_track_max_frames,
+            noncar_cfg=noncar_cfg,
+            noncar_ckpt=noncar_ckpt,
+            output_tag=output_tag,
+            raw_score_threshold=noncar_raw_threshold,
+            class_score_thresholds=class_thresholds,
+            pedestrian_max_distance=args.pedestrian_max_distance,
+            nonmotorized_max_distance=args.nonmotorized_max_distance,
+            sparsity_max_points=args.sparsity_max_points,
         ))
     print(json.dumps({"clips": summaries}, ensure_ascii=False, indent=2))
     return 0

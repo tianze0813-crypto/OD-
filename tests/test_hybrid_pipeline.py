@@ -117,11 +117,11 @@ class HybridPipelineTest(unittest.TestCase):
         # directory named "moga", so only the launcher source is checked.
         root = Path(hybrid_launcher.__file__).resolve().parents[1]
         self.assertEqual(
-            hybrid_launcher.EXPD_CFG,
+            hybrid_launcher.NONCAR_CFG,
             root / "models" / "voxelnext_fiveclass_nuscenes_infer.yaml")
         self.assertEqual(
-            hybrid_launcher.EXPD_CKPT,
-            root / "models" / "expD_e8.pth")
+            hybrid_launcher.NONCAR_CKPT,
+            root / "models" / "vod_2cls_ft_e12.pth")
         source = Path(hybrid_launcher.__file__).read_text(encoding="utf-8")
         self.assertNotIn("/home/moga", source)
         self.assertNotIn("moga/", source)

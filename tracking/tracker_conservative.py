@@ -46,6 +46,8 @@ CLASS_MAP = {
     "motorcycle": "Nonmotorized_vehicle", "Cyclist": "Nonmotorized_vehicle",
     "Car": "Car", "Truck": "Truck", "Vehicle": "Car",
     "Pedestrian": "Pedestrian", "Cyclist": "Nonmotorized_vehicle",
+    "Nonmotorized_vehicle": "Nonmotorized_vehicle",
+    "nonmotorized_vehicle": "Nonmotorized_vehicle",
 }
 
 

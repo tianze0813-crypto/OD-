@@ -5,7 +5,7 @@
 SUSTechPOINTS 打开的 `<clip>_pre/label/*.json`。
 
 本分支（`hybrid-main-car-expd-noncar`）默认走**混合链路**：先用 `main_chain/` 的
-Waymo 生成并固定 Car，再用 `models/expD_e8.pth` 保留其余四类，最后按 `frame_id`
+Waymo 生成并固定 Car，再用 `models/vod_2cls_ft_e12.pth` 保留其余四类，最后按 `frame_id`
 合并为一个 `<clip>_pre`。
 
 ## 本机环境（已就绪）
@@ -14,7 +14,7 @@ Waymo 生成并固定 Car，再用 `models/expD_e8.pth` 保留其余四类，最
 Python 3.10.20，CUDA 12.4，RTX A4000），无需手动安装依赖。
 
 - 手动指定解释器：`export OPENPCDET_PYTHON=<python>` 或用 `--python <python>`。
-- 环境自检：`python scripts/check_step1_env.py --cfg models/voxelnext_fiveclass_nuscenes_infer.yaml --ckpt models/expD_e8.pth`。
+- 环境自检：`python scripts/check_step1_env.py --cfg models/voxelnext_fiveclass_nuscenes_infer.yaml --ckpt models/vod_2cls_ft_e12.pth`。
 
 ## 单个运行
 
@@ -28,7 +28,7 @@ bash hybrid_run.sh <clip> <sust_root> --overwrite
 
 ```bash
 bash hybrid_run.sh \
-  /home/moga/桌面/test/scene_crossroad_my_record_20260827_163412_clip0 \
+  /home/moga/桌面/test/scene_crossroad_my_record_20260827_164838_clip5/ \
   /home/moga/桌面/SUSTechPOINTS/data/ --overwrite
 ```
 
@@ -99,19 +99,34 @@ bash hybrid_run.sh <clip> /tmp/foo --no-export-sust --overwrite
 
 - 输出已存在时需加 `--overwrite`（先删再生成）。
 
-## 权重
+## 权重（默认 e12）
 
-默认权重为 `models/expD_e8.pth`（非 Car 四类），Car 由 `main_chain/` 的 Waymo 权重
-（`main_chain/models/vn_waymo_v2_4gpu_full_epoch10.pth`）生成。二者都在仓库 `models/`
-与 `main_chain/models/` 下，无需手动切换。
+最终生产权重为 `models/vod_2cls_ft_e12.pth`（VOD 2 类微调，冻结骨干与
+Car/Truck/Bus 头，只训练 Pedestrian / Nonmotorized_vehicle 头）；Car 仍由
+`main_chain/` 的 Waymo 权重 `main_chain/models/vn_waymo_v2_4gpu_full_epoch10.pth`
+生成。默认类别分数阈值为：
 
-若 `models/*.pth` 只有 133 字节，说明是 Git LFS 指针，先 `git lfs pull`，或用真实
-权重覆盖后再跑。
+- `Truck` / `Bus`: `0.4`
+- `Pedestrian` / `Nonmotorized_vehicle`: `0.1`
+
+可用 `--noncar-ckpt models/vod_2cls_ft_e25.pth` 切换到 e25 版本（行人召回更高，
+耗时也更长）。若 `models/*.pth` 只有 133 字节，说明是 Git LFS 指针，先
+`git lfs pull`，或用真实权重覆盖后再跑。
+
+## 实测耗时
+
+RTX A4000 16GB、不与其他大任务并行时，混合链路单个 80 帧 clip：
+
+- `vod_2cls_ft_e12.pth`（默认）：约 4.5–5 分钟/clip
+- `vod_2cls_ft_e25.pth`：约 5.5–6.5 分钟/clip
+
+其中 Waymo-Car 主链约 1.5–2 分钟，非车推理约 1 分钟，其余为 CPU 后处理；
+Ped/NMV 阈值为 0.1 时检测数显著增多，后处理会比默认 expD 慢。
 
 ## 目录
 
 ```text
-hybrid_run.sh       本分支混合入口（main-Car + expD-非Car）
+hybrid_run.sh       本分支混合入口（main-Car + VOD-非Car）
 main_chain/         main 分支快照（Waymo Car 链路）
 pipeline/           当前 Step1/Step2/Step2.5/Step3 主链路
 classification/     Step2.5 类别归一化和 track 投票

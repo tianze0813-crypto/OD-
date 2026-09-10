@@ -69,6 +69,16 @@ WEIGHT_PRESETS = {
         DEFAULT_CFG,
         "full",
     ),
+    "vod_e12": (
+        ROOT / "models" / "vod_2cls_ft_e12.pth",
+        DEFAULT_CFG,
+        "full",
+    ),
+    "vod_e25": (
+        ROOT / "models" / "vod_2cls_ft_e25.pth",
+        DEFAULT_CFG,
+        "full",
+    ),
     "waymo": (
         ROOT / "models" / "vn_waymo_v2_4gpu_full_epoch10.pth",
         ROOT / "models" / "voxelnext_v2_waymo_infer.yaml",

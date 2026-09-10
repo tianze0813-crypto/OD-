@@ -9,7 +9,7 @@ import json
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Mapping
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -62,21 +62,34 @@ def _noncar_filter(frames: List[Dict[str, Any]]) -> Dict[str, int]:
 
 def _hard_config(*, sparsity_max_points: int,
                  visibility_min_ratio: float,
-                 score_threshold: float | None) -> HardFilterConfig:
+                 score_threshold: float | None,
+                 class_score_thresholds: Mapping[str, float] | None = None,
+                 pedestrian_max_distance: float = 20.0,
+                 nonmotorized_max_distance: float = 60.0) -> HardFilterConfig:
     fallback = 0.3 if score_threshold is None else float(score_threshold)
-    thresholds = fallback if score_threshold is not None else None
+    defaults = {
+        "Truck": 0.4,
+        "Bus": 0.4,
+        "Pedestrian": 0.3,
+        "Nonmotorized_vehicle": 0.3,
+    }
+    overrides = {
+        str(name): float(value)
+        for name, value in (class_score_thresholds or {}).items()
+    }
     per_class = tuple(
-        (name, fallback if thresholds is not None else value)
-        for name, value in (
-            ("Truck", 0.4), ("Bus", 0.4),
-            ("Pedestrian", 0.3), ("Nonmotorized_vehicle", 0.3),
-        )
+        (name,
+         overrides.get(name,
+                       fallback if score_threshold is not None else default))
+        for name, default in defaults.items()
     )
     return HardFilterConfig(
         score_threshold=fallback,
         class_score_thresholds=per_class,
         sparsity_max_points=int(sparsity_max_points),
         visibility_min_ratio=float(visibility_min_ratio),
+        pedestrian_max_distance=float(pedestrian_max_distance),
+        nonmotorized_max_distance=float(nonmotorized_max_distance),
         keep_classes=NON_CAR_CLASSES,
     )
 
@@ -169,7 +182,10 @@ def run(raw_json: Path, clip: Path, out_json: Path,
         *, sparsity_max_points: int = 10,
         visibility_min_ratio: float = 0.05,
         short_track_max_frames: int = 4,
-        score_threshold: float | None = None) -> Dict[str, Any]:
+        score_threshold: float | None = None,
+        class_score_thresholds: Mapping[str, float] | None = None,
+        pedestrian_max_distance: float = 20.0,
+        nonmotorized_max_distance: float = 60.0) -> Dict[str, Any]:
     source = json.loads(Path(raw_json).read_text(encoding="utf-8"))
     if not isinstance(source, list):
         raise ValueError(f"input must be a list of frames: {raw_json}")
@@ -195,6 +211,9 @@ def run(raw_json: Path, clip: Path, out_json: Path,
         sparsity_max_points=sparsity_max_points,
         visibility_min_ratio=visibility_min_ratio,
         score_threshold=score_threshold,
+        class_score_thresholds=class_score_thresholds,
+        pedestrian_max_distance=pedestrian_max_distance,
+        nonmotorized_max_distance=nonmotorized_max_distance,
     )
     work_root = Path(out_json).parent
     diagnostics["pre_step2_score_filter"] = apply_category_score_filter(
@@ -279,13 +298,31 @@ def main() -> None:
     parser.add_argument("--visibility-min-ratio", type=float, default=0.05)
     parser.add_argument("--short-track-max-frames", type=int, default=4)
     parser.add_argument("--score-threshold", type=float)
+    parser.add_argument("--truck-score-threshold", type=float)
+    parser.add_argument("--bus-score-threshold", type=float)
+    parser.add_argument("--pedestrian-score-threshold", type=float)
+    parser.add_argument("--nonmotorized-score-threshold", type=float)
+    parser.add_argument("--pedestrian-max-distance", type=float, default=20.0)
+    parser.add_argument("--nonmotorized-max-distance", type=float, default=60.0)
     args = parser.parse_args()
+    class_thresholds = {}
+    for name, value in (
+        ("Truck", args.truck_score_threshold),
+        ("Bus", args.bus_score_threshold),
+        ("Pedestrian", args.pedestrian_score_threshold),
+        ("Nonmotorized_vehicle", args.nonmotorized_score_threshold),
+    ):
+        if value is not None:
+            class_thresholds[name] = float(value)
     result = run(
         args.raw_json, args.clip, args.out_json, args.diagnostics,
         sparsity_max_points=args.sparsity_max_points,
         visibility_min_ratio=args.visibility_min_ratio,
         short_track_max_frames=args.short_track_max_frames,
         score_threshold=args.score_threshold,
+        class_score_thresholds=class_thresholds,
+        pedestrian_max_distance=args.pedestrian_max_distance,
+        nonmotorized_max_distance=args.nonmotorized_max_distance,
     )
     print(json.dumps({
         "pipeline": result["pipeline"],
