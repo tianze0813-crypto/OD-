@@ -171,7 +171,9 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
              class_score_thresholds: Dict[str, float] | None = None,
              pedestrian_max_distance: float = 20.0,
              nonmotorized_max_distance: float = 60.0,
-             sparsity_max_points: int = 10) -> Dict[str, Any]:
+             sparsity_max_points: int = 10,
+             static_nmv_min_frames: int = 8,
+             static_nmv_max_displacement: float = 1.0) -> Dict[str, Any]:
     base = clip.name
     tag = output_tag.strip("_-")
     output_name = f"{base}_{tag}_pre" if tag else f"{base}_pre"
@@ -208,6 +210,8 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
             pedestrian_max_distance=pedestrian_max_distance,
             nonmotorized_max_distance=nonmotorized_max_distance,
             sparsity_max_points=sparsity_max_points,
+            static_nmv_min_frames=static_nmv_min_frames,
+            static_nmv_max_displacement=static_nmv_max_displacement,
         )
         expd_frames = json.loads(expd_json.read_text(encoding="utf-8"))
         merged, merge_diag = merge_label_frames(main_labels, expd_frames)
@@ -239,6 +243,8 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
             "pedestrian_max_distance": float(pedestrian_max_distance),
             "nonmotorized_max_distance": float(nonmotorized_max_distance),
             "sparsity_max_points": int(sparsity_max_points),
+            "static_nmv_min_frames": int(static_nmv_min_frames),
+            "static_nmv_max_displacement": float(static_nmv_max_displacement),
             "raw_json": "temporary (cleaned after merge)",
             "final_detections": expd_result["final_detections"],
         },
@@ -272,6 +278,13 @@ def main() -> int:
     parser.add_argument("--pedestrian-max-distance", type=float, default=20.0)
     parser.add_argument("--nonmotorized-max-distance", type=float, default=60.0)
     parser.add_argument("--sparsity-max-points", type=int, default=10)
+    parser.add_argument("--static-nmv-min-frames", type=int, default=8,
+                        help="drop long-stationary NMV tracks with fewer "
+                             "observations than this")
+    parser.add_argument("--static-nmv-max-displacement", type=float, default=1.0,
+                        help="world-frame center movement (m); a long NMV "
+                             "track is dropped only if both its max pairwise "
+                             "span and cumulative path are <= this")
     parser.add_argument("--noncar-cfg", type=Path, default=NONCAR_CFG,
                         help="non-Car inference config (default: expD config)")
     parser.add_argument("--noncar-ckpt", type=Path, default=NONCAR_CKPT,
@@ -330,7 +343,9 @@ def main() -> int:
            f"class thresholds={class_thresholds}, "
            f"pedestrian_max_distance={args.pedestrian_max_distance}, "
            f"nonmotorized_max_distance={args.nonmotorized_max_distance}, "
-           f"sparsity_max_points={args.sparsity_max_points}")
+           f"sparsity_max_points={args.sparsity_max_points}, "
+           f"static_nmv_min_frames={args.static_nmv_min_frames}, "
+           f"static_nmv_max_displacement={args.static_nmv_max_displacement}")
     _validate_weight(noncar_ckpt)
     if not noncar_cfg.is_file():
         raise RuntimeError(f"config not found: {noncar_cfg}")
@@ -369,6 +384,8 @@ def main() -> int:
             pedestrian_max_distance=args.pedestrian_max_distance,
             nonmotorized_max_distance=args.nonmotorized_max_distance,
             sparsity_max_points=args.sparsity_max_points,
+            static_nmv_min_frames=args.static_nmv_min_frames,
+            static_nmv_max_displacement=args.static_nmv_max_displacement,
         ))
     print(json.dumps({"clips": summaries}, ensure_ascii=False, indent=2))
     return 0

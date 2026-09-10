@@ -109,6 +109,13 @@ Car/Truck/Bus 头，只训练 Pedestrian / Nonmotorized_vehicle 头）；Car 仍
 - `Truck` / `Bus`: `0.4`
 - `Pedestrian` / `Nonmotorized_vehicle`: `0.1`
 
+Step3 几何精修后、导出 base_link 之前，还会整条删除“纯静止”的非机动车轨迹：
+只处理观测帧数 `>= 8` 的 `Nonmotorized_vehicle` 轨迹；只有世界坐标系下
+“最大两两 XY 中心位移”和“累计中心移动路径”都 `<= 1.0m` 时才删除。
+轨迹期间只要出现过 1m 以上的中心移动（包括缓慢累计移动）就保留整条轨迹，
+避免误伤等红绿灯后起步的非机动车。阈值可通过
+`--static-nmv-min-frames` / `--static-nmv-max-displacement` 调整。
+
 可用 `--noncar-ckpt models/vod_2cls_ft_e25.pth` 切换到 e25 版本（行人召回更高，
 耗时也更长）。若 `models/*.pth` 只有 133 字节，说明是 Git LFS 指针，先
 `git lfs pull`，或用真实权重覆盖后再跑。

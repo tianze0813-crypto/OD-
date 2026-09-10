@@ -5,7 +5,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from pipeline.hybrid_expD_noncar import _noncar_filter, drop_spinning_vehicle
+import numpy as np
+
+from pipeline.hybrid_expD_noncar import (
+    _noncar_filter,
+    drop_long_stationary_nonmotorized,
+    drop_spinning_vehicle,
+)
 from pipeline.hybrid_merge import merge_frames, merge_label_frames
 
 
@@ -14,6 +20,28 @@ _SPEC = importlib.util.spec_from_file_location("hybrid_launcher", _SCRIPT)
 hybrid_launcher = importlib.util.module_from_spec(_SPEC)
 assert _SPEC.loader is not None
 _SPEC.loader.exec_module(hybrid_launcher)
+
+
+class _IdentityCoords:
+    """Minimal CoordinateProvider stub: lidar frame == world frame."""
+
+    def world_from_lidar(self, timestamp):
+        return np.eye(4, dtype=np.float64)
+
+
+def _moving_frames(class_name, centers, track_id=7):
+    frames = []
+    for index, x in enumerate(centers):
+        frames.append({
+            "frame_id": str((index + 1) * 1_000_000_000),
+            "detections": [{
+                "track_id": track_id,
+                "class_name": class_name,
+                "score": 0.5,
+                "box_lidar": [float(x), 0.0, 0.0, 1.5, 0.8, 1.5, 0.0],
+            }],
+        })
+    return frames
 
 
 def _det(track_id, name):
@@ -212,6 +240,54 @@ class HybridPipelineTest(unittest.TestCase):
             self.assertIsNone(result["final_clip"])
             self.assertFalse((output_root / "scene_pre").exists())
             self.assertEqual(result["labels"], 2)
+
+
+class LongStationaryNonmotorizedTest(unittest.TestCase):
+    def test_long_static_nmv_track_is_dropped(self):
+        frames = _moving_frames("Nonmotorized_vehicle", [0.0] * 10)
+        dropped, stats = drop_long_stationary_nonmotorized(
+            frames, _IdentityCoords(), min_frames=8,
+            max_world_displacement=1.0)
+        self.assertEqual(dropped, {7})
+        self.assertEqual(stats["tracks_dropped"], 1)
+        self.assertEqual(stats["boxes_removed"], 10)
+        self.assertTrue(all(not frame["detections"] for frame in frames))
+
+    def test_moving_nmv_track_is_kept(self):
+        frames = _moving_frames(
+            "Nonmotorized_vehicle", [0.2 * index for index in range(10)])
+        dropped, stats = drop_long_stationary_nonmotorized(
+            frames, _IdentityCoords(), min_frames=8,
+            max_world_displacement=1.0)
+        self.assertEqual(dropped, set())
+        self.assertEqual(stats["tracks_checked"], 1)
+        self.assertTrue(all(len(frame["detections"]) == 1 for frame in frames))
+
+    def test_track_with_cumulative_movement_is_kept(self):
+        # span stays <= 1m, but cumulative world path exceeds 1m: the track
+        # must be kept so waiting/creeping objects are not dropped.
+        frames = _moving_frames(
+            "Nonmotorized_vehicle",
+            [0.6 * (index % 2) for index in range(10)])
+        dropped, stats = drop_long_stationary_nonmotorized(
+            frames, _IdentityCoords(), min_frames=8,
+            max_world_displacement=1.0)
+        self.assertEqual(dropped, set())
+        self.assertEqual(stats["tracks_dropped"], 0)
+
+    def test_short_static_nmv_track_is_kept(self):
+        frames = _moving_frames("Nonmotorized_vehicle", [0.0] * 6)
+        dropped, _stats = drop_long_stationary_nonmotorized(
+            frames, _IdentityCoords(), min_frames=8,
+            max_world_displacement=1.0)
+        self.assertEqual(dropped, set())
+
+    def test_static_track_of_other_class_is_kept(self):
+        frames = _moving_frames("Truck", [0.0] * 10)
+        dropped, _stats = drop_long_stationary_nonmotorized(
+            frames, _IdentityCoords(), min_frames=8,
+            max_world_displacement=1.0)
+        self.assertEqual(dropped, set())
 
 
 if __name__ == "__main__":
