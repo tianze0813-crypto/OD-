@@ -13,9 +13,11 @@ from region.region_mask import DynamicRegionMask
 from region.retrack import (
     Step45Config,
     _movement_compatible,
+    align_dynamic_yaw,
     build_region,
     candidate_track_ids,
     collect_world_tracks,
+    direction_filter,
     inherit_ids,
     is_moving_seed,
     is_pure_static,
@@ -28,7 +30,7 @@ from region.retrack import (
     track_motion_stats,
     verify_static_freeze,
 )
-from tracking.tracker_conservative import CoordinateProvider
+from tracking.tracker_conservative import ConservativeTracker, CoordinateProvider
 
 
 def make_coords(root: Path) -> CoordinateProvider:
@@ -323,6 +325,76 @@ class Step45RetrackTest(unittest.TestCase):
         self.assertTrue(any(
             detail.get("kind") == "left_turn_tail"
             for detail in turn_details))
+
+    def test_direction_filter_removes_single_noise_frame(self):
+        frames_input = []
+        for index in range(6):
+            moving = det("Car", index * 4.0, 0.0, 1)
+            parked = det("Car", 100.0, 100.0, 2)
+            moving["box_lidar"][6] = 0.0
+            parked["box_lidar"][6] = math.pi / 2
+            frames_input.append({
+                "frame_id": str(index * 400000000), "num_points": 0,
+                "num_detections": 2, "detections": [moving, parked]})
+        # Noisy yaw on the moving track; static track is not a dynamic id.
+        frames_input[2]["detections"][0]["box_lidar"][6] = math.pi / 2
+        with TemporaryDirectory() as directory:
+            coords = make_coords(Path(directory))
+            tracks, _ = collect_world_tracks(frames_input, coords)
+            cleaned, details, diag = direction_filter(
+                frames_input, tracks, {1}, Step45Config())
+        self.assertEqual(diag["noise_detections_removed"], 1)
+        self.assertEqual(len(cleaned[2]["detections"]), 1)
+        self.assertEqual(cleaned[2]["detections"][0]["track_id"], 2)
+        self.assertEqual(len(cleaned[3]["detections"]), 2)
+
+    def test_occlusion_recovery_keeps_same_id(self):
+        def make_frame(timestamp, x):
+            return {
+                "frame_id": str(timestamp),
+                "num_points": 0,
+                "num_detections": 1,
+                "detections": [det("Car", x, 0.0, None)]
+                if x is not None else [],
+            }
+        times = [0, 400000000, 800000000, 1200000000,
+                 3200000000, 3600000000, 4000000000]
+        positions = [0.0, 2.0, 4.0, 6.0, 16.0, 18.0, 20.0]
+        frames_input = [make_frame(t, p)
+                        for t, p in zip(times, positions)]
+        with TemporaryDirectory() as directory:
+            coords = make_coords(Path(directory))
+            tracker = ConservativeTracker(
+                coords, min_static_hits=10 ** 9,
+                dynamic_max_gap=1.8, use_yaw=False,
+                occlusion_enabled=True, occlusion_max_gap=2.0)
+            output, diag = tracker.process(frames_input)
+        ids = {det["track_id"] for frame in output
+               for det in frame["detections"]}
+        self.assertEqual(len(ids), 1)
+        self.assertGreaterEqual(diag["occlusion_recoveries"], 1)
+
+    def test_dynamic_yaw_alignment_flips_180(self):
+        frames_input = [
+            {"frame_id": str(index * 400000000), "num_points": 0,
+             "num_detections": 1,
+             "detections": [det("Car", index * 4.0, 0.0, 1)]}
+            for index in range(5)
+        ]
+        for frame in frames_input:
+            detection = frame["detections"][0]
+            detection["box_lidar"][6] = math.pi
+            detection["_step45_retracked"] = True
+            detection["region"] = "dynamic"
+        with TemporaryDirectory() as directory:
+            coords = make_coords(Path(directory))
+            tracks, _ = collect_world_tracks(frames_input, coords)
+            result = align_dynamic_yaw(
+                frames_input, tracks, coords, {1}, Step45Config())
+        self.assertGreater(result["dynamic_yaw_aligned"], 0)
+        for frame in frames_input:
+            yaw = frame["detections"][0]["box_lidar"][6]
+            self.assertLess(abs(math.cos(yaw) - 1.0), 1e-6)
 
     def test_movement_gate_and_lane_change_limit(self):
         config = Step45Config()

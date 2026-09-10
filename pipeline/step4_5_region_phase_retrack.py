@@ -22,8 +22,10 @@ if str(PROJECT_ROOT) not in sys.path:
 from region.dynamic_region import DynamicRegionConfig
 from region.retrack import (
     Step45Config,
+    align_dynamic_yaw,
     build_region,
     collect_world_tracks,
+    direction_filter,
     dynamic_box_fit,
     inherit_ids,
     phase_stitch,
@@ -46,6 +48,15 @@ def run(step4_json: Path, clip: Path, step2_diagnostics: Path,
     step2 = json.loads(Path(step2_diagnostics).read_text(encoding="utf-8"))
     coords = tracking.CoordinateProvider(Path(clip))
 
+    # Pass 1: collect step-4 car-only tracks, then apply the reviewed
+    # driving-direction filter (60 degrees from the local motion heading).
+    tracks_pass1, _by_key = collect_world_tracks(frames, coords)
+    seeds_pass1 = seed_track_ids(tracks_pass1, config.region, config)
+    frames, direction_filter_details, direction_filter_diag = (
+        direction_filter(
+            frames, tracks_pass1, set(seeds_pass1), config))
+
+    # Rebuild pass-1 structures on the cleaned detections.
     tracks, _by_key = collect_world_tracks(frames, coords)
     static_slots = list(
         step2.get("tracking", {}).get("slot_details", []))
@@ -62,6 +73,8 @@ def run(step4_json: Path, clip: Path, step2_diagnostics: Path,
                 "dynamic" if (frame_index, detection_index) in retrackable
                 else "static")
     before_step45 = copy.deepcopy(frames)
+
+    # Pass 2: occlusion-aware motion-only re-tracking.
     retrack_diagnostics = retrack_dynamic(
         frames, coords, retrackable, config)
     inheritance = inherit_ids(
@@ -76,6 +89,16 @@ def run(step4_json: Path, clip: Path, step2_diagnostics: Path,
     _fitted_frames, box_fit_diagnostics = dynamic_box_fit(
         frames, Path(clip), coords, tracking_diagnostics,
         static_yaw_diagnostics)
+
+    # Final dynamic yaw: remove the 180-degree flip ambiguity and align the
+    # box axis to the local driving heading.
+    dynamic_final_ids = {
+        int(det["track_id"]) for frame in frames
+        for det in frame.get("detections", [])
+        if det.get("track_id") is not None
+        and det.get("_step45_retracked")}
+    yaw_diagnostics = align_dynamic_yaw(
+        frames, tracks, coords, dynamic_final_ids, config)
     static_freeze = verify_static_freeze(
         before_step45, frames, exempt_keys)
 
@@ -99,6 +122,8 @@ def run(step4_json: Path, clip: Path, step2_diagnostics: Path,
         "dynamic_region_mask": mask.to_dict(),
         "candidate_tracks": len(seeds),
         "candidate_track_ids": sorted(seeds),
+        "direction_filter": direction_filter_diag,
+        "direction_filter_details": direction_filter_details,
         "selection": selection,
         "retracking": retrack_diagnostics,
         "id_inheritance": inheritance,
@@ -112,6 +137,7 @@ def run(step4_json: Path, clip: Path, step2_diagnostics: Path,
         },
         "phase_stitching": phase,
         "box_fit": box_fit_diagnostics,
+        "dynamic_yaw_alignment": yaw_diagnostics,
         "static_freeze": static_freeze,
         "final_detections": sum(
             len(frame.get("detections", [])) for frame in frames),
@@ -159,9 +185,15 @@ def main() -> None:
         "candidate_tracks": diagnostics["candidate_tracks"],
         "retrackable_detections": diagnostics["selection"][
             "retrackable_detections"],
+        "direction_noise_removed": diagnostics[
+            "direction_filter"]["noise_detections_removed"],
         "id_assignments": len(diagnostics["id_inheritance"]["assignments"]),
         "queue_merges": len(diagnostics["queue_stitching"]["merges"]),
         "phase_merges": len(diagnostics["phase_stitching"]["applied"]),
+        "occlusion_recoveries": diagnostics["retracking"].get(
+            "occlusion_recoveries", 0),
+        "dynamic_yaw_aligned": diagnostics[
+            "dynamic_yaw_alignment"]["dynamic_yaw_aligned"],
         "final_detections": diagnostics["final_detections"],
         "static_freeze_passed": diagnostics["static_freeze"]["passed"],
     }, ensure_ascii=False, indent=2))

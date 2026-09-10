@@ -345,7 +345,9 @@ class ConservativeTracker:
                  departure_radius: float = 2.5, departure_frames: int = 3,
                  dynamic_max_gap: float = 1.8, dynamic_base_gate: float = 1.6,
                  dynamic_max_velocity: float = 28.0, dynamic_max_gate: float = 9.0,
-                 use_yaw: bool = True):
+                 use_yaw: bool = True,
+                 occlusion_enabled: bool = False,
+                 occlusion_max_gap: float = 0.0):
         self.coords = coords
         self.min_static_hits = int(min_static_hits)
         self.min_static_duration = float(min_static_duration)
@@ -359,6 +361,8 @@ class ConservativeTracker:
         self.dynamic_max_velocity = float(dynamic_max_velocity)
         self.dynamic_max_gate = float(dynamic_max_gate)
         self.use_yaw = bool(use_yaw)
+        self.occlusion_enabled = bool(occlusion_enabled)
+        self.occlusion_max_gap = float(occlusion_max_gap)
         self.next_id = 1
         self.next_slot = 1
         self.tracks: Dict[int, Track] = {}
@@ -367,6 +371,7 @@ class ConservativeTracker:
             "frames": 0, "detections": 0, "matches": 0, "births": 0,
             "static_locks": 0, "static_recoveries": 0, "departures": 0,
             "rejections": {}, "ambiguous_recoveries": 0, "events": [],
+            "occlusion_recoveries": 0,
         }
 
     def _event(self, event: str, tr: Track, timestamp: int, **fields: Any) -> None:
@@ -438,6 +443,9 @@ class ConservativeTracker:
                 if abs(candidate_speed - prior_speed) > allowed_delta:
                     return 1e9, "speed_continuity_gate"
         dxy = float(np.linalg.norm((obs.world - predicted)[:2]))
+        occluded = (
+            self.occlusion_enabled and not static_mode
+            and dt > self.dynamic_max_gap + 1e-6)
         if static_mode:
             if tr.slot_anchor is None:
                 return 1e9, "static_anchor_gate"
@@ -459,8 +467,20 @@ class ConservativeTracker:
                 covariance[:2, :2] = np.eye(2) * max(0.45, self.static_reacquire_radius / 2.0) ** 2
                 dxy = anchor_dist
         else:
-            gate = min(self.dynamic_max_gate,
-                       self.dynamic_base_gate + self.dynamic_max_velocity * max(dt - 0.1, 0.0))
+            if occluded:
+                prior_speed = float(np.linalg.norm(tr.velocity[:2]))
+                reachable_speed = min(
+                    self.dynamic_max_velocity, max(prior_speed, 2.0))
+                gate = min(
+                    self.dynamic_max_gate,
+                    self.dynamic_base_gate
+                    + reachable_speed * max(dt, 0.0)
+                    + 0.5 * math.sqrt(max(dt, 0.0)))
+            else:
+                gate = min(
+                    self.dynamic_max_gate,
+                    self.dynamic_base_gate
+                    + self.dynamic_max_velocity * max(dt - 0.1, 0.0))
             if dxy > gate:
                 return 1e9, "distance_gate"
         if not class_compatible(obs.detection.get("class_name", ""), tr.class_name):
@@ -468,6 +488,25 @@ class ConservativeTracker:
         scale_delta = float(np.linalg.norm(obs.size - tr.size) / max(float(np.linalg.norm(tr.size)), 1.0))
         if scale_delta > 1.35 and dxy > 0.75:
             return 1e9, "size_gate"
+        if occluded:
+            # Occlusion recovery: the covariance has grown for seconds, so
+            # the tight Mahalanobis / IoU gates would reject a valid
+            # re-appearance.  Use the motion/lane-friendly distance gate and
+            # a direction-consistency term instead.
+            recent_velocity = tr.velocity[:2]
+            if float(np.linalg.norm(recent_velocity)) > 1.0 and dxy > 0.5:
+                step_vector = obs.world[:2] - tr.last_world[:2]
+                cosine = float(np.dot(step_vector, recent_velocity) / max(
+                    float(np.linalg.norm(step_vector))
+                    * float(np.linalg.norm(recent_velocity)), 1e-9))
+                if cosine < -0.20:
+                    return 1e9, "occlusion_direction_gate"
+            cost = dxy / max(gate, 1e-9)
+            cost += 0.55 * min(scale_delta, 2.0)
+            cost += 0.02 * max(0.0, dt)
+            cost -= min(0.04, max(0.0, float(
+                obs.detection.get("score", 0.0))) * 0.02)
+            return cost, "occlusion_recover"
         innovation = obs.world[:2] - predicted[:2]
         innovation_cov = covariance[:2, :2] + np.eye(2) * 0.35 ** 2
         try:
@@ -727,8 +766,11 @@ class ConservativeTracker:
             # motion pass as well. This is what lets the original ID survive
             # the first departure frames; only a long disappearance falls back
             # to anchor-based static recovery.
+            gap_limit = self.dynamic_max_gap
+            if self.occlusion_enabled:
+                gap_limit = max(gap_limit, self.occlusion_max_gap)
             moving_tracks = [t for t in self.tracks.values()
-                             if (ts - t.last_ts) / 1e9 <= self.dynamic_max_gap]
+                             if (ts - t.last_ts) / 1e9 <= gap_limit]
             # A departing anchored vehicle is handled by the motion pass; a
             # parked anchor is deliberately considered only after moving tracks
             # have had first claim on the detection.
@@ -748,7 +790,13 @@ class ConservativeTracker:
             used_obs = set(id(o) for o in assigned.values())
             for tid, obs in assigned.items():
                 tr = self.tracks[tid]
+                gap_sec = (obs.timestamp - tr.last_ts) / 1e9
+                was_occluded = (
+                    self.occlusion_enabled and not tr.is_static
+                    and gap_sec > self.dynamic_max_gap + 1e-6)
                 self._update(tr, obs, "static_recover" if tr.is_static else "motion")
+                if was_occluded:
+                    self.diagnostics["occlusion_recoveries"] += 1
                 obs.detection["track_id"] = tid
                 self.diagnostics["matches"] += 1
                 self._event("match", tr, obs.timestamp, reason=tr.last_match_reason)

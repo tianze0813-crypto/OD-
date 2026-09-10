@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 from geometry.car_box_fit import CarBoxFitConfig, apply_car_box_fit
+from geometry.yaw_static_direction import _world_yaw_to_local
 from region.dynamic_region import (
     DynamicRegionConfig,
     DynamicRegionResult,
@@ -47,6 +48,8 @@ class Step45Config:
         default_factory=TrafficLightConfig)
     # Re-track association.
     dynamic_max_gap_sec: float = 1.8
+    # Dynamic-region occlusion state (PLAN section 19, final edge case).
+    occlusion_max_gap_sec: float = 2.0
     # Moving seed / pure static classification (PLAN section 19).
     moving_seed_net_min_m: float = 8.0
     moving_seed_concentration_min: float = 0.5
@@ -236,6 +239,144 @@ def seed_track_ids(
     return seeds
 
 
+def _step_headings(
+        items: Sequence[Mapping[str, Any]],
+) -> Tuple[List[float], List[float]]:
+    """Return valid step headings (rad) and step lengths for a track."""
+    ordered = sorted(items, key=lambda item: item["timestamp"])
+    headings: List[float] = []
+    lengths: List[float] = []
+    for left, right in zip(ordered, ordered[1:]):
+        vector = np.asarray(right["world"], dtype=np.float64) \
+            - np.asarray(left["world"], dtype=np.float64)
+        length = float(np.linalg.norm(vector))
+        if length <= 1e-6:
+            continue
+        headings.append(math.atan2(float(vector[1]), float(vector[0])))
+        lengths.append(length)
+    return headings, lengths
+
+
+def _circular_median_heading(headings: Sequence[float]) -> Optional[float]:
+    if not headings:
+        return None
+    values = np.asarray(headings, dtype=np.float64)
+    mean = math.atan2(float(np.mean(np.sin(values))),
+                      float(np.mean(np.cos(values))))
+    inliers = [float(value) for value in values
+               if abs(_wrap_angle(float(value) - mean)) <= math.radians(60.0)]
+    if len(inliers) < 2:
+        return None
+    values = np.asarray(inliers, dtype=np.float64)
+    return math.atan2(float(np.mean(np.sin(values))),
+                      float(np.mean(np.cos(values))))
+
+
+def _local_headings(
+        items: Sequence[Mapping[str, Any]],
+        half_window: int = 2,
+) -> List[Optional[float]]:
+    """Local driving heading from each detection's own temporal neighbours."""
+    ordered = sorted(items, key=lambda item: item["timestamp"])
+    if len(ordered) < 2:
+        return [None] * len(ordered)
+    headings = [None] * len(ordered)
+    for index in range(len(ordered)):
+        lo = max(0, index - half_window)
+        hi = min(len(ordered), index + half_window + 1)
+        values: List[float] = []
+        lengths: List[float] = []
+        # Deliberately exclude the current detection itself: the detection
+        # being tested may be the noisy one, so its own position must not
+        # define the reference heading.
+        if index - lo >= 2:
+            side_values, side_lengths = _step_headings(ordered[lo:index])
+            values.extend(side_values)
+            lengths.extend(side_lengths)
+        if hi - (index + 1) >= 2:
+            side_values, side_lengths = _step_headings(ordered[index + 1:hi])
+            values.extend(side_values)
+            lengths.extend(side_lengths)
+        if len(values) < 2:
+            continue
+        median_length = float(np.median(lengths)) if lengths else 0.0
+        kept = [value for value, length in zip(values, lengths)
+                if length <= max(3.0 * median_length, 1.5)]
+        headings[index] = _circular_median_heading(kept)
+    return headings
+
+
+def _robust_track_heading(
+        items: Sequence[Mapping[str, Any]],
+) -> Optional[float]:
+    headings, lengths = _step_headings(items)
+    if len(headings) < 2:
+        return None
+    kept = [value for value, length in zip(headings, lengths)
+            if length <= max(3.0 * float(np.median(lengths)), 1.5)]
+    return _circular_median_heading(kept)
+
+
+def direction_filter(
+        frames: Sequence[Mapping[str, Any]],
+        tracks: Mapping[int, Sequence[Mapping[str, Any]]],
+        dynamic_ids: set[int],
+        config: Step45Config,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    """Pass-1 driving-direction filter (PLAN 19 edge case).
+
+    A detection whose box yaw deviates more than 60 degrees (modulo pi) from
+    its own local driving heading is direction noise.  Only dynamic candidate
+    tracks are filtered; pure static tracks are left untouched.
+    """
+    threshold = math.radians(60.0)
+    noisy: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    for track_id, items in tracks.items():
+        if int(track_id) not in dynamic_ids:
+            continue
+        ordered = sorted(items, key=lambda item: item["timestamp"])
+        local = _local_headings(ordered)
+        fallback = _robust_track_heading(ordered)
+        for item, heading in zip(ordered, local):
+            chosen = heading if heading is not None else fallback
+            if chosen is None:
+                continue
+            deviation = tracking.angle_distance(
+                float(item["yaw"]), float(chosen), modulo_pi=True)
+            if deviation <= threshold:
+                continue
+            noisy[(int(item["frame_index"]), int(item["detection_index"]))] = {
+                "track_id": int(track_id),
+                "frame_index": int(item["frame_index"]),
+                "detection_index": int(item["detection_index"]),
+                "box_yaw_deg": round(math.degrees(float(item["yaw"])), 3),
+                "driving_heading_deg": round(math.degrees(float(chosen)), 3),
+                "deviation_deg": round(math.degrees(float(deviation)), 3),
+                "local_heading_used": heading is not None,
+            }
+    output: List[Dict[str, Any]] = []
+    removed = 0
+    for frame_index, frame in enumerate(frames):
+        kept = []
+        for detection_index, det in enumerate(frame.get("detections", [])):
+            if (frame_index, detection_index) in noisy:
+                removed += 1
+                continue
+            kept.append(copy.deepcopy(det))
+        new_frame = copy.deepcopy(frame)
+        new_frame["detections"] = kept
+        new_frame["num_detections"] = len(kept)
+        output.append(new_frame)
+    details = list(noisy.values())
+    return output, details, {
+        "direction_threshold_deg": 60.0,
+        "dynamic_tracks_checked": sum(
+            1 for track_id in tracks if int(track_id) in dynamic_ids),
+        "noise_detections_removed": removed,
+        "noise_details": details[:200],
+    }
+
+
 def candidate_track_ids(
         tracks: Mapping[int, Sequence[Mapping[str, Any]]],
         config: DynamicRegionConfig,
@@ -355,6 +496,8 @@ def retrack_dynamic(
         min_static_hits=10 ** 9,
         dynamic_max_gap=float(config.dynamic_max_gap_sec),
         use_yaw=False,
+        occlusion_enabled=True,
+        occlusion_max_gap=float(config.occlusion_max_gap_sec),
     )
     # Occlusion gaps during motion are explicitly out of scope and two cars
     # must not be merged.  The tracker's 3 s tracklet stitching is therefore
@@ -1392,6 +1535,69 @@ def phase_stitch(
         "merges": merges,
         "applied": applied,
         "dynamic_tracks": len(dynamic_ids),
+    }
+
+
+def align_dynamic_yaw(
+        frames: List[Dict[str, Any]],
+        tracks: Mapping[int, Sequence[Mapping[str, Any]]],
+        coords: tracking.CoordinateProvider,
+        dynamic_ids: set[int],
+        config: Step45Config,
+) -> Dict[str, Any]:
+    """Pass-2 dynamic yaw alignment (PLAN 19 final rule).
+
+    For moving dynamic tracks, choose the pi-equivalent yaw that points along
+    the local driving direction.  This removes the 180-degree flip ambiguity
+    without touching detector yaw in the perpendicular direction.  Static
+    tracks are never modified.
+    """
+    by_final: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for items in tracks.values():
+        for item in items:
+            final_id = item["det"].get("track_id")
+            if final_id is not None:
+                by_final[int(final_id)].append(item)
+    changed = 0
+    details: List[Dict[str, Any]] = []
+    for final_id, items in by_final.items():
+        if final_id not in dynamic_ids:
+            continue
+        if not any(item["det"].get("_step45_retracked")
+                   or item["det"].get("region") == "dynamic"
+                   for item in items):
+            continue
+        ordered = sorted(items, key=lambda item: item["timestamp"])
+        if len(ordered) < 3:
+            continue
+        local = _local_headings(ordered)
+        fallback = _robust_track_heading(ordered)
+        for item, heading in zip(ordered, local):
+            if not (item["det"].get("_step45_retracked")
+                    or item["det"].get("region") == "dynamic"):
+                continue
+            chosen = heading if heading is not None else fallback
+            if chosen is None:
+                continue
+            timestamp_ns = int(item.get("timestamp_ns", 0))
+            world_from_lidar = coords.world_from_lidar(timestamp_ns)
+            if world_from_lidar is None:
+                continue
+            target_local = _world_yaw_to_local(float(chosen), world_from_lidar)
+            box = item["det"].get("box_lidar")
+            if not isinstance(box, list) or len(box) < 7:
+                continue
+            box[6] = float(_wrap_angle(target_local))
+            changed += 1
+        if changed and len(details) < 200:
+            details.append({
+                "track_id": int(final_id),
+                "observations": len(ordered),
+            })
+    return {
+        "dynamic_yaw_aligned": changed,
+        "tracks": len(details),
+        "details": details,
     }
 
 

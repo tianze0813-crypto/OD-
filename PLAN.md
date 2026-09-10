@@ -730,3 +730,24 @@ Pass 2（局部）:
 - 变道连续性的具体横向速度 / heading 阈值；
 - 左转 5m 弧长对应的半径：可后续查标准转弯区尺寸（用户建议可上网查标准）；
 - queue 跨停止线 / 进入路口后的建模细节。
+
+### 19.9 行驶方向过滤 / 遮挡状态 / 动态 yaw 对齐（已实现）
+
+- **pass1 后行驶方向过滤**：
+  - 对动态候选 track 的每个 detection，用它自己前后 ±2 帧的中心位置（**排除当前检测本身**）
+    计算局部 driving heading；
+  - 局部窗口不足时回退到整条轨迹 robust heading；
+  - box yaw 与 driving heading 的轴向偏差 >60° → 标记 `direction_noise`，
+    只删该帧 detection，不删整条 ID；
+  - 只作用在动态候选上，纯静态停车不参与。
+- **occlusion / lost 状态**（只在 step4.5 动态区域）：
+  - `max_occlusion_gap = 2.0s`；
+  - 丢失期间仍参与匈牙利，用 Kalman 预测 + 宽松距离/运动方向 gate，
+    跳过已经膨胀的 Mahalanobis / IoU 硬门限；
+  - weak seed 也启用；
+  - 恢复成功保留原 ID；超过 2s 才结束；
+  - ambiguous 时按 cost 分给最优。
+- **pass2 后动态 yaw 对齐**：
+  - 对动态/重跟踪 detection，用局部 driving heading 把 box yaw 写为运动方向；
+  - 消除 180° 调转的方向歧义；
+  - 静态冻结 track 的 yaw 不变。
