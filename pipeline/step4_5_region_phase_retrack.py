@@ -23,13 +23,14 @@ from region.dynamic_region import DynamicRegionConfig
 from region.retrack import (
     Step45Config,
     build_region,
-    candidate_track_ids,
     collect_world_tracks,
     dynamic_box_fit,
     inherit_ids,
     phase_stitch,
+    queue_stitch,
     region_mask,
     retrack_dynamic,
+    seed_track_ids,
     select_retrackable,
     verify_static_freeze,
 )
@@ -48,11 +49,13 @@ def run(step4_json: Path, clip: Path, step2_diagnostics: Path,
     tracks, _by_key = collect_world_tracks(frames, coords)
     static_slots = list(
         step2.get("tracking", {}).get("slot_details", []))
-    candidates = candidate_track_ids(tracks, config.region)
-    region = build_region(tracks, static_slots, config.region)
+    seeds = seed_track_ids(tracks, config.region, config)
+    region = build_region(
+        tracks, static_slots, config.region,
+        accepted_track_ids=set(seeds))
     mask = region_mask(region, config.region)
     retrackable, selection = select_retrackable(
-        frames, coords, mask, candidates)
+        frames, coords, mask, seeds)
     for frame_index, frame in enumerate(frames):
         for detection_index, det in enumerate(frame.get("detections", [])):
             det["region"] = (
@@ -62,7 +65,10 @@ def run(step4_json: Path, clip: Path, step2_diagnostics: Path,
     retrack_diagnostics = retrack_dynamic(
         frames, coords, retrackable, config)
     inheritance = inherit_ids(
-        frames, tracks, retrackable, candidates, step2, config)
+        frames, tracks, retrackable, seeds, step2, config)
+    queue = queue_stitch(
+        frames, tracks, step2, mask, set(seeds), config)
+    exempt_keys = set(retrackable) | set(queue.get("modified_keys", []))
     phase = phase_stitch(frames, tracks, coords, config)
 
     tracking_diagnostics = step2.get("tracking", {})
@@ -71,7 +77,7 @@ def run(step4_json: Path, clip: Path, step2_diagnostics: Path,
         frames, Path(clip), coords, tracking_diagnostics,
         static_yaw_diagnostics)
     static_freeze = verify_static_freeze(
-        before_step45, frames, retrackable)
+        before_step45, frames, exempt_keys)
 
     for frame in frames:
         frame["num_detections"] = len(frame.get("detections", []))
@@ -91,11 +97,19 @@ def run(step4_json: Path, clip: Path, step2_diagnostics: Path,
         },
         "dynamic_region": region.to_dict(),
         "dynamic_region_mask": mask.to_dict(),
-        "candidate_tracks": len(candidates),
-        "candidate_track_ids": sorted(candidates),
+        "candidate_tracks": len(seeds),
+        "candidate_track_ids": sorted(seeds),
         "selection": selection,
         "retracking": retrack_diagnostics,
         "id_inheritance": inheritance,
+        "queue_stitching": {
+            "queues": queue.get("queues", 0),
+            "edges": queue.get("edges", 0),
+            "merges": queue.get("merges", []),
+            "modified_detections": len(queue.get("modified_keys", [])),
+            "direction_assignments": queue.get(
+                "direction_assignments", {}),
+        },
         "phase_stitching": phase,
         "box_fit": box_fit_diagnostics,
         "static_freeze": static_freeze,
@@ -146,6 +160,7 @@ def main() -> None:
         "retrackable_detections": diagnostics["selection"][
             "retrackable_detections"],
         "id_assignments": len(diagnostics["id_inheritance"]["assignments"]),
+        "queue_merges": len(diagnostics["queue_stitching"]["merges"]),
         "phase_merges": len(diagnostics["phase_stitching"]["applied"]),
         "final_detections": diagnostics["final_detections"],
         "static_freeze_passed": diagnostics["static_freeze"]["passed"],

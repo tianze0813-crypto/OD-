@@ -94,6 +94,15 @@ class DynamicRegionConfig:
     extension_min_stable_observations: int = 5
     extension_min_stable_path_m: float = 10.0
     extension_step_m: float = 1.0
+    # Turn handling (reviewed): a turning seed must not extend 30m forward.
+    # Only the actual swept turn area is used ahead; behind it uses the queue
+    # length.  A left turn may add a short (~5m) arc tail.
+    turn_min_heading_change_deg: float = 30.0
+    turn_forward_extension_m: float = 0.0
+    turn_backward_extension_m: float = 20.0
+    left_turn_tail_arc_length_m: float = 5.0
+    left_turn_tail_turn_deg: float = 60.0
+    left_turn_tail_step_m: float = 1.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -125,6 +134,14 @@ class DynamicRegionConfig:
             "extension_min_stable_path_m": (
                 self.extension_min_stable_path_m),
             "extension_step_m": self.extension_step_m,
+            "turn_min_heading_change_deg": (
+                self.turn_min_heading_change_deg),
+            "turn_forward_extension_m": self.turn_forward_extension_m,
+            "turn_backward_extension_m": self.turn_backward_extension_m,
+            "left_turn_tail_arc_length_m": (
+                self.left_turn_tail_arc_length_m),
+            "left_turn_tail_turn_deg": self.left_turn_tail_turn_deg,
+            "left_turn_tail_step_m": self.left_turn_tail_step_m,
         }
 
 
@@ -469,53 +486,163 @@ def _stable_endpoint_heading(
     return None
 
 
+def _append_straight_extension(
+        extended: List[Dict[str, Any]],
+        anchor: np.ndarray,
+        heading: float,
+        size: np.ndarray,
+        length: float,
+        *,
+        at_start: bool,
+        base_timestamp: float,
+        step: float,
+        config: DynamicRegionConfig,
+) -> Optional[Dict[str, Any]]:
+    if length <= 0.0:
+        return None
+    count = int(round(length / max(step, 0.5)))
+    if count <= 0:
+        return None
+    direction = np.array([math.cos(heading), math.sin(heading)],
+                         dtype=np.float64)
+    if at_start:
+        direction = -direction
+    sign = -1.0 if at_start else 1.0
+    for index in range(1, count + 1):
+        world = anchor + direction * (step * index)
+        extended.append({
+            "timestamp": base_timestamp + sign * 0.1 * index,
+            "world": world.astype(np.float64),
+            "yaw": float(heading),
+            "size": np.asarray(size, dtype=np.float64),
+            "class_name": "",
+            "synthetic_extension": True,
+        })
+    return {
+        "end": "start" if at_start else "end",
+        "heading_deg": round(math.degrees(heading), 3),
+        "length_m": round(length, 3),
+        "step_m": round(step, 3),
+        "anchor": [round(float(anchor[0]), 4),
+                   round(float(anchor[1]), 4)],
+        "kind": "straight_extension",
+    }
+
+
+def _append_left_turn_tail(
+        extended: List[Dict[str, Any]],
+        anchor: np.ndarray,
+        heading: float,
+        size: np.ndarray,
+        base_timestamp: float,
+        config: DynamicRegionConfig,
+) -> Optional[Dict[str, Any]]:
+    """Append a short left-turn arc (~5m default) at the track end."""
+    arc_length = float(config.left_turn_tail_arc_length_m)
+    if arc_length <= 0.0:
+        return None
+    total_turn = math.radians(float(config.left_turn_tail_turn_deg))
+    step = max(float(config.left_turn_tail_step_m), 0.5)
+    count = max(1, int(round(arc_length / step)))
+    current = np.asarray(anchor, dtype=np.float64).copy()
+    current_heading = float(heading)
+    for index in range(1, count + 1):
+        current_heading += total_turn / count
+        current = current + step * np.array([
+            math.cos(current_heading), math.sin(current_heading)],
+            dtype=np.float64)
+        extended.append({
+            "timestamp": base_timestamp + 0.1 * index,
+            "world": current.astype(np.float64),
+            "yaw": float(current_heading),
+            "size": np.asarray(size, dtype=np.float64),
+            "class_name": "",
+            "synthetic_extension": True,
+        })
+    return {
+        "end": "end",
+        "kind": "left_turn_tail",
+        "heading_deg": round(math.degrees(heading), 3),
+        "arc_length_m": round(arc_length, 3),
+        "turn_deg": float(config.left_turn_tail_turn_deg),
+        "anchor": [round(float(anchor[0]), 4),
+                   round(float(anchor[1]), 4)],
+    }
+
+
+def _track_turn_info(
+        normalized: Sequence[Mapping[str, Any]],
+        config: DynamicRegionConfig,
+) -> Optional[Tuple[str, float]]:
+    """Return (turn direction, heading change degrees) for a track."""
+    start_info = _stable_endpoint_heading(
+        normalized, at_start=True, config=config)
+    end_info = _stable_endpoint_heading(
+        normalized, at_start=False, config=config)
+    if start_info is None or end_info is None:
+        return None
+    delta = math.degrees(float(
+        _wrap_angle(end_info[1] - start_info[1])))
+    if abs(delta) < float(config.turn_min_heading_change_deg):
+        return None
+    return ("left" if delta > 0.0 else "right"), delta
+
+
 def _extend_track(
         normalized: Sequence[Mapping[str, Any]],
         config: DynamicRegionConfig,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Extend a high-speed track's swept corridor along its stable headings."""
+    """Extend a seed's swept corridor.
+
+    Straight: 30m both ends.  Turning: no forward 30m extension (the actual
+    swept turn area is used); backward uses queue length (20m); a left turn
+    may add a short ~5m arc tail.
+    """
     extended = [dict(item) for item in normalized]
     details: List[Dict[str, Any]] = []
-    length = float(config.extension_length_m)
-    if length <= 0.0 or len(normalized) < 2:
+    if len(normalized) < 2:
         return extended, details
     step = max(float(config.extension_step_m), 0.5)
-    count = int(round(length / step))
-    if count <= 0:
-        return extended, details
+    turn_info = _track_turn_info(normalized, config)
+    if turn_info is None:
+        backward_length = float(config.extension_length_m)
+        forward_length = float(config.extension_length_m)
+        turn_kind = None
+    else:
+        turn_kind, turn_delta = turn_info
+        backward_length = float(config.turn_backward_extension_m)
+        forward_length = float(config.turn_forward_extension_m)
+    start_info = _stable_endpoint_heading(
+        normalized, at_start=True, config=config)
+    end_info = _stable_endpoint_heading(
+        normalized, at_start=False, config=config)
 
-    for at_start in (True, False):
-        info = _stable_endpoint_heading(
-            normalized, at_start=at_start, config=config)
-        if info is None:
-            continue
-        anchor, heading, size = info
-        direction = np.array([math.cos(heading), math.sin(heading)],
-                             dtype=np.float64)
-        if at_start:
-            direction = -direction
-        base_timestamp = float(
-            normalized[0]["timestamp"] if at_start
-            else normalized[-1]["timestamp"])
-        sign = -1.0 if at_start else 1.0
-        for index in range(1, count + 1):
-            world = anchor + direction * (step * index)
-            extended.append({
-                "timestamp": base_timestamp + sign * 0.1 * index,
-                "world": world.astype(np.float64),
-                "yaw": float(heading),
-                "size": np.asarray(size, dtype=np.float64),
-                "class_name": "",
-                "synthetic_extension": True,
-            })
-        details.append({
-            "end": "start" if at_start else "end",
-            "heading_deg": round(math.degrees(heading), 3),
-            "length_m": round(length, 3),
-            "step_m": round(step, 3),
-            "anchor": [round(float(anchor[0]), 4),
-                       round(float(anchor[1]), 4)],
-        })
+    if start_info is not None:
+        anchor, heading, size = start_info
+        detail = _append_straight_extension(
+            extended, anchor, heading, size, backward_length,
+            at_start=True, base_timestamp=float(normalized[0]["timestamp"]),
+            step=step, config=config)
+        if detail is not None:
+            if turn_kind is not None:
+                detail["turn"] = turn_kind
+            details.append(detail)
+    if end_info is not None:
+        anchor, heading, size = end_info
+        detail = _append_straight_extension(
+            extended, anchor, heading, size, forward_length,
+            at_start=False, base_timestamp=float(normalized[-1]["timestamp"]),
+            step=step, config=config)
+        if detail is not None:
+            if turn_kind is not None:
+                detail["turn"] = turn_kind
+            details.append(detail)
+        if turn_kind == "left":
+            tail = _append_left_turn_tail(
+                extended, anchor, heading, size,
+                float(normalized[-1]["timestamp"]), config)
+            if tail is not None:
+                details.append(tail)
     extended.sort(key=lambda item: float(item["timestamp"]))
     return extended, details
 
@@ -543,6 +670,7 @@ def build_dynamic_regions(
         *,
         static_slots: Sequence[Mapping[str, Any]] = (),
         reference_points: Any = None,
+        accepted_track_ids: Optional[set[int]] = None,
         config: DynamicRegionConfig = DynamicRegionConfig(),
 ) -> DynamicRegionResult:
     """Build high-speed dynamic polygons from world-frame tracks.
@@ -574,31 +702,35 @@ def build_dynamic_regions(
                             dtype=np.float64)
         if points.size:
             all_points.append(points)
-        if not _is_high_speed(stats, config):
+        accepted = (accepted_track_ids is not None
+                    and int(track_id) in accepted_track_ids)
+        if not (_is_high_speed(stats, config) or accepted):
             continue
-        if _track_hits_static_slot(
+        if not accepted:
+            if _track_hits_static_slot(
+                    normalized, static_slots,
+                    config.static_slot_hard_exclusion_radius):
+                rejected_static_tracks.append({
+                    "track_id": int(track_id),
+                    "reason": "static_slot_hard_overlap",
+                    "static_overlap_fraction": round(
+                        _static_overlap_fraction(
+                            normalized, static_slots,
+                            config.static_slot_exclusion_radius), 4),
+                    **stats,
+                })
+                continue
+            overlap = _static_overlap_fraction(
                 normalized, static_slots,
-                config.static_slot_hard_exclusion_radius):
-            rejected_static_tracks.append({
-                "track_id": int(track_id),
-                "reason": "static_slot_hard_overlap",
-                "static_overlap_fraction": round(
-                    _static_overlap_fraction(
-                        normalized, static_slots,
-                        config.static_slot_exclusion_radius), 4),
-                **stats,
-            })
-            continue
-        overlap = _static_overlap_fraction(
-            normalized, static_slots, config.static_slot_exclusion_radius)
-        if overlap >= float(config.static_track_overlap_fraction):
-            rejected_static_tracks.append({
-                "track_id": int(track_id),
-                "reason": "static_slot_overlap_fraction",
-                "static_overlap_fraction": round(float(overlap), 4),
-                **stats,
-            })
-            continue
+                config.static_slot_exclusion_radius)
+            if overlap >= float(config.static_track_overlap_fraction):
+                rejected_static_tracks.append({
+                    "track_id": int(track_id),
+                    "reason": "static_slot_overlap_fraction",
+                    "static_overlap_fraction": round(float(overlap), 4),
+                    **stats,
+                })
+                continue
         kept_tracks[int(track_id)] = normalized
 
     extended_tracks, extension_details = _extend_high_speed_tracks(

@@ -8,16 +8,24 @@ from unittest import mock
 
 import numpy as np
 
+from region.dynamic_region import DynamicRegionConfig, _extend_track
+from region.region_mask import DynamicRegionMask
 from region.retrack import (
     Step45Config,
+    _movement_compatible,
     build_region,
     candidate_track_ids,
     collect_world_tracks,
     inherit_ids,
+    is_moving_seed,
+    is_pure_static,
+    is_weak_moving_seed,
     phase_stitch,
+    queue_stitch,
     region_mask,
     retrack_dynamic,
     select_retrackable,
+    track_motion_stats,
     verify_static_freeze,
 )
 from tracking.tracker_conservative import CoordinateProvider
@@ -182,6 +190,152 @@ class Step45RetrackTest(unittest.TestCase):
             if not det.get("_step45_retracked")
         }
         self.assertEqual(frozen_ids, {1})
+
+    def test_moving_seed_and_pure_static_rules(self):
+        config = Step45Config()
+        moving = [
+            {"timestamp": index * 0.6, "world": np.array([index * 4.0, 0.0])}
+            for index in range(6)
+        ]
+        parked = [
+            {"timestamp": index * 0.6,
+             "world": np.array([0.1 * (index % 2), 0.0])}
+            for index in range(6)
+        ]
+        moving_stats = track_motion_stats(moving)
+        parked_stats = track_motion_stats(parked)
+        self.assertTrue(is_moving_seed(moving_stats, config))
+        self.assertFalse(is_moving_seed(parked_stats, config))
+        self.assertTrue(is_pure_static(parked_stats, config))
+        self.assertFalse(is_pure_static(moving_stats, config))
+
+    def test_weak_moving_seed_accepts_short_start(self):
+        config = Step45Config()
+        start = [
+            {"timestamp": index * 0.3,
+             "world": np.array([index * 0.8, 0.0])}
+            for index in range(5)
+        ]
+        stats = track_motion_stats(start)
+        self.assertTrue(is_weak_moving_seed(stats, config))
+
+    def test_queue_stitch_merges_sequential_fragments(self):
+        source = frames(
+            [[det("Car", 0.0, 0.0, 1)]]
+            + [[det("Car", index * 2.0, 0.0, 1)] for index in range(1, 6)]
+            + [[det("Car", 10.0, 0.0, 2)] for _ in range(4)]
+        )
+        with TemporaryDirectory() as directory:
+            coords = make_coords(Path(directory))
+            tracks, _ = collect_world_tracks(source, coords)
+            config = Step45Config()
+            mask = DynamicRegionMask.from_polygons(
+                [[(-20.0, -20.0), (40.0, -20.0),
+                  (40.0, 20.0), (-20.0, 20.0)]], resolution=1.0)
+            direction = {
+                "direction_id": 0,
+                "origin": [0.0, 0.0],
+                "forward": [1.0, 0.0],
+                "right": [0.0, 1.0],
+            }
+            assignments = {
+                1: {"direction_id": 0, "movement": "straight"},
+                2: {"direction_id": 0, "movement": None},
+            }
+            with mock.patch(
+                    "region.retrack._direction_assignments",
+                    return_value=([direction], assignments)):
+                result = queue_stitch(
+                    source, tracks, {}, mask, {1}, config)
+        self.assertTrue(result["merges"])
+        ids = {det["track_id"] for frame in source
+               for det in frame["detections"]}
+        self.assertEqual(ids, {1})
+
+    def test_queue_stitch_does_not_merge_time_overlap(self):
+        source = frames([
+            [det("Car", 0.0, 0.0, 1), det("Car", 0.0, 8.0, 2)]
+            for _ in range(5)
+        ])
+        with TemporaryDirectory() as directory:
+            coords = make_coords(Path(directory))
+            tracks, _ = collect_world_tracks(source, coords)
+            config = Step45Config()
+            mask = DynamicRegionMask.from_polygons(
+                [[(-20.0, -20.0), (20.0, -20.0),
+                  (20.0, 20.0), (-20.0, 20.0)]], resolution=1.0)
+            direction = {
+                "direction_id": 0, "origin": [0.0, 0.0],
+                "forward": [1.0, 0.0], "right": [0.0, 1.0],
+            }
+            assignments = {
+                1: {"direction_id": 0, "movement": None},
+                2: {"direction_id": 0, "movement": None},
+            }
+            with mock.patch(
+                    "region.retrack._direction_assignments",
+                    return_value=([direction], assignments)):
+                result = queue_stitch(
+                    source, tracks, {}, mask, {1}, config)
+        self.assertFalse(result["merges"])
+
+    def test_turn_extension_uses_swept_area_forward(self):
+        config = DynamicRegionConfig()
+        # A left-turning track: first half straight east, then turns north.
+        points = []
+        heading = 0.0
+        current = np.array([0.0, 0.0])
+        for index in range(55):
+            if index == 30:
+                heading = math.radians(60.0)
+            current = current + 0.5 * np.array(
+                [math.cos(heading), math.sin(heading)])
+            points.append({
+                "timestamp": index * 0.4,
+                "world": current.copy(),
+                "yaw": heading,
+                "size": np.array([4.5, 2.0, 1.6]),
+                "class_name": "Car",
+            })
+        straight = [
+            {
+                "timestamp": index * 0.4,
+                "world": np.array([index * 1.0, 0.0]),
+                "yaw": 0.0,
+                "size": np.array([4.5, 2.0, 1.6]),
+                "class_name": "Car",
+            }
+            for index in range(20)
+        ]
+        straight_extended, straight_details = _extend_track(straight, config)
+        turn_extended, turn_details = _extend_track(points, config)
+        self.assertTrue(any(
+            item.get("synthetic_extension") for item in straight_extended))
+        self.assertTrue(any(
+            detail.get("kind") == "straight_extension"
+            for detail in straight_details))
+        turn_forward = [
+            detail for detail in turn_details
+            if detail.get("end") == "end"
+            and detail.get("kind") == "straight_extension"
+        ]
+        self.assertFalse(turn_forward)
+        self.assertTrue(any(
+            detail.get("kind") == "left_turn_tail"
+            for detail in turn_details))
+
+    def test_movement_gate_and_lane_change_limit(self):
+        config = Step45Config()
+        # straight -> left is only allowed as a left-side lane change <=5m.
+        self.assertTrue(_movement_compatible(
+            "straight", "left", 0.0, -1.0, config))
+        self.assertFalse(_movement_compatible(
+            "straight", "left", 0.0, 5.5, config))
+        # right turn is hard-gated to the right side only.
+        self.assertTrue(_movement_compatible(
+            "straight", "right", 0.0, 1.0, config))
+        self.assertFalse(_movement_compatible(
+            "straight", "right", 0.0, -1.0, config))
 
 
 if __name__ == "__main__":

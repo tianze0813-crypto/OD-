@@ -47,6 +47,26 @@ class Step45Config:
         default_factory=TrafficLightConfig)
     # Re-track association.
     dynamic_max_gap_sec: float = 1.8
+    # Moving seed / pure static classification (PLAN section 19).
+    moving_seed_net_min_m: float = 8.0
+    moving_seed_concentration_min: float = 0.5
+    moving_seed_duration_min_sec: float = 3.0
+    moving_seed_low_speed_floor_mps: float = 1.0
+    # Weak moving seed: short start / low-speed pull-away (e.g. clip6 7->387).
+    # It is used as a queue stitch anchor and as a small region seed.
+    weak_seed_net_min_m: float = 2.0
+    weak_seed_concentration_min: float = 0.8
+    weak_seed_duration_min_sec: float = 1.0
+    weak_seed_low_speed_floor_mps: float = 1.0
+    static_net_max_m: float = 1.0
+    static_span_max_m: float = 1.0
+    static_step_max_m: float = 1.0
+    # Queue / same-vehicle stitching.
+    queue_longitudinal_gap_m: float = 20.0
+    queue_stitch_position_tolerance_m: float = 1.5
+    queue_stitch_lateral_tolerance_m: float = 5.0
+    lane_change_max_lateral_m: float = 5.0
+    left_turn_tail_arc_length_m: float = 5.0
     # ID inheritance / slot release.
     boundary_max_gap_sec: float = 2.0
     boundary_max_distance_m: float = 3.5
@@ -123,6 +143,99 @@ def collect_world_tracks(
     return dict(tracks), by_key
 
 
+def track_motion_stats(
+        items: Sequence[Mapping[str, Any]],
+) -> Optional[Dict[str, float]]:
+    """Net displacement / span / speed statistics used by the 19.x rules."""
+    ordered = sorted(items, key=lambda item: item["timestamp"])
+    if len(ordered) < 2:
+        return None
+    centers = np.asarray([item["world"] for item in ordered], dtype=np.float64)
+    median = np.median(centers, axis=0)
+    radii = np.linalg.norm(centers - median, axis=1)
+    steps = np.linalg.norm(np.diff(centers, axis=0), axis=1)
+    times = np.asarray([item["timestamp"] for item in ordered],
+                       dtype=np.float64)
+    intervals = np.diff(times)
+    valid = intervals > 1e-3
+    speeds = (steps[valid] / intervals[valid]
+              if np.any(valid) else np.zeros(0, dtype=np.float64))
+    path = float(np.sum(steps))
+    net = float(np.linalg.norm(centers[-1] - centers[0]))
+    duration = float(times[-1] - times[0])
+    return {
+        "observations": len(ordered),
+        "duration": round(duration, 4),
+        "path": round(path, 4),
+        "net": round(net, 4),
+        "concentration": round(net / max(path, 1e-9), 4),
+        "median_span": round(float(np.median(radii)), 4),
+        "max_span": round(float(np.max(radii)), 4),
+        "p90_span": round(float(np.percentile(radii, 90.0)), 4),
+        "max_step": round(float(np.max(steps)) if len(steps) else 0.0, 4),
+        "p90_speed": round(float(np.percentile(speeds, 90.0))
+                           if len(speeds) else 0.0, 4),
+        "median_speed": round(float(np.median(speeds))
+                              if len(speeds) else 0.0, 4),
+    }
+
+
+def is_moving_seed(stats: Mapping[str, Any], config: Step45Config) -> bool:
+    """Low-speed-but-clearly-moving seed (PLAN 19.1)."""
+    return (
+        float(stats["net"]) >= float(config.moving_seed_net_min_m)
+        and float(stats["concentration"])
+        >= float(config.moving_seed_concentration_min)
+        and float(stats["duration"]) >= float(config.moving_seed_duration_min_sec)
+        and float(stats["p90_speed"])
+        >= float(config.moving_seed_low_speed_floor_mps)
+    )
+
+
+def is_weak_moving_seed(
+        stats: Mapping[str, Any],
+        config: Step45Config,
+) -> bool:
+    """Short but clear start / pull-away fragment (PLAN 19 edge case)."""
+    return (
+        float(stats["net"]) >= float(config.weak_seed_net_min_m)
+        and float(stats["concentration"])
+        >= float(config.weak_seed_concentration_min)
+        and float(stats["duration"]) >= float(config.weak_seed_duration_min_sec)
+        and float(stats["p90_speed"])
+        >= float(config.weak_seed_low_speed_floor_mps)
+    )
+
+
+def is_pure_static(stats: Mapping[str, Any], config: Step45Config) -> bool:
+    """Pure parking / stationary jitter (PLAN 19.2)."""
+    return (
+        float(stats["net"]) < float(config.static_net_max_m)
+        and float(stats["max_span"]) < float(config.static_span_max_m)
+        and float(stats["max_step"]) < float(config.static_step_max_m)
+    )
+
+
+def seed_track_ids(
+        tracks: Mapping[int, Sequence[Mapping[str, Any]]],
+        region_config: DynamicRegionConfig,
+        config: Step45Config,
+) -> Dict[int, Dict[str, Any]]:
+    """Strong (high-speed) + moving seeds used for region / re-tracking."""
+    seeds: Dict[int, Dict[str, Any]] = {}
+    for track_id, items in tracks.items():
+        stats = track_motion_stats(items)
+        if stats is None:
+            continue
+        high_speed_stats = _track_speed_stats(items, region_config)
+        strong = (high_speed_stats is not None
+                  and _is_high_speed(high_speed_stats, region_config))
+        if (strong or is_moving_seed(stats, config)
+                or is_weak_moving_seed(stats, config)):
+            seeds[int(track_id)] = stats
+    return seeds
+
+
 def candidate_track_ids(
         tracks: Mapping[int, Sequence[Mapping[str, Any]]],
         config: DynamicRegionConfig,
@@ -142,6 +255,7 @@ def build_region(
         tracks: Mapping[int, Sequence[Mapping[str, Any]]],
         static_slots: Sequence[Mapping[str, Any]],
         config: DynamicRegionConfig,
+        accepted_track_ids: Optional[set[int]] = None,
 ) -> DynamicRegionResult:
     """Build the reviewed buffer-free dynamic region."""
     reference_points = np.asarray([
@@ -150,7 +264,9 @@ def build_region(
     ], dtype=np.float64).reshape(-1, 2)
     return build_dynamic_regions(
         tracks, static_slots=static_slots,
-        reference_points=reference_points, config=config)
+        reference_points=reference_points,
+        accepted_track_ids=accepted_track_ids,
+        config=config)
 
 
 def region_mask(result: DynamicRegionResult,
@@ -685,6 +801,353 @@ def inherit_ids(
         "physical_violations": physical_violations,
         "next_id": int(next_id),
         "tracks_total": len(all_ids),
+    }
+
+
+def _direction_assignments(
+        by_final_id: Mapping[int, Sequence[Mapping[str, Any]]],
+        config: Step45Config,
+) -> Tuple[List[Dict[str, Any]], Dict[int, Dict[str, Any]]]:
+    """Direction/movement context plus geometric fallback for static tracks."""
+    model_tracks = {
+        final_id: [
+            {
+                "timestamp": float(item["timestamp"]),
+                "world": np.asarray(item["world"], dtype=np.float64),
+                "yaw": float(item["yaw"]),
+                "size": np.asarray(item["size"], dtype=np.float64),
+                "class_name": str(item.get("class_name", "Car")),
+            }
+            for item in sorted(items, key=lambda value: value["timestamp"])
+        ]
+        for final_id, items in by_final_id.items() if len(items) >= 2
+    }
+    result = build_traffic_light_model(
+        model_tracks, config=config.traffic_light)
+    directions = list(
+        result.diagnostics.get("direction_phase", {}).get("directions", []))
+    classification = {
+        int(item["track_id"]): item for item in result.track_classification
+        if item.get("track_id") is not None
+    }
+    direction_points: Dict[int, List[np.ndarray]] = defaultdict(list)
+    for track_id, item in classification.items():
+        items = by_final_id.get(int(track_id), [])
+        if not items:
+            continue
+        center = np.median(
+            np.asarray([value["world"] for value in items], dtype=np.float64),
+            axis=0)
+        direction_points[int(item.get("direction_id", -1))].append(center)
+
+    assignments: Dict[int, Dict[str, Any]] = {}
+    for final_id, items in by_final_id.items():
+        final_id = int(final_id)
+        info = classification.get(final_id)
+        if (info is not None and info.get("movement")
+                and info.get("direction_id") is not None):
+            assignments[final_id] = {
+                "direction_id": int(info["direction_id"]),
+                "movement": str(info["movement"]),
+                "heading_deg": info.get("stable_heading_deg"),
+            }
+            continue
+        center = np.median(
+            np.asarray([value["world"] for value in items], dtype=np.float64),
+            axis=0)
+        best: Optional[Tuple[float, int]] = None
+        for direction in directions:
+            points = direction_points.get(int(direction["direction_id"]))
+            if not points:
+                continue
+            distance = min(float(np.linalg.norm(center - point))
+                           for point in points)
+            if best is None or distance < best[0]:
+                best = (distance, int(direction["direction_id"]))
+        assignments[final_id] = {
+            "direction_id": None if best is None else best[1],
+            "movement": None,
+        }
+    return directions, assignments
+
+
+def _movement_compatible(
+        movement_a: Optional[str],
+        movement_b: Optional[str],
+        v_a: float,
+        v_b: float,
+        config: Step45Config,
+) -> bool:
+    """PLAN 19.6 movement matrix / lane-change / right-turn gate."""
+    if not movement_a or not movement_b or movement_a == movement_b:
+        if movement_a == "right" or movement_b == "right":
+            # Right turn is only allowed on the right side of the other lane.
+            return abs(v_a - v_b) <= float(config.lane_change_max_lateral_m)
+        return True
+    movement_pair = {movement_a, movement_b}
+    lateral = abs(v_a - v_b)
+    if movement_pair == {"left", "straight"}:
+        if lateral > float(config.lane_change_max_lateral_m):
+            return False
+        left_v = v_a if movement_a == "left" else v_b
+        straight_v = v_b if movement_a == "left" else v_a
+        return left_v <= straight_v
+    if movement_pair == {"right", "straight"}:
+        if lateral > float(config.lane_change_max_lateral_m):
+            return False
+        right_v = v_a if movement_a == "right" else v_b
+        straight_v = v_b if movement_a == "right" else v_a
+        return right_v >= straight_v
+    if movement_pair == {"left", "right"}:
+        return False
+    return True
+
+
+def queue_stitch(
+        frames: List[Dict[str, Any]],
+        tracks: Mapping[int, Sequence[Mapping[str, Any]]],
+        step2_diagnostics: Mapping[str, Any],
+        mask: DynamicRegionMask,
+        seed_ids: set[int],
+        config: Step45Config,
+) -> Dict[str, Any]:
+    """PLAN 19.4-19.6 queue-based same-vehicle stitching.
+
+    The three reviewed conditions are hard:
+
+    * same direction / queue;
+    * the two fragments must not overlap in time;
+    * the later fragment must start at the earlier fragment's end position.
+    """
+    by_final: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for items in tracks.values():
+        for item in items:
+            final_id = item["det"].get("track_id")
+            if final_id is not None:
+                by_final[int(final_id)].append(item)
+    for items in by_final.values():
+        items.sort(key=lambda value: value["timestamp"])
+    if len(by_final) < 2:
+        return {"queues": 0, "edges": 0, "merges": [], "modified_keys": []}
+    stats = {final_id: track_motion_stats(items)
+             for final_id, items in by_final.items()}
+
+    directions, assignments = _direction_assignments(by_final, config)
+    direction_by_id = {int(item["direction_id"]): item for item in directions}
+
+    # Build queues: cluster lateral lanes first (lane width ~3.5m), then
+    # group longitudinal neighbours <=20m inside each lane.
+    queues: List[List[Tuple[float, float, int]]] = []
+    for direction in directions:
+        direction_id = int(direction["direction_id"])
+        origin = np.asarray(direction["origin"], dtype=np.float64)
+        forward = np.asarray(direction["forward"], dtype=np.float64)
+        right = np.asarray(direction["right"], dtype=np.float64)
+        rows: List[Tuple[float, float, int]] = []
+        for final_id, assignment in assignments.items():
+            if assignment.get("direction_id") != direction_id:
+                continue
+            items = by_final.get(final_id)
+            if not items:
+                continue
+            center = np.median(
+                np.asarray([value["world"] for value in items],
+                           dtype=np.float64), axis=0)
+            u = float(np.dot(center - origin, forward))
+            v = float(np.dot(center - origin, right))
+            rows.append((u, v, final_id))
+        rows.sort(key=lambda row: row[1])
+        lane_clusters: List[List[Tuple[float, float, int]]] = []
+        for row in rows:
+            if (not lane_clusters
+                    or abs(row[1] - lane_clusters[-1][-1][1]) > 3.5):
+                lane_clusters.append([row])
+            else:
+                lane_clusters[-1].append(row)
+        for cluster in lane_clusters:
+            cluster.sort(key=lambda row: row[0])
+            current: List[Tuple[float, float, int]] = []
+            for row in cluster:
+                if not current:
+                    current = [row]
+                    continue
+                previous = current[-1]
+                if abs(row[0] - previous[0]) \
+                        <= float(config.queue_longitudinal_gap_m):
+                    current.append(row)
+                else:
+                    queues.append(current)
+                    current = [row]
+            if current:
+                queues.append(current)
+
+    parent = {final_id: final_id for final_id in by_final}
+
+    def find(value: int) -> int:
+        while parent[value] != value:
+            parent[value] = parent[parent[value]]
+            value = parent[value]
+        return value
+
+    edges: List[Dict[str, Any]] = []
+    for queue in queues:
+        for i in range(len(queue)):
+            for j in range(i + 1, len(queue)):
+                _u1, v_1, id_1 = queue[i]
+                _u2, v_2, id_2 = queue[j]
+                items_1 = by_final[id_1]
+                items_2 = by_final[id_2]
+                # Determine the earlier-end -> later-start order explicitly;
+                # queue rows are sorted by longitudinal position, not time.
+                if items_1[-1]["timestamp"] < items_2[0]["timestamp"]:
+                    id_a, id_b = id_1, id_2
+                    items_a, items_b = items_1, items_2
+                    v_a, v_b = v_1, v_2
+                elif items_2[-1]["timestamp"] < items_1[0]["timestamp"]:
+                    id_a, id_b = id_2, id_1
+                    items_a, items_b = items_2, items_1
+                    v_a, v_b = v_2, v_1
+                else:
+                    continue
+                a_end = items_a[-1]
+                b_start = items_b[0]
+                direction_id = assignments[id_a].get("direction_id")
+                direction = (direction_by_id.get(int(direction_id))
+                             if direction_id is not None else None)
+                if direction is None:
+                    continue
+                origin = np.asarray(direction["origin"], dtype=np.float64)
+                forward = np.asarray(direction["forward"], dtype=np.float64)
+                u_end = float(np.dot(
+                    np.asarray(a_end["world"], dtype=np.float64) - origin,
+                    forward))
+                u_start = float(np.dot(
+                    np.asarray(b_start["world"], dtype=np.float64) - origin,
+                    forward))
+                if u_start + float(
+                        config.queue_stitch_position_tolerance_m) < u_end:
+                    continue
+                bridge = float(np.linalg.norm(
+                    np.asarray(b_start["world"], dtype=np.float64)
+                    - np.asarray(a_end["world"], dtype=np.float64)))
+                if bridge > float(config.queue_stitch_position_tolerance_m):
+                    continue
+                if abs(float(v_a) - float(v_b)) \
+                        > float(config.queue_stitch_lateral_tolerance_m):
+                    continue
+                # Only stitch inside/near the dynamic region.
+                end_inside = mask.contains_point(
+                    float(a_end["world"][0]), float(a_end["world"][1]))
+                start_inside = mask.contains_point(
+                    float(b_start["world"][0]), float(b_start["world"][1]))
+                if not end_inside and not start_inside:
+                    continue
+                movement_a = assignments[id_a].get("movement")
+                movement_b = assignments[id_b].get("movement")
+                if not _movement_compatible(
+                        movement_a, movement_b, float(v_a), float(v_b),
+                        config):
+                    continue
+                blocked = False
+                for _u_c, _v_c, id_c in queue:
+                    if id_c in (id_a, id_b):
+                        continue
+                    items_c = by_final[id_c]
+                    c_start, c_end = items_c[0], items_c[-1]
+                    if not (a_end["timestamp"] < c_start["timestamp"]
+                            and c_end["timestamp"] < b_start["timestamp"]):
+                        continue
+                    center_c = np.median(
+                        np.asarray([value["world"] for value in items_c],
+                                   dtype=np.float64), axis=0)
+                    u_c = float(np.dot(center_c - origin, forward))
+                    if min(u_end, u_start) - 2.0 <= u_c \
+                            <= max(u_end, u_start) + 2.0:
+                        blocked = True
+                        break
+                if blocked:
+                    continue
+                edges.append({
+                    "from": int(id_a),
+                    "to": int(id_b),
+                    "bridge_m": round(bridge, 4),
+                    "movement_a": movement_a,
+                    "movement_b": movement_b,
+                    "direction_id": int(direction_id),
+                })
+                root_a, root_b = find(int(id_a)), find(int(id_b))
+                if root_a != root_b:
+                    parent[root_b] = root_a
+
+    components: Dict[int, List[int]] = defaultdict(list)
+    for final_id in by_final:
+        components[find(final_id)].append(final_id)
+
+    merges: List[Dict[str, Any]] = []
+    modified_keys: List[Tuple[int, int]] = []
+    occupancy: Dict[int, set[int]] = defaultdict(set)
+    for final_id, items in by_final.items():
+        for item in items:
+            occupancy[item["frame_index"]].add(int(final_id))
+
+    for members in components.values():
+        if len(members) < 2:
+            continue
+        members = sorted(members)
+        # A queue component must contain at least one clear moving seed and
+        # every pair of its members must be time-disjoint.
+        has_seed = False
+        for member in members:
+            member_stats = stats.get(member)
+            if member_stats is None:
+                continue
+            if (member in seed_ids
+                    or is_moving_seed(member_stats, config)
+                    or is_weak_moving_seed(member_stats, config)):
+                has_seed = True
+                break
+        if not has_seed:
+            continue
+        time_conflict = False
+        for i in range(len(members)):
+            a_items = by_final[members[i]]
+            for j in range(i + 1, len(members)):
+                b_items = by_final[members[j]]
+                if (a_items[0]["timestamp"] < b_items[-1]["timestamp"]
+                        and b_items[0]["timestamp"] < a_items[-1]["timestamp"]):
+                    time_conflict = True
+                    break
+            if time_conflict:
+                break
+        if time_conflict:
+            continue
+        member_set = set(members)
+        counts = {member: len(by_final[member]) for member in members}
+        chosen = max(members, key=lambda member: (counts[member], -member))
+        collision = any(
+            chosen in (occupancy[item["frame_index"]] - member_set)
+            for member in members for item in by_final[member])
+        if collision:
+            continue
+        for member in members:
+            for item in by_final[member]:
+                item["det"]["track_id"] = int(chosen)
+                item["det"]["_step45_queue_stitched"] = True
+                modified_keys.append((item["frame_index"],
+                                      item["detection_index"]))
+                occupancy[item["frame_index"]].discard(int(member))
+                occupancy[item["frame_index"]].add(int(chosen))
+        merges.append({
+            "members": [int(member) for member in members],
+            "final_id": int(chosen),
+            "detections": sum(counts.values()),
+        })
+    return {
+        "queues": len(queues),
+        "edges": len(edges),
+        "merges": merges,
+        "modified_keys": modified_keys,
+        "direction_assignments": assignments,
     }
 
 

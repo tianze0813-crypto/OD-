@@ -644,9 +644,11 @@ center span < 1m
 
 ### 19.3 动态区域与左转小尾巴
 
-- 动态区域 = 强 seed + moving seed 的 swept box（`buffer=0`）
-  + 稳定方向两端 30m 直线延伸。
-- 左转 seed：在延伸末端加一段 **弧长约 5m** 的小尾巴（替代原来的 8m），
+- 动态区域 = 强 seed + moving seed 的 swept box（`buffer=0`）。
+- **直行 seed：稳定方向两端各延伸 30m。**
+- **转弯 seed（左转 / 右转）：不向前延伸 30m，向前只用实际 swept area；
+  向后按队列长度（20m）延伸。**
+- 左转 seed：在末端加一段 **弧长约 5m** 的小尾巴（替代原来的 8m），
   用来覆盖待转区 / 等待左转的位置和转弯路径。
 - 对向车道（如 car68）由方向 / lane gate 排除，不进入本方向 queue。
 
