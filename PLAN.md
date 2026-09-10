@@ -570,3 +570,161 @@ scene_crossroad_my_record_20260827_164838_clip6
   保留 detector 原始值”的决策执行，若后续发现某类急转弯 detector yaw
   不可信，可在 step2 增加“确认转弯”平滑，而不是恢复整段 motion heading。
 - 运动遮挡 gap 不主动 stitching，避免两车变一车；需要时再单独评估。
+
+---
+
+## 19. 队列 / movement / moving seed 对齐（2026-09-09 晚）
+
+> 本节是第 5 / 8 节的补充和部分替代：high-speed candidate 只作为“强 seed”，
+> 不再作为唯一的动态区域 / 重跟踪入口；纯静态冻结和路口等待语义改为
+> moving seed + 车道队列 + 双重队列判断。
+
+### 19.1 moving seed（低速动态目标）
+
+moving seed 不再要求 `p90_speed >= 5 m/s`。判据：
+
+```text
+net_displacement >= 8~10m
+net / path      >= 0.5
+duration        >= 3s
+p90_speed       >= low_speed_floor        # 暂定 1.0~1.5 m/s，待定
+至少若干步持续位移 > 0.5m
+```
+
+说明：
+
+- `path` 是累计移动距离，抖动会累加；**静止/移动判断必须用 net 位移和 center span**。
+- high-speed candidate（`p90>=5m/s`、`high_speed_steps>=3`）继续保留为强 seed，
+  但不再是唯一 seed。
+- 示例：
+  - car29：net=19.35m, span=10.62m, p90=3.25m/s → moving seed；
+  - car142：net=17.89m, span=13.25m, p90=2.26m/s → moving seed；
+  - id22（163412 停车区）：path=12.24m 但 net=0.028m, span=0.75m → 不是 seed。
+
+### 19.2 纯静态冻结 / 解冻
+
+冻结条件：
+
+```text
+net        < 1m
+center span < 1m
+每步位移无 >1m 的突跳
+且在密集 slot / 非运动区域里没有长连续历史就“突然出现”
+→ 默认冻结
+```
+
+解冻条件（hard，冻结容易解冻难）：
+
+1. 自身有长连续轨迹：
+
+   ```text
+   net >= 8~10m
+   net/path >= 0.5
+   duration >= 3s
+   p90 >= low_speed_floor
+   ```
+
+2. 由已确认的 moving seed / 同 lane 的 queue 带出来：
+
+   ```text
+   同 lane / queue
+   + 时间不重叠
+   + 纵向顺序
+   + 前后位置连续
+   ```
+
+纯停车绝不参与 stitching。090400 与 163412 远处停车区的数据：
+
+```text
+090400_clip1/2 纯静止轨迹 max_span 0.11~0.51m
+163412_clip1 远处停车区 ID 8~23 max_span <= 0.75m, net <= 0.58m
+```
+
+1m 的 net / span 门限是安全的。
+
+### 19.3 动态区域与左转小尾巴
+
+- 动态区域 = 强 seed + moving seed 的 swept box（`buffer=0`）
+  + 稳定方向两端 30m 直线延伸。
+- 左转 seed：在延伸末端加一段 **弧长约 5m** 的小尾巴（替代原来的 8m），
+  用来覆盖待转区 / 等待左转的位置和转弯路径。
+- 对向车道（如 car68）由方向 / lane gate 排除，不进入本方向 queue。
+
+### 19.4 方向 / lane / queue
+
+- 方向：沿用 `direction_phase` 的方向 / 轴输出。
+- lane：同一方向内的 movement lane（left / straight / right）。
+- queue（车队）：
+  - 同一 lane 上，纵向相邻成员距离 <=20m 归入同一 queue；
+  - member = 一辆车的一段时间连续片段；
+  - queue state = `moving / stopped / waiting`。
+- 双重队列判断：
+  - 本 queue 前进 + 隔壁 queue 停止 → 隔壁等待；
+  - 本 queue 停止 + 隔壁 queue 前进 → 本 queue 等待；
+  - 两个都停 → 红灯 / 未知；
+  - 两个都前进 → 正常通行（右转允许）。
+  - 主要相邻对：`left <-> straight`、`straight <-> right`。
+
+### 19.5 同一辆车的拼接（queue 内）
+
+不使用单对 track 的 gap 阈值，改为：
+
+```text
+同 lane / queue
++ 时间不重叠（hard）
++ 纵向顺序
++ 前后位置连续（误差 <= 1~1.5m）
++ 中间没有其他 member 占用同一纵向位置
+→ 判为同一辆车，可拼接
+```
+
+- car29 → car14：时间不重叠、位置差 ~0.5m → 拼；
+- car142 → car356 → car456：互不重叠、位置连续 → 拼；
+- car5 与 car29：22 帧时间重叠、位置差 ~8m → 两辆车，绝不拼。
+
+### 19.6 movement 兼容矩阵 / 变道 / 右转
+
+```text
+straight lane ↔ straight 检测：允许
+rightmost lane ↔ right 检测：允许（右转常绿，硬 gate 只允许最右侧一条）
+left lane ↔ left 检测：
+    仅左转相位 / 待转区许可 / queue 已确认 waiting
+straight lane ↔ left 检测：禁止（硬 gate，不能直行流突然左转）
+任意方向 ↔ 对向车道检测：禁止
+```
+
+变道：
+
+- 允许同方向内变道 / 超车（例如左转前从 straight 变到 left）；
+- **一次只允许跨 1 条 lane**；
+- **横向位移 <= 5m**（正常车道 3.5m；超过 5m 一律禁止，作为
+  “不可到对向车道”的简化硬约束）；
+- 变道必须连续、平缓，不能单帧跳；
+- movement 兼容项用 hard gate；变道用有条件放行 / 高成本，不直接禁死。
+
+### 19.7 Pass1 / Pass2（都放在 step4.5）
+
+```text
+Pass 1（整体）:
+  step4 car-only
+  → moving seed
+  → 动态区域 + 30m 直线 + 左转 5m 小尾巴
+  → 方向 → movement lane → queue
+  → queue 状态时间轴
+
+Pass 2（局部）:
+  → 同 lane / queue 内按 19.5 做同一辆车拼接
+  → 双重 queue 判断等待 / 放行
+  → movement 兼容矩阵 + 变道规则（hard gate）
+  → 对向车道 / 跨方向 gate
+  → 输出最终 ID；纯静态、区域外、时间重叠 track 不参与
+```
+
+### 19.8 待定 / 后续微调
+
+- `low_speed_floor` 具体值：1.0 还是 1.5 m/s；
+- moving seed 的 net 阈值：8m 还是 10m；
+- queue state 的速度 / 位移门限；
+- 变道连续性的具体横向速度 / heading 阈值；
+- 左转 5m 弧长对应的半径：可后续查标准转弯区尺寸（用户建议可上网查标准）；
+- queue 跨停止线 / 进入路口后的建模细节。
