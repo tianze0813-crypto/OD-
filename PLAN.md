@@ -553,7 +553,7 @@ scene_crossroad_my_record_20260827_164838_clip6
 
 ### 验证
 
-- 单元测试：`98 tests, OK`。
+- 单元测试：`115 tests, OK`（截至 2026-09-10 横向门限 / 最终轨迹 yaw 改动后）。
 - 5 个验收 clip（`~/桌面/new/`）全链路：
   - step1 推理 → step2 → step3 → step4 → step4.5 → step5；
   - `090400_clip1/2`、`163412_clip1`、`164838_clip5_pre`、`164838_clip6`
@@ -776,12 +776,17 @@ Pass 2（局部）:
   - 纯停车 track 不参与；
   - 示例：clip5 car130 vs car34，IoU=0.0382，点 14 vs 202，
     删除 car130 的 t=655.8 帧。
-- **yaw 反转（启用，放在最终 ID 定下来之后）**：
-  - 用整条最终运动轨迹的 robust heading；
-  - 每帧计算 directed `yaw - heading`（wrap 到 [-pi, pi]）；
-  - 若 track 的中位 `|directed| > 150°`，整条 track 的 yaw 加 pi；
+- **yaw 反转（启用，放在最终 ID 定下来之后，2026-09-10 改为最终轨迹直比）**：
+  - 最终 ID 的最终运动轨迹取**首观测中心 -> 末观测中心**方向，得到一个
+    trajectory heading；
+  - **不再对每帧 `|yaw - heading|` 取中位数 / 投票**；
+  - 每个 detection 的 yaw 直接与最终 trajectory heading 比较，
+    directed `yaw - heading`（wrap 到 [-pi, pi]）绝对值 >90° 时，
+    **这一帧**自己加 pi（即选择离最终轨迹更近的 π 等价表示）；
+  - 90° 是最近的 π 等价分界；这样不会因为多数帧方向不同而把本来
+    正确的少数帧也整条翻掉；
   - 位置 / 尺寸 / 中心不动，不重跑 box fit；
-  - 纯停车不参与。
+  - 纯停车、净位移 <1m 的 track 不参与。
 - **moving fragment seed**：暂不加入；如果 130→55 在 pass2 拼不上，
   就保持分开，等后续需要再评估。
 
@@ -829,3 +834,34 @@ Pass 2（局部）:
 - 新增硬断言 `verify_unique_frame_ids`：step4.5 输出任何一帧出现重复
   track_id 直接报错。
 - 修复后重跑生产 clip2 / clip3 / clip10，同帧重复 ID 清零。
+
+### 19.15 step4.5-only 横向跳变保护（2026-09-10）
+
+- **只加在 step4.5**：`Step45Config.lateral_jump_gate_enabled = True`；
+  step2 的 `ConservativeTracker` 默认仍关闭，静态 / step2 行为不变。
+- 关联规则：track 已有最近两帧观测形成的运动轴（位移 >=0.5m）时，
+  候选 detection 中心到该运动轴的**横向偏移 > 2.5m** 一律拒绝；
+  候选自然落到 unmatched -> 发新 ID。
+- 该门限只约束横向 teleport，不替代现有：
+  - `position_jump_gate`（纵向可达距离物理包络）；
+  - `reverse_step_gate`；
+  - 速度 / 加速度 / 距离 / Mahalanobis 连续性。
+- 参数：
+  ```text
+  lateral_jump_gate_enabled = True
+  lateral_jump_max_m = 2.5
+  lateral_jump_min_prior_step_m = 0.5
+  ```
+- 同一门限同时用于 step4.5 的 fragment 拼接，避免 tracker 拆开后又
+  被后续步骤合回：
+  - `inherit_ids` 的 `_continuity_ok` / fallback 继承；
+  - `queue_stitch` 的 queue 边 / component 合并；
+  - `phase_stitch` 的相位拼接桥。
+- 拼接桥的横向参考轴优先取“较早片段最后一帧的运动方向”；如果较早片段
+  没有可用运动方向（例如停车锚点），再用较晚片段第一帧的出射方向。
+- 时间上有交叠 / 交错插入的片段不能按单点桥判断：会先把合并后的观测
+  按时间排序，再逐步检查每个相邻 step 是否超过 2.5m 横向偏移。
+- `queue_stitch` 在 component 真正回写 ID 前，还会对 component 全部成员
+  的合并后序列再做一次同样的横向连续性检查。
+- 目的：部分车辆在 ID 追踪时出现横向 3m 左右跳变；纵向距离门限可能
+  放行这种“时间可达但车道不可达”的错误关联，现在由横向门限拒绝。

@@ -12,6 +12,8 @@ from region.dynamic_region import DynamicRegionConfig, _extend_track
 from region.region_mask import DynamicRegionMask
 from region.retrack import (
     Step45Config,
+    _combined_merge_lateral_ok,
+    _lateral_jump_ok,
     _movement_compatible,
     align_dynamic_yaw,
     build_region,
@@ -27,6 +29,7 @@ from region.retrack import (
     queue_stitch,
     region_mask,
     retrack_dynamic,
+    revert_dynamic_yaw,
     select_retrackable,
     track_motion_stats,
     verify_static_freeze,
@@ -384,6 +387,138 @@ class Step45RetrackTest(unittest.TestCase):
         ids = {det["track_id"] for frame in output
                for det in frame["detections"]}
         self.assertGreater(len(ids), 1)
+
+    def test_retrack_lateral_jump_gate_rejects_sideways_step(self):
+        def make_frame(timestamp, x, y):
+            return {
+                "frame_id": str(timestamp),
+                "num_points": 0,
+                "num_detections": 1,
+                "detections": [det("Car", x, y, None)],
+            }
+        positions = [(0.0, 0.0), (4.0, 0.0), (8.0, 0.0), (11.8, 2.6)]
+        timestamps = [index * 400000000 for index in range(len(positions))]
+        with TemporaryDirectory() as directory:
+            coords = make_coords(Path(directory))
+            disabled = ConservativeTracker(
+                coords, min_static_hits=10 ** 9,
+                dynamic_max_gap=1.8, use_yaw=False,
+                physical_position_jump_enabled=False,
+                lateral_jump_gate_enabled=False)
+            output, _diagnostics = disabled.process(
+                [make_frame(t, x, y)
+                 for t, (x, y) in zip(timestamps, positions)],
+                enable_stitching=False)
+        disabled_ids = {
+            detection["track_id"]
+            for frame in output for detection in frame["detections"]
+        }
+        self.assertEqual(disabled_ids, {1})
+
+        with TemporaryDirectory() as directory:
+            coords = make_coords(Path(directory))
+            enabled = ConservativeTracker(
+                coords, min_static_hits=10 ** 9,
+                dynamic_max_gap=1.8, use_yaw=False,
+                physical_position_jump_enabled=False,
+                lateral_jump_gate_enabled=True,
+                lateral_jump_max_m=2.5)
+            output, enabled_diagnostics = enabled.process(
+                [make_frame(t, x, y)
+                 for t, (x, y) in zip(timestamps, positions)],
+                enable_stitching=False)
+        enabled_ids = {
+            detection["track_id"]
+            for frame in output for detection in frame["detections"]
+        }
+        self.assertEqual(len(enabled_ids), 2)
+        self.assertEqual(
+            enabled_diagnostics["lateral_jump_triggered"], 1)
+
+    def test_inherit_ids_rejects_lateral_jump_bridge(self):
+        source = frames([
+            [det("Car", x, y, 1)]
+            for x, y in [(0.0, 0.0), (4.0, 0.0), (8.0, 0.0),
+                         (11.8, 2.6), (15.8, 2.6), (19.8, 2.6)]
+        ])
+        with TemporaryDirectory() as directory:
+            coords = make_coords(Path(directory))
+            tracks, _ = collect_world_tracks(source, coords)
+            retrackable = {
+                (frame_index, 0) for frame_index in range(len(source))}
+            config = Step45Config()
+            retrack_dynamic(source, coords, retrackable, config)
+            result = inherit_ids(
+                source, tracks, retrackable, {}, {}, config)
+        final_ids = [
+            detection["track_id"]
+            for frame in source for detection in frame["detections"]
+        ]
+        self.assertEqual(len(set(final_ids)), 2)
+        self.assertEqual(final_ids, [1, 1, 1, 2, 2, 2])
+        self.assertTrue(any(
+            assignment["reason"] == "new_id"
+            for assignment in result["assignments"]))
+
+    def test_merge_lateral_gate_uses_incoming_axis_and_order(self):
+        config = Step45Config()
+
+        def point(timestamp, x, y):
+            return {"timestamp": timestamp,
+                    "world": np.asarray([x, y], dtype=np.float64)}
+
+        incoming = [point(0.0, 0.0, 0.0), point(0.4, 4.0, 0.0)]
+        lateral = [point(1.0, 8.0, 3.0)]
+        # (4, 0) -> (8, 3) has 3m lateral offset from the incoming axis.
+        self.assertFalse(_lateral_jump_ok(incoming, lateral, config))
+        # Argument order must not hide the jump when fragments are passed
+        # newest-first.
+        self.assertFalse(_lateral_jump_ok(lateral, incoming, config))
+        # Interleaved insertion is validated on the combined time order.
+        existing = [point(0.0, 0.0, 0.0), point(0.4, 4.0, 0.0),
+                    point(1.0, 8.0, 0.0)]
+        inserted = [point(0.2, 3.5, 3.0)]
+        self.assertFalse(_combined_merge_lateral_ok(
+            existing, inserted, config))
+
+    def test_final_trajectory_yaw_uses_nearest_pi_equivalent(self):
+        def make_detection(x, yaw):
+            detection = det("Car", x, 0.0, 1)
+            detection["box_lidar"][6] = float(yaw)
+            detection["region"] = "dynamic"
+            detection["_step45_retracked"] = True
+            return detection
+
+        reversed_yaw = math.radians(120.0)
+        frames_input = [{
+            "frame_id": str(index * 400000000),
+            "num_points": 0,
+            "num_detections": 1,
+            "detections": [
+                make_detection(index * 4.0,
+                               reversed_yaw if index < 2 else 0.0)
+            ],
+        } for index in range(5)]
+        with TemporaryDirectory() as directory:
+            coords = make_coords(Path(directory))
+            tracks, _ = collect_world_tracks(frames_input, coords)
+            result = revert_dynamic_yaw(
+                frames_input, tracks, Step45Config())
+        # A whole-track median vote would leave 120 deg untouched
+        # (median deviation = 0).  The nearest-pi-equivalent rule must
+        # rewrite only those two to -60 deg.
+        self.assertEqual(result["reversed_detections"], 2)
+        self.assertEqual(result["reversed_tracks"], 1)
+        self.assertEqual(result["method"],
+                         "final_trajectory_per_observation")
+        for frame in frames_input[:2]:
+            yaw = frame["detections"][0]["box_lidar"][6]
+            self.assertAlmostEqual(yaw, -math.pi / 3.0, places=6)
+            self.assertTrue(
+                frame["detections"][0].get("_step45_yaw_reversed"))
+        for frame in frames_input[2:]:
+            yaw = frame["detections"][0]["box_lidar"][6]
+            self.assertAlmostEqual(yaw, 0.0, places=6)
 
     def test_turn_extension_uses_swept_area_forward(self):
         config = DynamicRegionConfig()

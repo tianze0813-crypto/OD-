@@ -350,7 +350,10 @@ class ConservativeTracker:
                  occlusion_max_gap: float = 0.0,
                  physical_position_jump_enabled: bool = False,
                  physical_accel_limit_mps2: float = 1.5,
-                 physical_position_noise_m: float = 0.5):
+                 physical_position_noise_m: float = 0.5,
+                 lateral_jump_gate_enabled: bool = False,
+                 lateral_jump_max_m: float = 2.5,
+                 lateral_jump_min_prior_step_m: float = 0.5):
         self.coords = coords
         self.min_static_hits = int(min_static_hits)
         self.min_static_duration = float(min_static_duration)
@@ -374,6 +377,14 @@ class ConservativeTracker:
             physical_position_jump_enabled)
         self.physical_accel_limit_mps2 = float(physical_accel_limit_mps2)
         self.physical_position_noise_m = float(physical_position_noise_m)
+        # Hard lateral-jump rejection.  This is enabled only by the step-4.5
+        # motion-only re-tracker: when a track already has a stable recent
+        # motion axis, a candidate whose centre is more than
+        # ``lateral_jump_max_m`` off that axis cannot be the same vehicle.
+        self.lateral_jump_gate_enabled = bool(lateral_jump_gate_enabled)
+        self.lateral_jump_max_m = float(lateral_jump_max_m)
+        self.lateral_jump_min_prior_step_m = float(
+            lateral_jump_min_prior_step_m)
         self.next_id = 1
         self.next_slot = 1
         self.tracks: Dict[int, Track] = {}
@@ -382,7 +393,7 @@ class ConservativeTracker:
             "frames": 0, "detections": 0, "matches": 0, "births": 0,
             "static_locks": 0, "static_recoveries": 0, "departures": 0,
             "rejections": {}, "ambiguous_recoveries": 0, "events": [],
-            "occlusion_recoveries": 0,
+            "occlusion_recoveries": 0, "lateral_jump_triggered": 0,
         }
 
     def _event(self, event: str, tr: Track, timestamp: int, **fields: Any) -> None:
@@ -446,10 +457,40 @@ class ConservativeTracker:
             return "position_jump_gate"
         return None
 
+    def _lateral_jump_gate(
+            self, tr: Track, obs: Observation) -> Optional[str]:
+        """Reject a candidate that jumps sideways off the recent motion axis.
+
+        The gate is intentionally local and independent of the longitudinal
+        distance gate: adjacent vehicles can be reachable in time but still
+        require an impossible lateral teleport.  It is enabled only by the
+        step-4.5 re-tracker so the step-2 tracker contract is unchanged.
+        """
+        if not self.lateral_jump_gate_enabled:
+            return None
+        if len(tr.observations) < 2:
+            return None
+        previous = tr.observations[-2].world[:2]
+        last = tr.last_world[:2]
+        motion = last - previous
+        motion_norm = float(np.linalg.norm(motion))
+        if motion_norm < self.lateral_jump_min_prior_step_m:
+            return None
+        step = obs.world[:2] - last
+        lateral = abs(float(
+            motion[0] * step[1] - motion[1] * step[0])) / motion_norm
+        if lateral > self.lateral_jump_max_m:
+            self.diagnostics["lateral_jump_triggered"] += 1
+            return "lateral_jump_gate"
+        return None
+
     def _cost(self, tr: Track, obs: Observation, predicted: np.ndarray,
               covariance: np.ndarray, dt: float,
               static_mode: bool = False) -> Tuple[float, str]:
         if not static_mode:
+            lateral_reason = self._lateral_jump_gate(tr, obs)
+            if lateral_reason is not None:
+                return 1e9, lateral_reason
             jump_reason = self._position_jump_gate(tr, obs)
             if jump_reason is not None:
                 return 1e9, jump_reason

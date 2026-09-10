@@ -161,6 +161,8 @@ def run(step4_json: Path, clip: Path, step2_diagnostics: Path,
             "region": config.region.to_dict(),
             "traffic_light": config.traffic_light.to_dict(),
             "dynamic_max_gap_sec": config.dynamic_max_gap_sec,
+            "lateral_jump_gate_enabled": config.lateral_jump_gate_enabled,
+            "lateral_jump_max_m": config.lateral_jump_max_m,
             "phase_merge_max_gap_sec": config.phase_merge_max_gap_sec,
             "yielding_max_gap_sec": config.yielding_max_gap_sec,
         },
@@ -251,6 +253,8 @@ def main() -> None:
         "phase_merges": len(diagnostics["phase_stitching"]["applied"]),
         "occlusion_recoveries": diagnostics["retracking"].get(
             "occlusion_recoveries", 0),
+        "lateral_jump_triggered": diagnostics["retracking"].get(
+            "lateral_jump_triggered", 0),
         "dynamic_yaw_aligned": diagnostics[
             "dynamic_yaw_alignment"]["dynamic_yaw_aligned"],
         "final_detections": diagnostics["final_detections"],

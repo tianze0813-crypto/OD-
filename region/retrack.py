@@ -64,10 +64,13 @@ class Step45Config:
     # lidar points inside its box; equal points -> do nothing.
     overlap_filter_enabled: bool = True
     overlap_iou_threshold: float = 0.02
-    # Reviewed whole-track yaw reversal (after final IDs):
-    # if the motion trajectory is opposite to box yaw, add pi to yaw only.
+    # Reviewed yaw sign disambiguation after final IDs: compare each
+    # detection yaw directly with the first->last final-trajectory heading
+    # and keep the pi-equivalent representation closest to that heading.
+    # The default 90 deg is the exact nearest-pi-equivalent split; no median
+    # or whole-track voting is used.
     yaw_reversal_enabled: bool = True
-    yaw_reversal_threshold_deg: float = 150.0
+    yaw_reversal_threshold_deg: float = 90.0
     # Moving seed / pure static classification (PLAN section 19).
     moving_seed_net_min_m: float = 8.0
     moving_seed_concentration_min: float = 0.5
@@ -93,6 +96,13 @@ class Step45Config:
     # ``position_noise_m`` covers detector/pose quantisation only.
     physical_accel_limit_mps2: float = 1.5
     physical_position_noise_m: float = 0.5
+    # Hard lateral-jump protection for step-4.5 ID association only:
+    # reject a candidate whose centre is farther than this from the track's
+    # recent motion axis.  This is deliberately separate from the
+    # longitudinal / reachable-distance gates.
+    lateral_jump_gate_enabled: bool = True
+    lateral_jump_max_m: float = 2.5
+    lateral_jump_min_prior_step_m: float = 0.5
     # Long-gap isolated tail rule: after this many missing frames a single
     # resumed observation is a merge-invalid isolated frame, not an anchor.
     long_gap_frames: int = 30
@@ -635,6 +645,10 @@ def retrack_dynamic(
         physical_position_jump_enabled=True,
         physical_accel_limit_mps2=float(config.physical_accel_limit_mps2),
         physical_position_noise_m=float(config.physical_position_noise_m),
+        lateral_jump_gate_enabled=bool(config.lateral_jump_gate_enabled),
+        lateral_jump_max_m=float(config.lateral_jump_max_m),
+        lateral_jump_min_prior_step_m=float(
+            config.lateral_jump_min_prior_step_m),
     )
     # Occlusion gaps during motion are explicitly out of scope and two cars
     # must not be merged.  The tracker's 3 s tracklet stitching is therefore
@@ -883,6 +897,145 @@ def _physical_split(
     return None
 
 
+def _lateral_offset_around_bridge(
+        earlier: Sequence[Mapping[str, Any]],
+        boundary_a: Mapping[str, Any],
+        later: Sequence[Mapping[str, Any]],
+        boundary_b: Mapping[str, Any],
+        config: Step45Config,
+) -> Optional[float]:
+    """Lateral offset of a bridge relative to the incoming motion axis.
+
+    ``earlier`` / ``later`` are the two fragments being connected, and the
+    boundary observations are the observations at the connection.  The
+    incoming fragment's last observed step is used as the reference axis; if
+    that is unavailable (e.g. a parked anchor with no motion), the outgoing
+    fragment's first observed step is used instead.
+    """
+    if not earlier or not later:
+        return None
+    ordered_earlier = sorted(earlier, key=lambda item: item["timestamp"])
+    ordered_later = sorted(later, key=lambda item: item["timestamp"])
+
+    def index_of(items: Sequence[Mapping[str, Any]],
+                 target: Mapping[str, Any]) -> Optional[int]:
+        for index, item in enumerate(items):
+            if item is target:
+                return index
+        return None
+
+    min_axis = float(config.lateral_jump_min_prior_step_m)
+    axis: Optional[np.ndarray] = None
+
+    def motion_vector(left: Mapping[str, Any],
+                      right: Mapping[str, Any]) -> Optional[np.ndarray]:
+        vector = (np.asarray(right["world"], dtype=np.float64)
+                  - np.asarray(left["world"], dtype=np.float64))[:2]
+        if float(np.linalg.norm(vector)) < min_axis:
+            return None
+        return vector
+
+    # Prefer the incoming track's last observed motion direction.  Only if
+    # the earlier fragment has no usable direction (e.g. a parked anchor)
+    # fall back to the later fragment's first outgoing direction.
+    earlier_index = index_of(ordered_earlier, boundary_a)
+    if earlier_index is not None and earlier_index >= 1:
+        axis = motion_vector(
+            ordered_earlier[earlier_index - 1], boundary_a)
+    if axis is None:
+        later_index = index_of(ordered_later, boundary_b)
+        if later_index is not None and later_index + 1 < len(ordered_later):
+            axis = motion_vector(
+                boundary_b, ordered_later[later_index + 1])
+    if axis is None:
+        return None
+    step = (np.asarray(boundary_b["world"], dtype=np.float64)
+            - np.asarray(boundary_a["world"], dtype=np.float64))[:2]
+    return abs(float(axis[0] * step[1] - axis[1] * step[0])) \
+        / float(np.linalg.norm(axis))
+
+
+def _combined_lateral_ok(
+        items: Sequence[Mapping[str, Any]],
+        config: Step45Config,
+) -> bool:
+    """Whether one time-ordered observation set has a local lateral jump."""
+    if not bool(config.lateral_jump_gate_enabled):
+        return True
+    combined = sorted(items, key=lambda item: item["timestamp"])
+    if len(combined) < 3:
+        return True
+    min_axis = float(config.lateral_jump_min_prior_step_m)
+    max_lateral = float(config.lateral_jump_max_m)
+    points = [np.asarray(item["world"], dtype=np.float64)[:2]
+              for item in combined]
+    for index in range(1, len(points)):
+        step = points[index] - points[index - 1]
+        axis: Optional[np.ndarray] = None
+        if index >= 2:
+            previous = points[index - 1] - points[index - 2]
+            if float(np.linalg.norm(previous)) >= min_axis:
+                axis = previous
+        if axis is None and index + 1 < len(points):
+            following = points[index + 1] - points[index]
+            if float(np.linalg.norm(following)) >= min_axis:
+                axis = following
+        if axis is None:
+            continue
+        lateral = (abs(float(axis[0] * step[1] - axis[1] * step[0]))
+                   / float(np.linalg.norm(axis)))
+        if lateral > max_lateral:
+            return False
+    return True
+
+
+def _combined_merge_lateral_ok(
+        earlier: Sequence[Mapping[str, Any]],
+        later: Sequence[Mapping[str, Any]],
+        config: Step45Config,
+) -> bool:
+    """Whether merging two observation sets creates a local lateral jump.
+
+    The combined sequence is time-sorted first, so interleaved fragments
+    cannot hide a sideways step by being passed in a convenient order.
+    """
+    return _combined_lateral_ok(
+        list(earlier) + list(later), config)
+
+
+def _lateral_jump_ok(
+        earlier: Sequence[Mapping[str, Any]],
+        later: Sequence[Mapping[str, Any]],
+        config: Step45Config,
+) -> bool:
+    """Whether two fragments can share one final id.
+
+    Time-disjoint fragments use the local motion axes around their bridge.
+    If the two sets overlap/interleave in time, the combined sequence is
+    validated instead because the bridge order is not well-defined.
+    """
+    if not bool(config.lateral_jump_gate_enabled):
+        return True
+    if not earlier or not later:
+        return True
+    ordered_earlier = sorted(earlier, key=lambda item: item["timestamp"])
+    ordered_later = sorted(later, key=lambda item: item["timestamp"])
+    if (float(ordered_earlier[-1]["timestamp"])
+            <= float(ordered_later[0]["timestamp"])):
+        first, second = ordered_earlier, ordered_later
+    elif (float(ordered_later[-1]["timestamp"])
+          <= float(ordered_earlier[0]["timestamp"])):
+        first, second = ordered_later, ordered_earlier
+    else:
+        return _combined_merge_lateral_ok(
+            ordered_earlier, ordered_later, config)
+    offset = _lateral_offset_around_bridge(
+        first, first[-1], second, second[0], config)
+    if offset is None:
+        return True
+    return offset <= float(config.lateral_jump_max_m)
+
+
 def _continuity_ok(
         existing: Sequence[Mapping[str, Any]],
         group: Sequence[Mapping[str, Any]],
@@ -909,6 +1062,12 @@ def _continuity_ok(
         + float(config.merge_gate_per_sec_m) * gap)
     if distance > gate:
         return False
+    if bool(config.lateral_jump_gate_enabled):
+        lateral_offset = _lateral_offset_around_bridge(
+            existing, nearest, group, item, config)
+        if (lateral_offset is not None
+                and lateral_offset > float(config.lateral_jump_max_m)):
+            return False
     size_delta = float(np.linalg.norm(
         np.asarray(nearest["size"], dtype=np.float64)
         - np.asarray(item["size"], dtype=np.float64))) / max(
@@ -1007,10 +1166,14 @@ def inherit_ids(
                     1, int(0.5 * len(items)))
                 if set(old_counts) != {int(candidate_id)} and not dominant:
                     continue
-            if (candidate_id in assigned_items
-                    and not _continuity_ok(
-                        assigned_items[candidate_id], items, config)):
-                continue
+            if candidate_id in assigned_items:
+                existing_candidate = assigned_items[candidate_id]
+                if not _continuity_ok(
+                        existing_candidate, items, config):
+                    continue
+                if not _combined_merge_lateral_ok(
+                        existing_candidate, items, config):
+                    continue
             chosen = int(candidate_id)
             chosen_reason = reason
             chosen_evidence = evidence
@@ -1029,6 +1192,10 @@ def inherit_ids(
             for old_id in fallback:
                 if any(int(old_id) in used_by_frame[item["frame_index"]]
                        for item in items):
+                    continue
+                existing = assigned_items.get(int(old_id))
+                if existing is not None and not _combined_merge_lateral_ok(
+                        existing, items, config):
                     continue
                 chosen = int(old_id)
                 chosen_reason = "fallback_old_id"
@@ -1403,6 +1570,8 @@ def queue_stitch(
                     continue
                 a_end = items_a[-1]
                 b_start = items_b[0]
+                if not _lateral_jump_ok(items_a, items_b, config):
+                    continue
                 gap_sec = max(
                     0.0,
                     float(b_start["timestamp"]) - float(a_end["timestamp"]))
@@ -1520,6 +1689,11 @@ def queue_stitch(
             if time_conflict:
                 break
         if time_conflict:
+            continue
+        component_items = [
+            item for member in members for item in by_final[member]
+        ]
+        if not _combined_lateral_ok(component_items, config):
             continue
         # An id carrying a long-gap isolated frame cannot be the merged
         # target, otherwise that invalid single frame would be absorbed by
@@ -1665,6 +1839,8 @@ def phase_stitch(
             if end_id not in dynamic_ids and start_id not in dynamic_ids:
                 continue
             start = start_items[0]
+            if not _lateral_jump_ok(end_items, start_items, config):
+                continue
             gap = float(start["timestamp"] - end["timestamp"])
             if gap <= 0.0 or gap > float(config.phase_merge_max_gap_sec):
                 continue
@@ -1875,6 +2051,7 @@ def align_dynamic_yaw(
             if not isinstance(box, list) or len(box) < 7:
                 continue
             box[6] = float(_wrap_angle(target_local))
+            item["yaw"] = float(_wrap_angle(float(chosen)))
             changed += 1
         if changed and len(details) < 200:
             details.append({
@@ -1888,18 +2065,51 @@ def align_dynamic_yaw(
     }
 
 
+def _final_trajectory_heading(
+        items: Sequence[Mapping[str, Any]],
+) -> Optional[float]:
+    """Heading from the first to the last observed centre.
+
+    This is the reviewed ``final trajectory`` reference for yaw sign
+    disambiguation: one direction for the already-stitched final id, no
+    per-frame voting and no median over yaw differences.
+    """
+    ordered = sorted(items, key=lambda item: item["timestamp"])
+    if len(ordered) < 2:
+        return None
+    start = np.asarray(ordered[0]["world"], dtype=np.float64)
+    end = np.asarray(ordered[-1]["world"], dtype=np.float64)
+    delta = end - start
+    if float(np.linalg.norm(delta[:2])) < 1e-9:
+        return None
+    return math.atan2(float(delta[1]), float(delta[0]))
+
+
 def revert_dynamic_yaw(
         frames: List[Dict[str, Any]],
         tracks: Mapping[int, Sequence[Mapping[str, Any]]],
         config: Step45Config,
 ) -> Dict[str, Any]:
-    """Whole-track yaw reversal after final IDs (reviewed).
+    """Resolve the pi-equivalent yaw sign against the final trajectory.
 
-    If the final motion trajectory is consistently opposite to box yaw
-    (median directed difference > threshold), add pi to every detection yaw
-    of that track.  Position and size are never changed.  Pure parked tracks
-    are excluded.
+    For every final dynamic id, compare each detection's directed yaw with
+    the final motion-trajectory heading (first observation -> last
+    observation).  A detection whose directed difference is larger than the
+    configured nearest-pi-equivalent split (90 deg by default) gets ``+pi``
+    on its own, so it always ends up closer to the final trajectory.  A
+    single noisy frame can never out-vote the rest of the track.  Position,
+    size and the heading itself are never changed.  Pure parked tracks are
+    excluded.
     """
+    if not bool(config.yaw_reversal_enabled):
+        return {
+            "enabled": False,
+            "method": "final_trajectory_per_observation",
+            "threshold_deg": float(config.yaw_reversal_threshold_deg),
+            "reversed_detections": 0,
+            "reversed_tracks": 0,
+            "details": [],
+        }
     by_final: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
     for items in tracks.values():
         for item in items:
@@ -1915,39 +2125,47 @@ def revert_dynamic_yaw(
             if item["det"].get("_step45_retracked")
             or item["det"].get("region") == "dynamic"
         ]
-        if not dynamic_items:
+        if len(dynamic_items) < 2:
             continue
-        stats = track_motion_stats(items)
+        ordered = sorted(dynamic_items, key=lambda item: item["timestamp"])
+        stats = track_motion_stats(ordered)
         if stats is None or is_pure_static(stats, config):
             continue
         if float(stats["net"]) < 1.0:
             continue
-        heading = _robust_track_heading(items)
+        heading = _final_trajectory_heading(ordered)
         if heading is None:
             continue
-        directed = np.asarray([
-            _wrap_angle(float(item["yaw"]) - float(heading))
-            for item in dynamic_items
-        ], dtype=np.float64)
-        median_abs = float(np.median(np.abs(directed)))
-        if median_abs <= threshold:
-            continue
-        for item in dynamic_items:
+        deviations = [
+            abs(_wrap_angle(float(item["yaw"]) - float(heading)))
+            for item in ordered
+        ]
+        max_deviation = max(deviations) if deviations else 0.0
+        track_flipped = 0
+        for item, deviation in zip(ordered, deviations):
+            if deviation <= threshold:
+                continue
             box = item["det"].get("box_lidar")
             if not isinstance(box, list) or len(box) < 7:
                 continue
             box[6] = float(_wrap_angle(float(box[6]) + math.pi))
             item["yaw"] = float(_wrap_angle(float(item["yaw"]) + math.pi))
+            item["det"]["_step45_yaw_reversed"] = True
             flipped += 1
-        details.append({
-            "track_id": int(final_id),
-            "observations": len(dynamic_items),
-            "trajectory_heading_deg": round(math.degrees(float(heading)), 3),
-            "median_directed_diff_deg": round(
-                math.degrees(median_abs), 3),
-        })
+            track_flipped += 1
+        if track_flipped:
+            details.append({
+                "track_id": int(final_id),
+                "observations": len(ordered),
+                "flipped_observations": track_flipped,
+                "trajectory_heading_deg": round(
+                    math.degrees(float(heading)), 3),
+                "max_directed_diff_deg": round(
+                    math.degrees(float(max_deviation)), 3),
+            })
     return {
         "enabled": bool(config.yaw_reversal_enabled),
+        "method": "final_trajectory_per_observation",
         "threshold_deg": float(config.yaw_reversal_threshold_deg),
         "reversed_detections": flipped,
         "reversed_tracks": len(details),

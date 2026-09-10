@@ -283,6 +283,12 @@ Step4.5 是全链路唯一会修改 Car ID 的阶段，原则是**区域外静�
 7. 相位感知拼接：waiting_red / 绿灯起步 / 右转 yielding 的碎片按方向、
    停止线、空间桥接和物理连续性保守合并
 8. 只对动态 / 重跟踪段再跑一遍 box fit；静态冻结段保留 Step3 结果
+9. 最终 ID 定下来后，用最终运动轨迹（首->末观测方向）直接比较每个
+   detection 的 yaw；偏离超过 90° 的单帧自己加 pi，即选择离最终轨迹更近的
+   π 等价表示，不做中位数投票
+10. step4.5 专用横向跳变保护：关联候选偏离最近运动轴 >2.5m 直接拒绝；
+    同一门限同时用于 ID 继承 / queue / phase 拼接，防止拆开的横向跳变
+    又被合回；step2 默认关闭
 ```
 
 单条：
@@ -303,7 +309,8 @@ Step4.5 是全链路唯一会修改 Car ID 的阶段，原则是**区域外静�
 ```
 
 诊断字段包括 `dynamic_region` / `selection` / `retracking` /
-`id_inheritance` / `phase_stitching` / `box_fit` / `static_freeze`。
+`id_inheritance` / `phase_stitching` / `box_fit` / `yaw_reversal` /
+`static_freeze`。
 `static_freeze.passed=False` 会直接报错，避免误改静态。
 
 ### Step 5：最终过滤 + box 转换到 base_link

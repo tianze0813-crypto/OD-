@@ -70,6 +70,8 @@ def main() -> None:
             "candidate_tracks": result["candidate_tracks"],
             "retrackable_detections": result["selection"][
                 "retrackable_detections"],
+            "lateral_jump_triggered": result["retracking"].get(
+                "lateral_jump_triggered", 0),
             "phase_merges": len(result["phase_stitching"]["applied"]),
             "static_freeze_passed": result["static_freeze"]["passed"],
         })
