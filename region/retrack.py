@@ -1751,6 +1751,13 @@ def revert_dynamic_yaw(
     flipped = 0
     details: List[Dict[str, Any]] = []
     for final_id, items in by_final.items():
+        dynamic_items = [
+            item for item in items
+            if item["det"].get("_step45_retracked")
+            or item["det"].get("region") == "dynamic"
+        ]
+        if not dynamic_items:
+            continue
         stats = track_motion_stats(items)
         if stats is None or is_pure_static(stats, config):
             continue
@@ -1761,12 +1768,12 @@ def revert_dynamic_yaw(
             continue
         directed = np.asarray([
             _wrap_angle(float(item["yaw"]) - float(heading))
-            for item in items
+            for item in dynamic_items
         ], dtype=np.float64)
         median_abs = float(np.median(np.abs(directed)))
         if median_abs <= threshold:
             continue
-        for item in items:
+        for item in dynamic_items:
             box = item["det"].get("box_lidar")
             if not isinstance(box, list) or len(box) < 7:
                 continue
@@ -1775,7 +1782,7 @@ def revert_dynamic_yaw(
             flipped += 1
         details.append({
             "track_id": int(final_id),
-            "observations": len(items),
+            "observations": len(dynamic_items),
             "trajectory_heading_deg": round(math.degrees(float(heading)), 3),
             "median_directed_diff_deg": round(
                 math.degrees(median_abs), 3),
