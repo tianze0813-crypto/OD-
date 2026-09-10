@@ -1015,18 +1015,24 @@ def inherit_ids(
                 or set(old_counts) == {old_id}
                 or count >= max(1, int(0.5 * len(items)))
             ]
-            if fallback:
-                chosen = int(fallback[0])
+            for old_id in fallback:
+                if any(int(old_id) in used_by_frame[item["frame_index"]]
+                       for item in items):
+                    continue
+                chosen = int(old_id)
                 chosen_reason = "fallback_old_id"
                 chosen_evidence = {
                     "reason": "continuity_failed_but_old_id_kept",
                     "votes": old_counts[chosen],
                 }
-            else:
+                break
+            if chosen is None:
                 chosen = next_id
                 next_id += 1
                 chosen_reason = "new_id"
-                chosen_evidence = {}
+                chosen_evidence = {
+                    "reason": "fallback_old_id_collision_new_id",
+                }
         for item in items:
             item["det"]["track_id"] = int(chosen)
             used_by_frame[item["frame_index"]].add(int(chosen))
@@ -1823,6 +1829,32 @@ def dynamic_box_fit(
             len(frame.get("detections", [])) for frame in frames) - replaced,
     })
     return list(frames), diagnostics
+
+
+def verify_unique_frame_ids(
+        frames: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Hard invariant: no frame may contain the same track_id twice."""
+    duplicates: List[Dict[str, Any]] = []
+    for frame_index, frame in enumerate(frames):
+        counts = Counter(
+            int(det["track_id"]) for det in frame.get("detections", [])
+            if det.get("track_id") is not None)
+        repeated = {key: value for key, value in counts.items() if value > 1}
+        if repeated:
+            duplicates.append({
+                "frame_index": frame_index,
+                "frame_id": str(frame.get("frame_id")),
+                "duplicates": repeated,
+            })
+    if duplicates:
+        raise AssertionError(
+            f"step4.5 produced duplicate frame ids: {duplicates[:3]}")
+    return {
+        "passed": True,
+        "frames_checked": len(frames),
+        "duplicate_frames": 0,
+    }
 
 
 def verify_static_freeze(

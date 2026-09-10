@@ -37,6 +37,7 @@ from region.retrack import (
     select_retrackable,
     single_frame_overlap_filter,
     verify_static_freeze,
+    verify_unique_frame_ids,
 )
 from tracking import tracker_conservative as tracking
 
@@ -108,6 +109,7 @@ def run(step4_json: Path, clip: Path, step2_diagnostics: Path,
         frames, tracks, step2, mask, set(seeds), config)
     exempt_keys = set(retrackable) | set(queue.get("modified_keys", []))
     phase = phase_stitch(frames, tracks, coords, config)
+    unique_ids = verify_unique_frame_ids(frames)
 
     tracking_diagnostics = step2.get("tracking", {})
     static_yaw_diagnostics = step2.get("static_yaw_stabilization", {})
@@ -180,6 +182,7 @@ def run(step4_json: Path, clip: Path, step2_diagnostics: Path,
                 "direction_assignments", {}),
         },
         "phase_stitching": phase,
+        "unique_frame_ids": unique_ids,
         "box_fit": box_fit_diagnostics,
         "dynamic_yaw_alignment": yaw_diagnostics,
         "yaw_reversal": yaw_reversal_diag,

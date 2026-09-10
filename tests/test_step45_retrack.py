@@ -29,6 +29,7 @@ from region.retrack import (
     select_retrackable,
     track_motion_stats,
     verify_static_freeze,
+    verify_unique_frame_ids,
 )
 from tracking.tracker_conservative import ConservativeTracker, CoordinateProvider
 
@@ -420,6 +421,15 @@ class Step45RetrackTest(unittest.TestCase):
         for frame in frames_input:
             yaw = frame["detections"][0]["box_lidar"][6]
             self.assertLess(abs(math.cos(yaw) - 1.0), 1e-6)
+
+    def test_duplicate_frame_ids_are_rejected(self):
+        duplicate = frames([
+            [det("Car", 0.0, 0.0, 1), det("Car", 1.0, 0.0, 1)],
+        ])
+        with self.assertRaises(AssertionError):
+            verify_unique_frame_ids(duplicate)
+        clean = frames([[det("Car", 0.0, 0.0, 1)]])
+        self.assertTrue(verify_unique_frame_ids(clean)["passed"])
 
     def test_movement_gate_and_lane_change_limit(self):
         config = Step45Config()

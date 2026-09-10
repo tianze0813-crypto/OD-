@@ -814,3 +814,18 @@ Pass 2（局部）:
 - 区域外 frozen track 没有 dynamic 标记，不会被 queue 合并。
 - 全量 5 clip 回归：labels / IDs 与上一版 region-only 结果一致，
   说明这次只是语义收口，没有引入新的合并。
+
+### 19.14 继承 fallback 的同帧唯一性修复（2026-09-10）
+
+- 生产包 clip2 出现 14 帧同帧两个 `34`，根因是 `inherit_ids` 的
+  `fallback_old_id` 路径没有做同帧碰撞检查：
+  ```text
+  fragment A: old votes {34:37, 27:33} -> final 34
+  fragment B: old votes {34:18}       -> fallback 又选了 34
+  两组同帧共存 -> duplicate 34
+  ```
+- 修复：fallback 候选现在也逐个检查 `used_by_frame`，
+  若旧 ID 在同帧已被占用，则顺延候选；全部冲突则发新 ID。
+- 新增硬断言 `verify_unique_frame_ids`：step4.5 输出任何一帧出现重复
+  track_id 直接报错。
+- 修复后重跑生产 clip2 / clip3 / clip10，同帧重复 ID 清零。
