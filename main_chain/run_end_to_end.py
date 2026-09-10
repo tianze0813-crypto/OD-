@@ -8,17 +8,26 @@ Output:
     /path/to/<clip>_pre      the input clip renamed, with label/<frame>.json
 
 Intermediate JSON files are written to a system temporary directory and are
-removed automatically.  ``--export-sust`` only copies the final ``<clip>_pre``
-into ``SUSTechPOINTS/data``.
+removed automatically; pass ``--keep-intermediate`` to keep them under
+``--work-root``.  ``--export-sust`` only copies the final ``<clip>_pre`` into
+``SUSTechPOINTS/data``.
+
+Pipeline:
+    step1 inference -> step2 identity/class/yaw -> step3 car box fit
+    -> step4 Car->Truck then Car-only
+    -> step4.5 dynamic-region re-tracking / ID inheritance / phase stitch
+    -> step5 final filter + base_link conversion.
 
 Examples:
     python run_end_to_end.py --clip /path/to/scene_clip --export-sust
     python run_end_to_end.py --clip-dir /path/to/clips --export-sust
+    python run_end_to_end.py --clip /path/to/scene_clip --keep-intermediate
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import shutil
 import subprocess
@@ -111,6 +120,11 @@ def main():
                         action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--score-thresh", type=float, default=0.3)
     parser.add_argument("--drop-vis-below", type=float, default=0.05)
+    parser.add_argument("--keep-intermediate", action="store_true",
+                        help="keep step1..step4.5 JSON/diagnostics under "
+                             "--work-root instead of a temporary directory")
+    parser.add_argument("--work-root", type=Path,
+                        default=ROOT / "work" / "end_to_end")
     args = parser.parse_args()
 
     clips = collect_clips(args)
@@ -118,18 +132,28 @@ def main():
         raise SystemExit("--raw-json 仅支持单个 --clip")
 
     summaries = []
-    with tempfile.TemporaryDirectory(prefix="fullchain_") as tmp:
-        tmp_root = Path(tmp)
-        step1_root = tmp_root / "step1"
-        step2_root = tmp_root / "step2"
-        step3_root = tmp_root / "step3"
-        step4_root = tmp_root / "step4"
-        step5_root = tmp_root / "step5"
-        for path in (step1_root, step2_root, step3_root, step4_root, step5_root):
-            path.mkdir(parents=True, exist_ok=True)
+    with contextlib.ExitStack() as stack:
+        if args.keep_intermediate:
+            tmp_root = Path(args.work_root).resolve()
+            tmp_root.mkdir(parents=True, exist_ok=True)
+        else:
+            tmp_root = Path(stack.enter_context(
+                tempfile.TemporaryDirectory(prefix="fullchain_")))
 
         for index, clip in enumerate(clips, 1):
             base = clip.name
+            work_root = (tmp_root / base if args.keep_intermediate
+                         else tmp_root)
+            step1_root = work_root / "step1"
+            step2_root = work_root / "step2"
+            step3_root = work_root / "step3"
+            step4_root = work_root / "step4"
+            step45_root = work_root / "step4_5"
+            step5_root = work_root / "step5"
+            for path in (step1_root, step2_root, step3_root, step4_root,
+                         step45_root, step5_root):
+                path.mkdir(parents=True, exist_ok=True)
+
             final_clip = clip.with_name(base + args.final_suffix)
             print(f"\n===== [{index}/{len(clips)}] {base} =====", flush=True)
 
@@ -174,12 +198,21 @@ def main():
                  "--out-json", step4_json,
                  "--diagnostics", step4_diag])
 
+            step45_json = step45_root / f"{base}_step45.json"
+            step45_diag = step45_root / f"{base}_step45_diagnostics.json"
+            run([args.post_python,
+                 ROOT / "pipeline" / "step4_5_region_phase_retrack.py",
+                 "--step4-json", step4_json, "--clip", clip,
+                 "--step2-diagnostics", step2_diag,
+                 "--out-json", step45_json,
+                 "--diagnostics", step45_diag])
+
             step5_json = step5_root / f"{base}_step5.json"
             step5_diag = step5_root / f"{base}_step5_diagnostics.json"
             step5_cmd = [
                 args.post_python,
                 ROOT / "pipeline" / "step5_class_motion_filter.py",
-                "--step4-json", step4_json, "--clip", clip,
+                "--step4-json", step45_json, "--clip", clip,
                 "--out-json", step5_json, "--diagnostics", step5_diag,
                 "--sparsity-max-points", args.sparsity_max_points,
                 "--short-track-max-frames", args.short_track_max_frames,
@@ -206,6 +239,8 @@ def main():
                 replace_clip_copy(final_clip, sust_dest)
                 print(f"SUST export: {sust_dest}", flush=True)
 
+            step45_summary = json.loads(
+                step45_diag.read_text(encoding="utf-8"))
             summaries.append({
                 "input_clip": str(clip),
                 "final_clip": str(final_clip),
@@ -217,6 +252,13 @@ def main():
                 "large_car_detections_relabelled": json.loads(
                     step4_diag.read_text(encoding="utf-8")
                 )["large_car_detections_relabelled"],
+                "candidate_tracks": step45_summary["candidate_tracks"],
+                "retrackable_detections": step45_summary[
+                    "selection"]["retrackable_detections"],
+                "phase_merges": len(
+                    step45_summary["phase_stitching"]["applied"]),
+                "static_freeze_passed": step45_summary[
+                    "static_freeze"]["passed"],
                 "sust_export": str(sust_dest) if sust_dest else None,
             })
 

@@ -196,7 +196,8 @@ class StaticYawTest(unittest.TestCase):
         self.assertEqual(diagnostics["parking_boxes_stabilized"], 3)
 
     def test_departure_segment_is_not_locked(self):
-        source = frames([[det("Car", float(index), track_id=7)]
+        positions = [0.0, 0.0, 0.0, 1.0, 2.0, 3.0]
+        source = frames([[det("Car", positions[index], track_id=7)]
                          for index in range(6)])
         raw_yaws = [0.08, -0.05, 0.04, 0.65, 0.75, 0.85]
         for frame, yaw in zip(source, raw_yaws):

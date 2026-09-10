@@ -12,7 +12,10 @@ from typing import Any, Dict, List, Mapping, Sequence, Tuple
 import numpy as np
 
 from geometry.yaw_static_direction import _world_yaw_to_local
-from geometry.yaw_vehicle_dynamic import apply_yaw_vehicle_dynamic
+from geometry.yaw_vehicle_dynamic import (
+    YawVehicleDynamicConfig,
+    apply_yaw_vehicle_dynamic,
+)
 from tracking import tracker_conservative as tracking
 
 
@@ -92,10 +95,12 @@ def apply_yaw_integrated(
         tracking_diagnostics: Mapping[str, Any],
         static_yaw_diagnostics: Mapping[str, Any],
         pedestrian_config: PedestrianYawConfig = PedestrianYawConfig(),
+        vehicle_config: YawVehicleDynamicConfig = YawVehicleDynamicConfig(),
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     output, diagnostics = apply_yaw_vehicle_dynamic(
         final_frames, pre_yaw_frames, coords, clip,
-        tracking_diagnostics, static_yaw_diagnostics)
+        tracking_diagnostics, static_yaw_diagnostics,
+        config=vehicle_config)
     pedestrian_targets, pedestrian_details = _pedestrian_targets(
         output, coords, pedestrian_config)
 
@@ -115,13 +120,17 @@ def apply_yaw_integrated(
     _verify_yaw_only(final_frames, output)
     diagnostics["policy"]["pipeline_position"] = (
         "after_identity_class_filters_and_short_tracks")
-    diagnostics["policy"]["priority"] = [
-        "static_direction_vote",
-        "confirmed_motion_heading",
+    priority = ["static_direction_vote"]
+    if getattr(vehicle_config, "apply_motion_yaw", False):
+        priority.append("confirmed_motion_heading")
+    priority += [
         "stationary_multiframe_pointcloud_axis",
         "pedestrian_two_frame_heading",
         "keep_original",
     ]
+    diagnostics["policy"]["priority"] = priority
+    diagnostics["policy"]["apply_motion_yaw"] = bool(
+        getattr(vehicle_config, "apply_motion_yaw", False))
     diagnostics["boxes_by_mode"][
         "pedestrian_two_frame_heading"] = pedestrian_boxes
     diagnostics["pedestrian"] = {

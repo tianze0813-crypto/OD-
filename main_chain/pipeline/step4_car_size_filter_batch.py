@@ -19,9 +19,9 @@ from pipeline.step4_car_size_filter import run
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--step3-work-root", type=Path,
-                        default=PROJECT_ROOT / "work" / "step3_car_box_fit")
+                        default=PROJECT_ROOT / "work" / "step3")
     parser.add_argument("--work-root", type=Path,
-                        default=PROJECT_ROOT / "work" / "step4_car_size_filter")
+                        default=PROJECT_ROOT / "work" / "step4")
     parser.add_argument("--truck-length-min", type=float, default=6.0)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
@@ -48,6 +48,10 @@ def main() -> None:
                 "large_car_tracks_relabelled"],
             "large_car_detections_relabelled": result[
                 "large_car_detections_relabelled"],
+            "before_detections": result["before_detections"],
+            "after_detections": result["after_detections"],
+            "car_only_removed": result["car_only_removed"],
+            "classes_removed": result["classes_removed"],
         })
 
     summary_path = args.work_root / "batch_summary.json"

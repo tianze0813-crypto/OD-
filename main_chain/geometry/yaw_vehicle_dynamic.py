@@ -41,6 +41,9 @@ class YawVehicleDynamicConfig:
     motion_fit_min_displacement: float = 0.45
     stationary_min_observations: int = 5
     stationary_center_spread90: float = 0.45
+    # A single distant ID-switch frame must not make a parked fragment look
+    # stationary and overwrite its raw yaw.
+    stationary_max_center_radius: float = 1.0
     pointcloud_min_valid_frames: int = 5
     pointcloud_min_points_per_frame: int = 15
     pointcloud_axis_ratio: float = 2.0
@@ -49,6 +52,11 @@ class YawVehicleDynamicConfig:
     pointcloud_direction_min_margin: float = 0.15
     pointcloud_raw_yaw_stability: float = 0.98
     pointcloud_raw_axis_conflict: float = math.radians(20.0)
+    # Dynamic detector yaw is accurate enough; the motion model must not
+    # overwrite it during sharp turns / occlusion.  Motion evidence is still
+    # computed for diagnostics and for excluding moving tracks from the
+    # stationary point-cloud branch.
+    apply_motion_yaw: bool = False
 
 
 def _track_items(
@@ -369,8 +377,11 @@ def _stationary_pointcloud_targets(
             continue
         centers = np.asarray([x["world"][:2] for x in items], dtype=np.float64)
         center = np.median(centers, axis=0)
-        spread90 = float(np.percentile(np.linalg.norm(centers - center, axis=1), 90))
-        if spread90 > config.stationary_center_spread90:
+        radii = np.linalg.norm(centers - center, axis=1)
+        spread90 = float(np.percentile(radii, 90))
+        max_radius = float(np.max(radii))
+        if (spread90 > config.stationary_center_spread90
+                or max_radius > config.stationary_max_center_radius):
             continue
 
         aggregate = []
@@ -469,6 +480,7 @@ def _stationary_pointcloud_targets(
             "observations": len(items),
             "yaw_mode": "stationary_multiframe_pointcloud_axis",
             "center_spread90": round(spread90, 4),
+            "center_max_radius": round(max_radius, 4),
             "valid_pointcloud_frames": len(aggregate),
             "aggregate_points": int(sum(len(x) for x in aggregate)),
             "axis_ratio": round(float(ratio), 4),
@@ -522,10 +534,15 @@ def apply_yaw_vehicle_dynamic(
             if target is not None and timestamp < cutoffs.get(tid, math.inf):
                 mode = "static_direction_vote"
             else:
-                target = motion_targets.get((frame_index, detection_index))
-                if target is not None:
+                motion_target = motion_targets.get(
+                    (frame_index, detection_index))
+                if motion_target is not None and config.apply_motion_yaw:
+                    target = motion_target
                     mode = "confirmed_motion_heading"
                 else:
+                    # When motion yaw is disabled the detector yaw is kept for
+                    # moving boxes.  Stationary point-cloud yaw is still
+                    # allowed for non-moving tracks.
                     target = point_targets.get((frame_index, detection_index))
                     if target is not None:
                         mode = "stationary_multiframe_pointcloud_axis"
@@ -540,12 +557,13 @@ def apply_yaw_vehicle_dynamic(
             "pipeline_position": "after_identity_class_filters_and_short_tracks",
             "tracking_feedback": False,
             "mutated_field": "box_lidar[6]",
-            "priority": [
-                "static_direction_vote",
-                "confirmed_motion_heading",
-                "stationary_multiframe_pointcloud_axis",
-                "keep_original",
-            ],
+            "apply_motion_yaw": bool(config.apply_motion_yaw),
+            "priority": (
+                ["static_direction_vote"]
+                + (["confirmed_motion_heading"] if config.apply_motion_yaw
+                   else [])
+                + ["stationary_multiframe_pointcloud_axis", "keep_original"]
+            ),
         },
         "boxes_by_mode": dict(sorted(counts.items())),
         "static": {"tracks": len(static_details), "details": static_details},

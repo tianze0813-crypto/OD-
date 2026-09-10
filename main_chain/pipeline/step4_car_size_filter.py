@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Step 4: relabel truck-sized Car tracks as Truck for the final Car gate."""
+"""Step 4: Car -> Truck size gate, then keep only Car for step 4.5.
+
+The reviewed order is fixed:
+
+1. relabel truck-sized ``Car`` tracks as ``Truck``;
+2. remove every detection whose canonical export class is not ``Car``.
+
+Only canonical ``Car`` tracks reach step 4.5.  Large cars that were relabelled
+to ``Truck`` in step 1 are therefore removed as well.
+"""
 
 from __future__ import annotations
 
@@ -12,16 +21,23 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from filtering.car_only_filter import apply_car_only_filter
 from filtering.car_size_filter import LargeCarFilterConfig, apply_large_car_to_truck
 
 
 def run(step3_json: Path, out_json: Path, diagnostics_path: Path,
         config: LargeCarFilterConfig = LargeCarFilterConfig()) -> dict:
     frames = json.loads(Path(step3_json).read_text(encoding="utf-8"))
-    output, result = apply_large_car_to_truck(frames, config)
+    relabelled, result = apply_large_car_to_truck(frames, config)
+    output, car_only = apply_car_only_filter(relabelled)
     result.update({
-        "pipeline": "step4_car_size_filter",
+        "pipeline": "step4_car_size_filter_then_car_only",
         "source_step3_json": str(Path(step3_json).resolve()),
+        "car_only": car_only,
+        "before_detections": car_only["before_detections"],
+        "after_detections": car_only["after_detections"],
+        "car_only_removed": car_only["detections_removed"],
+        "classes_removed": car_only["classes_removed"],
     })
     out_json.parent.mkdir(parents=True, exist_ok=True)
     out_json.write_text(json.dumps(output, ensure_ascii=False, indent=2) + "\n",
@@ -47,7 +63,9 @@ def main() -> None:
         LargeCarFilterConfig(truck_length_min=args.truck_length_min))
     print(json.dumps({key: result[key] for key in (
         "truck_length_min", "tracks_checked", "large_car_tracks_relabelled",
-        "large_car_detections_relabelled")}, ensure_ascii=False, indent=2))
+        "large_car_detections_relabelled", "before_detections",
+        "after_detections", "car_only_removed", "classes_removed")},
+        ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

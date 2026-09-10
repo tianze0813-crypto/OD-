@@ -23,11 +23,7 @@ class HardFilterConfig:
     sparsity_max_points: int = 10
     visibility_min_ratio: float = 0.05
     visibility_occlusion_tolerance: float = 0.3
-    use_point_occlusion: bool = True
-    point_occlusion_trigger: float = 0.01
-    point_occlusion_full_vis_ratio: float = 0.9
     pedestrian_max_distance: float = 20.0
-    nonmotorized_max_distance: float = 60.0
     keep_classes: Tuple[str, ...] = (
         "Vehicle", "Car", "Truck", "Pedestrian", "Cyclist"
     )
@@ -97,13 +93,10 @@ def apply_hard_filters(frames: List[Dict[str, Any]], clip: Path,
         valid_indices = [i for i, det in enumerate(detections) if _valid_box(det)]
         valid_detections = [detections[i] for i in valid_indices]
 
-        points = _load_lidar_xyz(clip, frame_id)
         visibility_stats = camera_visibility.compute_frame_visibility(
-            valid_detections, cameras, config.visibility_occlusion_tolerance,
-            points=points, use_point_occlusion=config.use_point_occlusion,
-            point_occlusion_trigger=config.point_occlusion_trigger,
-            full_vis_ratio=config.point_occlusion_full_vis_ratio)
+            valid_detections, cameras, config.visibility_occlusion_tolerance)
         del visibility_stats
+        points = _load_lidar_xyz(clip, frame_id)
         point_counts = count_points_in_boxes(
             points, [det["box_lidar"] for det in valid_detections])
         point_count_by_index = {
@@ -129,10 +122,6 @@ def apply_hard_filters(frames: List[Dict[str, Any]], clip: Path,
                         and math.hypot(float(box[0]), float(box[1]))
                         > config.pedestrian_max_distance):
                     reasons.append("distant_pedestrian")
-                if (class_name == "Nonmotorized_vehicle"
-                        and math.hypot(float(box[0]), float(box[1]))
-                        > config.nonmotorized_max_distance):
-                    reasons.append("distant_nonmotorized")
                 if point_count_by_index[detection_index] <= config.sparsity_max_points:
                     reasons.append("sparse_points")
                 if (float(det.get("visibility", {}).get("ratio", 0.0))

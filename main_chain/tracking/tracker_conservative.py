@@ -344,7 +344,16 @@ class ConservativeTracker:
                  static_speed: float = 0.8, static_reacquire_radius: float = 2.25,
                  departure_radius: float = 2.5, departure_frames: int = 3,
                  dynamic_max_gap: float = 1.8, dynamic_base_gate: float = 1.6,
-                 dynamic_max_velocity: float = 28.0, dynamic_max_gate: float = 9.0):
+                 dynamic_max_velocity: float = 28.0, dynamic_max_gate: float = 9.0,
+                 use_yaw: bool = True,
+                 occlusion_enabled: bool = False,
+                 occlusion_max_gap: float = 0.0,
+                 physical_position_jump_enabled: bool = False,
+                 physical_accel_limit_mps2: float = 1.5,
+                 physical_position_noise_m: float = 0.5,
+                 lateral_jump_gate_enabled: bool = False,
+                 lateral_jump_max_m: float = 2.5,
+                 lateral_jump_min_prior_step_m: float = 0.5):
         self.coords = coords
         self.min_static_hits = int(min_static_hits)
         self.min_static_duration = float(min_static_duration)
@@ -357,6 +366,25 @@ class ConservativeTracker:
         self.dynamic_base_gate = float(dynamic_base_gate)
         self.dynamic_max_velocity = float(dynamic_max_velocity)
         self.dynamic_max_gate = float(dynamic_max_gate)
+        self.use_yaw = bool(use_yaw)
+        self.occlusion_enabled = bool(occlusion_enabled)
+        self.occlusion_max_gap = float(occlusion_max_gap)
+        # Physical position-jump envelope.  These are not association
+        # tolerances: they bound how far a real object could have moved.
+        # Enabled explicitly by the step-4.5 motion-only re-tracker so the
+        # existing step-2 static/dynamic contract keeps its behaviour.
+        self.physical_position_jump_enabled = bool(
+            physical_position_jump_enabled)
+        self.physical_accel_limit_mps2 = float(physical_accel_limit_mps2)
+        self.physical_position_noise_m = float(physical_position_noise_m)
+        # Hard lateral-jump rejection.  This is enabled only by the step-4.5
+        # motion-only re-tracker: when a track already has a stable recent
+        # motion axis, a candidate whose centre is more than
+        # ``lateral_jump_max_m`` off that axis cannot be the same vehicle.
+        self.lateral_jump_gate_enabled = bool(lateral_jump_gate_enabled)
+        self.lateral_jump_max_m = float(lateral_jump_max_m)
+        self.lateral_jump_min_prior_step_m = float(
+            lateral_jump_min_prior_step_m)
         self.next_id = 1
         self.next_slot = 1
         self.tracks: Dict[int, Track] = {}
@@ -365,6 +393,7 @@ class ConservativeTracker:
             "frames": 0, "detections": 0, "matches": 0, "births": 0,
             "static_locks": 0, "static_recoveries": 0, "departures": 0,
             "rejections": {}, "ambiguous_recoveries": 0, "events": [],
+            "occlusion_recoveries": 0, "lateral_jump_triggered": 0,
         }
 
     def _event(self, event: str, tr: Track, timestamp: int, **fields: Any) -> None:
@@ -391,10 +420,125 @@ class ConservativeTracker:
             ))
         return out
 
+    def _recent_speed(self, tr: Track) -> float:
+        if len(tr.observations) >= 2:
+            previous, last = tr.observations[-2], tr.observations[-1]
+            gap = (last.timestamp - previous.timestamp) / 1e9
+            if gap > 1e-3:
+                return float(np.linalg.norm(
+                    (last.world - previous.world)[:2])) / gap
+        return float(np.linalg.norm(tr.velocity[:2]))
+
+    def _position_jump_gate(
+            self, tr: Track, obs: Observation) -> Optional[str]:
+        if not self.physical_position_jump_enabled:
+            return None
+        # A new fragment may already be moving when it is first observed;
+        # only a track with a stable motion estimate can prove a jump.
+        if len(tr.observations) < 3:
+            return None
+        gap = max((obs.timestamp - tr.last_ts) / 1e9, 0.0)
+        if gap <= 1e-6:
+            return None
+        prior_speed = max(
+            float(np.linalg.norm(tr.velocity[:2])),
+            self._recent_speed(tr))
+        displacement = float(np.linalg.norm(
+            (obs.world[:2] - tr.last_world[:2])))
+        # Very small frame-to-frame centre jumps are detector/pose noise and
+        # must stay associable; the physical jump gate targets real flashes.
+        if displacement <= self.dynamic_base_gate:
+            return None
+        reachable = (
+            self.physical_position_noise_m
+            + max(0.0, prior_speed) * gap
+            + 0.5 * self.physical_accel_limit_mps2 * gap * gap)
+        if displacement > reachable:
+            return "position_jump_gate"
+        return None
+
+    def _lateral_jump_gate(
+            self, tr: Track, obs: Observation) -> Optional[str]:
+        """Reject a candidate that jumps sideways off the recent motion axis.
+
+        The gate is intentionally local and independent of the longitudinal
+        distance gate: adjacent vehicles can be reachable in time but still
+        require an impossible lateral teleport.  It is enabled only by the
+        step-4.5 re-tracker so the step-2 tracker contract is unchanged.
+        """
+        if not self.lateral_jump_gate_enabled:
+            return None
+        if len(tr.observations) < 2:
+            return None
+        previous = tr.observations[-2].world[:2]
+        last = tr.last_world[:2]
+        motion = last - previous
+        motion_norm = float(np.linalg.norm(motion))
+        if motion_norm < self.lateral_jump_min_prior_step_m:
+            return None
+        step = obs.world[:2] - last
+        lateral = abs(float(
+            motion[0] * step[1] - motion[1] * step[0])) / motion_norm
+        if lateral > self.lateral_jump_max_m:
+            self.diagnostics["lateral_jump_triggered"] += 1
+            return "lateral_jump_gate"
+        return None
+
     def _cost(self, tr: Track, obs: Observation, predicted: np.ndarray,
               covariance: np.ndarray, dt: float,
               static_mode: bool = False) -> Tuple[float, str]:
+        if not static_mode:
+            lateral_reason = self._lateral_jump_gate(tr, obs)
+            if lateral_reason is not None:
+                return 1e9, lateral_reason
+            jump_reason = self._position_jump_gate(tr, obs)
+            if jump_reason is not None:
+                return 1e9, jump_reason
+        # Once a track has a clear recent direction, reject a single
+        # significant step directly backwards.  This prevents a detector
+        # jitter or ID swap from contaminating the track with one reverse
+        # frame; stationary jitter remains below the displacement gates.
+        if not static_mode and len(tr.observations) >= 3:
+            prior = tr.observations[-3].world[:2]
+            previous = tr.observations[-2].world[:2]
+            current = tr.observations[-1].world[:2]
+            prior_direction = previous - prior
+            direction = current - previous
+            candidate_step = obs.world[:2] - current
+            prior_norm = float(np.linalg.norm(prior_direction))
+            direction_norm = float(np.linalg.norm(direction))
+            step_norm = float(np.linalg.norm(candidate_step))
+            coherent = (prior_norm >= 0.35 and direction_norm >= 0.35
+                        and float(np.dot(prior_direction, direction))
+                        >= 0.25 * prior_norm * direction_norm)
+            if coherent and step_norm >= 0.30:
+                backward = float(np.dot(candidate_step, direction))
+                if backward < -0.25 * direction_norm * step_norm:
+                    return 1e9, "reverse_step_gate"
+        if not static_mode and len(tr.observations) >= 3:
+            # Compare speeds in metres/second using each observation's real
+            # timestamp. This remains valid across missed detections.
+            recent = tr.observations[-3:]
+            speeds = []
+            for left, right in zip(recent, recent[1:]):
+                interval = (right.timestamp - left.timestamp) / 1e9
+                if interval > 1e-3:
+                    speeds.append(float(np.linalg.norm(
+                        right.world[:2] - left.world[:2])) / interval)
+            candidate_dt = (obs.timestamp - tr.last_ts) / 1e9
+            candidate_speed = (float(np.linalg.norm(
+                obs.world[:2] - tr.last_world[:2])) / candidate_dt
+                              if candidate_dt > 1e-3 else 0.0)
+            if speeds and candidate_dt > 1e-3:
+                prior_speed = speeds[-1]
+                # A gradual slowdown is allowed; an isolated jump is not.
+                allowed_delta = max(5.0, 1.25 * prior_speed)
+                if abs(candidate_speed - prior_speed) > allowed_delta:
+                    return 1e9, "speed_continuity_gate"
         dxy = float(np.linalg.norm((obs.world - predicted)[:2]))
+        occluded = (
+            self.occlusion_enabled and not static_mode
+            and dt > self.dynamic_max_gap + 1e-6)
         if static_mode:
             if tr.slot_anchor is None:
                 return 1e9, "static_anchor_gate"
@@ -416,8 +560,20 @@ class ConservativeTracker:
                 covariance[:2, :2] = np.eye(2) * max(0.45, self.static_reacquire_radius / 2.0) ** 2
                 dxy = anchor_dist
         else:
-            gate = min(self.dynamic_max_gate,
-                       self.dynamic_base_gate + self.dynamic_max_velocity * max(dt - 0.1, 0.0))
+            if occluded:
+                prior_speed = float(np.linalg.norm(tr.velocity[:2]))
+                reachable_speed = min(
+                    self.dynamic_max_velocity, max(prior_speed, 2.0))
+                gate = min(
+                    self.dynamic_max_gate,
+                    self.dynamic_base_gate
+                    + reachable_speed * max(dt, 0.0)
+                    + 0.5 * math.sqrt(max(dt, 0.0)))
+            else:
+                gate = min(
+                    self.dynamic_max_gate,
+                    self.dynamic_base_gate
+                    + self.dynamic_max_velocity * max(dt - 0.1, 0.0))
             if dxy > gate:
                 return 1e9, "distance_gate"
         if not class_compatible(obs.detection.get("class_name", ""), tr.class_name):
@@ -425,7 +581,25 @@ class ConservativeTracker:
         scale_delta = float(np.linalg.norm(obs.size - tr.size) / max(float(np.linalg.norm(tr.size)), 1.0))
         if scale_delta > 1.35 and dxy > 0.75:
             return 1e9, "size_gate"
-        yaw_delta = angle_distance(obs.yaw, tr.last_yaw, modulo_pi=True)
+        if occluded:
+            # Occlusion recovery: the covariance has grown for seconds, so
+            # the tight Mahalanobis / IoU gates would reject a valid
+            # re-appearance.  Use the motion/lane-friendly distance gate and
+            # a direction-consistency term instead.
+            recent_velocity = tr.velocity[:2]
+            if float(np.linalg.norm(recent_velocity)) > 1.0 and dxy > 0.5:
+                step_vector = obs.world[:2] - tr.last_world[:2]
+                cosine = float(np.dot(step_vector, recent_velocity) / max(
+                    float(np.linalg.norm(step_vector))
+                    * float(np.linalg.norm(recent_velocity)), 1e-9))
+                if cosine < -0.20:
+                    return 1e9, "occlusion_direction_gate"
+            cost = dxy / max(gate, 1e-9)
+            cost += 0.55 * min(scale_delta, 2.0)
+            cost += 0.02 * max(0.0, dt)
+            cost -= min(0.04, max(0.0, float(
+                obs.detection.get("score", 0.0))) * 0.02)
+            return cost, "occlusion_recover"
         innovation = obs.world[:2] - predicted[:2]
         innovation_cov = covariance[:2, :2] + np.eye(2) * 0.35 ** 2
         try:
@@ -434,14 +608,23 @@ class ConservativeTracker:
             return 1e9, "covariance_gate"
         if mahalanobis2 > 13.82:  # chi-square(2), 99.9%; hard probabilistic gate
             return 1e9, "mahalanobis_gate"
-        iou = bev_iou(predicted, tr.size, tr.last_yaw, obs.world, obs.size, obs.yaw)
-        if dt <= 0.5 and dxy > 0.8 and iou < 0.01 and mahalanobis2 > 6.0:
-            return 1e9, "iou_gate"
+        if self.use_yaw:
+            yaw_delta = angle_distance(obs.yaw, tr.last_yaw, modulo_pi=True)
+            iou = bev_iou(predicted, tr.size, tr.last_yaw,
+                          obs.world, obs.size, obs.yaw)
+            if dt <= 0.5 and dxy > 0.8 and iou < 0.01 and mahalanobis2 > 6.0:
+                return 1e9, "iou_gate"
+        else:
+            # Step 4.5 dynamic re-tracking is motion-only: identity must not
+            # depend on detector yaw, which can be unstable during turns.
+            yaw_delta = 0.0
+            iou = 0.0
         # A box heading is symmetric modulo pi. Position uncertainty and IoU
         # dominate; size and yaw only resolve close, dense-scene alternatives.
         cost = math.sqrt(max(0.0, mahalanobis2)) / math.sqrt(13.82)
         cost += 0.55 * min(scale_delta, 2.0) + 0.25 * (1.0 - iou)
-        cost += 0.10 * (yaw_delta / math.pi)
+        if self.use_yaw:
+            cost += 0.10 * (yaw_delta / math.pi)
         cost += 0.02 * max(0.0, dt)
         cost -= min(0.04, max(0.0, float(obs.detection.get("score", 0.0))) * 0.02)
         return cost, "static_anchor" if static_mode else "motion"
@@ -676,8 +859,11 @@ class ConservativeTracker:
             # motion pass as well. This is what lets the original ID survive
             # the first departure frames; only a long disappearance falls back
             # to anchor-based static recovery.
+            gap_limit = self.dynamic_max_gap
+            if self.occlusion_enabled:
+                gap_limit = max(gap_limit, self.occlusion_max_gap)
             moving_tracks = [t for t in self.tracks.values()
-                             if (ts - t.last_ts) / 1e9 <= self.dynamic_max_gap]
+                             if (ts - t.last_ts) / 1e9 <= gap_limit]
             # A departing anchored vehicle is handled by the motion pass; a
             # parked anchor is deliberately considered only after moving tracks
             # have had first claim on the detection.
@@ -697,7 +883,13 @@ class ConservativeTracker:
             used_obs = set(id(o) for o in assigned.values())
             for tid, obs in assigned.items():
                 tr = self.tracks[tid]
+                gap_sec = (obs.timestamp - tr.last_ts) / 1e9
+                was_occluded = (
+                    self.occlusion_enabled and not tr.is_static
+                    and gap_sec > self.dynamic_max_gap + 1e-6)
                 self._update(tr, obs, "static_recover" if tr.is_static else "motion")
+                if was_occluded:
+                    self.diagnostics["occlusion_recoveries"] += 1
                 obs.detection["track_id"] = tid
                 self.diagnostics["matches"] += 1
                 self._event("match", tr, obs.timestamp, reason=tr.last_match_reason)
