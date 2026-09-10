@@ -9,7 +9,7 @@ import numpy as np
 
 from pipeline.hybrid_expD_noncar import (
     _noncar_filter,
-    drop_long_stationary_nonmotorized,
+    drop_short_motion_nonmotorized,
     drop_spinning_vehicle,
 )
 from pipeline.hybrid_merge import merge_frames, merge_label_frames
@@ -51,6 +51,33 @@ def _det(track_id, name):
         "score": 0.8,
         "box_lidar": [1.0, 2.0, 0.0, 4.0, 2.0, 1.5, 0.0],
     }
+
+
+def _car_label(obj_id, x=0.0, y=0.0, dx=4.0, dy=2.0, yaw=0.0):
+    return {
+        "obj_id": str(obj_id), "obj_type": "Car", "score": 0.9,
+        "psr": {
+            "position": {"x": float(x), "y": float(y), "z": 0.0},
+            "rotation": {"x": 0.0, "y": 0.0, "z": float(yaw)},
+            "scale": {"x": float(dx), "y": float(dy), "z": 1.5},
+        },
+    }
+
+
+def _tb_det(track_id, name, x=0.0, y=0.0, dx=3.0, dy=1.5, yaw=0.0):
+    return {
+        "track_id": int(track_id), "class_name": name, "score": 0.8,
+        "box_lidar": [float(x), float(y), 0.0,
+                      float(dx), float(dy), 1.5, float(yaw)],
+    }
+
+
+class _MissingPoseCoords:
+    def __init__(self, missing_timestamps):
+        self.missing = {int(value) for value in missing_timestamps}
+
+    def world_from_lidar(self, timestamp):
+        return None if int(timestamp) in self.missing else np.eye(4, dtype=np.float64)
 
 
 class HybridPipelineTest(unittest.TestCase):
@@ -242,52 +269,99 @@ class HybridPipelineTest(unittest.TestCase):
             self.assertEqual(result["labels"], 2)
 
 
-class LongStationaryNonmotorizedTest(unittest.TestCase):
-    def test_long_static_nmv_track_is_dropped(self):
+class ShortMotionNonmotorizedTest(unittest.TestCase):
+    def test_static_nmv_track_is_dropped(self):
         frames = _moving_frames("Nonmotorized_vehicle", [0.0] * 10)
-        dropped, stats = drop_long_stationary_nonmotorized(
-            frames, _IdentityCoords(), min_frames=8,
-            max_world_displacement=1.0)
+        dropped, stats = drop_short_motion_nonmotorized(
+            frames, _IdentityCoords(), min_net_displacement=15.0)
         self.assertEqual(dropped, {7})
         self.assertEqual(stats["tracks_dropped"], 1)
         self.assertEqual(stats["boxes_removed"], 10)
         self.assertTrue(all(not frame["detections"] for frame in frames))
 
-    def test_moving_nmv_track_is_kept(self):
+    def test_nmv_track_with_net_displacement_over_15m_is_kept(self):
         frames = _moving_frames(
-            "Nonmotorized_vehicle", [0.2 * index for index in range(10)])
-        dropped, stats = drop_long_stationary_nonmotorized(
-            frames, _IdentityCoords(), min_frames=8,
-            max_world_displacement=1.0)
+            "Nonmotorized_vehicle", [0.0, 4.0, 8.0, 12.0, 16.0, 20.0])
+        dropped, stats = drop_short_motion_nonmotorized(
+            frames, _IdentityCoords(), min_net_displacement=15.0)
         self.assertEqual(dropped, set())
-        self.assertEqual(stats["tracks_checked"], 1)
+        self.assertEqual(stats["tracks_seen"], 1)
+        self.assertEqual(stats["tracks_dropped"], 0)
         self.assertTrue(all(len(frame["detections"]) == 1 for frame in frames))
 
-    def test_track_with_cumulative_movement_is_kept(self):
-        # span stays <= 1m, but cumulative world path exceeds 1m: the track
-        # must be kept so waiting/creeping objects are not dropped.
+    def test_jitter_does_not_keep_static_nmv_track(self):
+        # Same start/end center despite large frame-to-frame jitter: net
+        # displacement is small, so the noisy track must be removed.
         frames = _moving_frames(
             "Nonmotorized_vehicle",
-            [0.6 * (index % 2) for index in range(10)])
-        dropped, stats = drop_long_stationary_nonmotorized(
-            frames, _IdentityCoords(), min_frames=8,
-            max_world_displacement=1.0)
-        self.assertEqual(dropped, set())
-        self.assertEqual(stats["tracks_dropped"], 0)
+            [5.0 * (index % 2) for index in range(10)])
+        dropped, _stats = drop_short_motion_nonmotorized(
+            frames, _IdentityCoords(), min_net_displacement=15.0)
+        self.assertEqual(dropped, {7})
 
-    def test_short_static_nmv_track_is_kept(self):
-        frames = _moving_frames("Nonmotorized_vehicle", [0.0] * 6)
-        dropped, _stats = drop_long_stationary_nonmotorized(
-            frames, _IdentityCoords(), min_frames=8,
-            max_world_displacement=1.0)
+    def test_missing_pose_frames_are_skipped_from_displacement(self):
+        centers = [0.0, 100.0, 0.0, 0.0, 0.0]
+        frames = _moving_frames("Nonmotorized_vehicle", centers)
+        coords = _MissingPoseCoords({2_000_000_000})
+        dropped, stats = drop_short_motion_nonmotorized(
+            frames, coords, min_net_displacement=15.0)
+        # After skipping the missing-pose frame the usable net displacement is
+        # 0m, so the track is removed; including it would have reported 100m.
+        self.assertEqual(dropped, {7})
+        self.assertEqual(stats["tracks_dropped"], 1)
+
+    def test_unmeasurable_track_is_kept(self):
+        frames = _moving_frames("Nonmotorized_vehicle", [0.0] * 5)
+        coords = _MissingPoseCoords(
+            {1_000_000_000, 2_000_000_000, 4_000_000_000, 5_000_000_000})
+        dropped, stats = drop_short_motion_nonmotorized(
+            frames, coords, min_net_displacement=15.0)
         self.assertEqual(dropped, set())
+        self.assertEqual(stats["tracks_unmeasurable"], 1)
+        self.assertTrue(all(len(frame["detections"]) == 1 for frame in frames))
 
     def test_static_track_of_other_class_is_kept(self):
         frames = _moving_frames("Truck", [0.0] * 10)
-        dropped, _stats = drop_long_stationary_nonmotorized(
-            frames, _IdentityCoords(), min_frames=8,
-            max_world_displacement=1.0)
+        dropped, _stats = drop_short_motion_nonmotorized(
+            frames, _IdentityCoords(), min_net_displacement=15.0)
         self.assertEqual(dropped, set())
+
+
+class FrameCarOverlapTest(unittest.TestCase):
+    def test_car_covered_by_truck_is_removed_in_that_frame_only(self):
+        main = {
+            "1": [_car_label("car-1", x=0.0)],
+            "2": [_car_label("car-1", x=0.0)],
+        }
+        expd = [
+            {"frame_id": "1", "detections": [_tb_det(1, "Truck", x=0.0)]},
+            {"frame_id": "2", "detections": [_tb_det(1, "Truck", x=30.0)]},
+        ]
+        output, stats = merge_label_frames(main, expd)
+        first = {label["obj_type"] for label in output[0]["labels"]}
+        second = {label["obj_type"] for label in output[1]["labels"]}
+        self.assertNotIn("Car", first)
+        self.assertIn("Truck", first)
+        self.assertIn("Car", second)
+        self.assertEqual(stats["frame_car_overlap"]["car_labels_removed"], 1)
+        self.assertEqual(stats["class_counts"]["Car"], 1)
+
+    def test_car_overlap_at_or_below_half_is_kept(self):
+        main = {"1": [_car_label("car-1", x=0.0, dx=4.0, dy=2.0)]}
+        # Car 4x2 at x=0; Truck 4x2 at x=2.0 -> intersection/car = 0.5.
+        expd = [{"frame_id": "1",
+                 "detections": [_tb_det(1, "Truck", x=2.0, dx=4.0, dy=2.0)]}]
+        output, stats = merge_label_frames(main, expd)
+        self.assertIn("Car", {label["obj_type"] for label in output[0]["labels"]})
+        self.assertEqual(stats["frame_car_overlap"]["car_labels_removed"], 0)
+
+    def test_car_covered_by_bus_is_removed(self):
+        main = {"1": [_car_label("car-1", x=0.0)]}
+        expd = [{"frame_id": "1", "detections": [_tb_det(1, "Bus", x=0.0)]}]
+        output, stats = merge_label_frames(main, expd)
+        self.assertNotIn("Car", {label["obj_type"] for label in output[0]["labels"]})
+        self.assertIn("Bus", {label["obj_type"] for label in output[0]["labels"]})
+        self.assertEqual(stats["frame_car_overlap"]["car_labels_removed"], 1)
 
 
 if __name__ == "__main__":

@@ -147,6 +147,87 @@ def _absorb_high_iou_cross_class(
     }
 
 
+def _remove_frame_level_car_overlap(
+        frames: List[Dict[str, Any]],
+        *,
+        threshold: float = 0.5,
+) -> Dict[str, Any]:
+    """Remove a Car label only in a frame where Truck/Bus covers it.
+
+    The overlap metric is BEV intersection area divided by the Car box area.
+    Only the Car label in that single frame is removed; Truck/Bus labels and
+    the same Car track in all other frames are kept.  This runs after the
+    existing track-level high-IoU absorption policy and does not change it.
+    """
+    removed: List[Dict[str, Any]] = []
+    pairs_tested = 0
+    for frame in frames:
+        labels = frame.get("labels", [])
+        if not labels:
+            continue
+        blockers: List[tuple[Mapping[str, Any], List[float]]] = []
+        for label in labels:
+            if str(label.get("obj_type")) not in ("Truck", "Bus"):
+                continue
+            try:
+                blockers.append((label, _label_to_box(label)))
+            except (KeyError, TypeError, ValueError):
+                continue
+        if not blockers:
+            continue
+
+        kept: List[Any] = []
+        for label in labels:
+            if str(label.get("obj_type")) != "Car":
+                kept.append(label)
+                continue
+            try:
+                car_box = _label_to_box(label)
+                car_poly = tracking.rectangle_corners(
+                    car_box[:2], car_box[3:5], car_box[6])
+                car_area = tracking.polygon_area(car_poly)
+            except (KeyError, TypeError, ValueError):
+                kept.append(label)
+                continue
+
+            hit: tuple[Mapping[str, Any], float] | None = None
+            if car_area > 1e-9:
+                for blocker, blocker_box in blockers:
+                    blocker_poly = tracking.rectangle_corners(
+                        blocker_box[:2], blocker_box[3:5], blocker_box[6])
+                    intersection = tracking.polygon_area(
+                        tracking.convex_intersection(car_poly, blocker_poly))
+                    pairs_tested += 1
+                    ratio = float(intersection) / float(car_area)
+                    if ratio > float(threshold):
+                        hit = (blocker, ratio)
+                        break
+            if hit is None:
+                kept.append(label)
+                continue
+            blocker, ratio = hit
+            removed.append({
+                "frame_id": str(frame.get("frame_id", "")),
+                "car_obj_id": str(label.get("obj_id")),
+                "blocker_obj_id": str(blocker.get("obj_id")),
+                "blocker_type": str(blocker.get("obj_type")),
+                "intersection_over_car": round(float(ratio), 4),
+            })
+        frame["labels"] = kept
+
+    return {
+        "policy": {
+            "metric": "bev_intersection_area_over_car_area",
+            "threshold": float(threshold),
+            "scope": "single frame only",
+            "kept": ["Car in other frames", "Truck", "Bus"],
+        },
+        "pairs_tested": pairs_tested,
+        "car_labels_removed": len(removed),
+        "removed": removed,
+    }
+
+
 def merge_label_frames(
         main_labels: Mapping[str, Sequence[Mapping[str, Any]]],
         expd_frames: Sequence[Mapping[str, Any]],
@@ -218,6 +299,10 @@ def merge_label_frames(
             expd_count += 1
         output.append({"frame_id": frame_id, "labels": labels})
 
+    frame_overlap_stats = _remove_frame_level_car_overlap(output)
+    final_class_counts: Counter[str] = Counter(
+        str(label.get("obj_type", ""))
+        for frame in output for label in frame.get("labels", []))
     main_count = sum(len(labels) for labels in filtered_main.values())
     return output, {
         "pipeline": "hybrid_merge",
@@ -225,7 +310,9 @@ def merge_label_frames(
         "main_car_detections": main_count,
         "expd_non_car_detections": expd_count,
         "merged_detections": sum(len(frame["labels"]) for frame in output),
-        "class_counts": dict(sorted(class_counts.items())),
+        "class_counts": dict(sorted(final_class_counts.items())),
+        "class_counts_before_frame_overlap": dict(sorted(class_counts.items())),
+        "frame_car_overlap": frame_overlap_stats,
         "track_id_remap": {
             "source_track_ids": sorted(source_ids),
             "remapped_track_ids": id_map,

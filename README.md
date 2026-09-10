@@ -109,12 +109,15 @@ Car/Truck/Bus 头，只训练 Pedestrian / Nonmotorized_vehicle 头）；Car 仍
 - `Truck` / `Bus`: `0.4`
 - `Pedestrian` / `Nonmotorized_vehicle`: `0.1`
 
-Step3 几何精修后、导出 base_link 之前，还会整条删除“纯静止”的非机动车轨迹：
-只处理观测帧数 `>= 8` 的 `Nonmotorized_vehicle` 轨迹；只有世界坐标系下
-“最大两两 XY 中心位移”和“累计中心移动路径”都 `<= 1.0m` 时才删除。
-轨迹期间只要出现过 1m 以上的中心移动（包括缓慢累计移动）就保留整条轨迹，
-避免误伤等红绿灯后起步的非机动车。阈值可通过
-`--static-nmv-min-frames` / `--static-nmv-max-displacement` 调整。
+Step3 几何精修后、导出 base_link 之前，`Nonmotorized_vehicle` 只保留
+**world 系首尾净位移 `> 15m`** 的轨迹：首尾中心取该轨迹最早和最晚的可用观测，
+pose 缺失的帧不参与计算；净位移 `<= 15m` 的轨迹整条删除，不足两帧可用的轨迹
+保留（无法测量）。首尾净位移不受相邻帧抖动影响。阈值可通过
+`--nonmotorized-min-net-displacement` 调整。
+
+Car 与非车合并时还有一条逐帧规则：若同一帧内有 **Truck 或 Bus 与某个 Car 的
+BEV 交集面积 / Car 面积 `> 0.5`**，只删除这一帧的这个 Car，Truck/Bus 保留，
+该 Car 在其他帧不受影响。原有 `BEV IoU >= 0.8` 的整条轨迹吸收规则保持不变。
 
 可用 `--noncar-ckpt models/vod_2cls_ft_e25.pth` 切换到 e25 版本（行人召回更高，
 耗时也更长）。若 `models/*.pth` 只有 133 字节，说明是 Git LFS 指针，先

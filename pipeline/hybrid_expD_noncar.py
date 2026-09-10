@@ -179,27 +179,25 @@ def drop_spinning_vehicle(
     }
 
 
-def drop_long_stationary_nonmotorized(
+def drop_short_motion_nonmotorized(
         frames: List[Dict[str, Any]],
         coords: tracking.CoordinateProvider,
         *,
-        min_frames: int = 8,
-        max_world_displacement: float = 1.0,
+        min_net_displacement: float = 15.0,
         class_name: str = "Nonmotorized_vehicle",
 ) -> tuple[set[int], Dict[str, Any]]:
-    """Drop Nonmotorized_vehicle tracks that are purely stationary in world.
+    """Keep only Nonmotorized_vehicle tracks with enough net displacement.
 
-    Only tracks with at least ``min_frames`` observations are considered.  A
-    track is removed only when, in the world frame, both its maximum pairwise
-    XY center displacement and its cumulative XY center path length are at
-    most ``max_world_displacement`` meters.  A track that shows any center
-    movement above the threshold (including slow cumulative movement) is kept
-    as a whole, which protects e.g. red-light waiters that start moving later
-    in the clip.  Tracks with missing pose transforms are also kept, because a
-    missing pose could hide real motion.
+    For each track the world-frame XY net displacement between its first and
+    last usable observation is computed.  Frames whose pose transform is
+    unavailable are skipped from this calculation.  A track is removed when
+    its net displacement is at most ``min_net_displacement`` meters.  Jitter
+    does not affect the criterion because only the two end centers are used.
+    Tracks with fewer than two usable observations are kept because their net
+    displacement cannot be measured.
     """
     observations: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
-    tracks_with_missing_pose: set[int] = set()
+    tracks_seen: set[int] = set()
     for frame in frames:
         try:
             timestamp = int(frame["frame_id"])
@@ -212,8 +210,10 @@ def drop_long_stationary_nonmotorized(
             if det.get("track_id") is None or not tracking.finite_box(det):
                 continue
             track_id = int(det["track_id"])
+            tracks_seen.add(track_id)
             if world_from_lidar is None:
-                tracks_with_missing_pose.add(track_id)
+                # Missing pose frames do not participate in the net
+                # displacement calculation.
                 continue
             center = tracking.center_world(det["box_lidar"], world_from_lidar)
             observations[track_id].append({
@@ -223,37 +223,28 @@ def drop_long_stationary_nonmotorized(
 
     dropped: set[int] = set()
     details: List[Dict[str, Any]] = []
+    unmeasurable = 0
     for track_id, items in sorted(observations.items()):
-        if track_id in tracks_with_missing_pose:
+        items = sorted(items, key=lambda item: int(item["frame_id"]))
+        if len(items) < 2:
+            unmeasurable += 1
             continue
-        if len(items) < int(min_frames):
+        first, last = items[0], items[-1]
+        net_displacement = float(
+            np.linalg.norm(last["center_xy"] - first["center_xy"]))
+        if net_displacement > float(min_net_displacement):
             continue
-        centers = np.stack([item["center_xy"] for item in items])
-        deltas = centers[:, None, :] - centers[None, :, :]
-        world_span = float(np.sqrt(np.sum(deltas * deltas, axis=2)).max())
-        if len(centers) > 1:
-            steps = centers[1:] - centers[:-1]
-            world_path_length = float(
-                np.sqrt(np.sum(steps * steps, axis=1)).sum())
-        else:
-            world_path_length = 0.0
-        # A track with movement above the threshold anywhere in its lifetime is
-        # kept as a whole.  Only completely still tracks are removed.
-        if (world_span > float(max_world_displacement)
-                or world_path_length > float(max_world_displacement)):
-            continue
-        timestamps = [int(item["frame_id"]) for item in items]
-        duration_sec = (max(timestamps) - min(timestamps)) / 1e9
         dropped.add(track_id)
         details.append({
             "track_id": track_id,
             "observations": len(items),
-            "duration_sec": round(float(duration_sec), 3),
-            "world_span_m": round(world_span, 4),
-            "world_path_length_m": round(world_path_length, 4),
-            "first_frame": min(timestamps),
-            "last_frame": max(timestamps),
+            "net_displacement_m": round(net_displacement, 4),
+            "first_frame": int(first["frame_id"]),
+            "last_frame": int(last["frame_id"]),
         })
+
+    # Tracks with no usable pose at all are unmeasurable as well.
+    unmeasurable += len(tracks_seen - set(observations))
 
     removed = 0
     for frame in frames:
@@ -271,13 +262,14 @@ def drop_long_stationary_nonmotorized(
         frame["num_detections"] = len(kept)
 
     return dropped, {
-        "pipeline": "hybrid_drop_long_stationary_nonmotorized",
+        "pipeline": "hybrid_drop_short_motion_nonmotorized",
         "class": class_name,
-        "min_frames": int(min_frames),
-        "max_world_displacement": float(max_world_displacement),
-        "tracks_with_missing_pose": len(tracks_with_missing_pose),
-        "tracks_checked": len(observations),
+        "min_net_displacement_m": float(min_net_displacement),
+        "tracks_seen": len(tracks_seen),
+        "tracks_measured": len(observations),
+        "tracks_unmeasurable": unmeasurable,
         "tracks_dropped": len(dropped),
+        "tracks_kept": len(tracks_seen) - len(dropped) - unmeasurable,
         "boxes_removed": removed,
         "dropped_track_ids": sorted(dropped),
         "details": details,
@@ -293,8 +285,7 @@ def run(raw_json: Path, clip: Path, out_json: Path,
         class_score_thresholds: Mapping[str, float] | None = None,
         pedestrian_max_distance: float = 20.0,
         nonmotorized_max_distance: float = 60.0,
-        static_nmv_min_frames: int = 8,
-        static_nmv_max_displacement: float = 1.0) -> Dict[str, Any]:
+        nonmotorized_min_net_displacement: float = 15.0) -> Dict[str, Any]:
     source = json.loads(Path(raw_json).read_text(encoding="utf-8"))
     if not isinstance(source, list):
         raise ValueError(f"input must be a list of frames: {raw_json}")
@@ -311,7 +302,7 @@ def run(raw_json: Path, clip: Path, out_json: Path,
             "current_identity_tracking",
             "current_class_correction_and_filters_without_static_car_pass",
             "current_non_car_geometry_refinement",
-            "drop_long_stationary_nonmotorized",
+            "drop_short_motion_nonmotorized",
             "base_link_conversion",
         ],
     }
@@ -365,12 +356,11 @@ def run(raw_json: Path, clip: Path, out_json: Path,
 
     processed = json.loads(step3_json.read_text(encoding="utf-8"))
     coords = tracking.CoordinateProvider(Path(clip))
-    _static_dropped, static_stats = drop_long_stationary_nonmotorized(
+    _short_dropped, short_motion_stats = drop_short_motion_nonmotorized(
         processed, coords,
-        min_frames=static_nmv_min_frames,
-        max_world_displacement=static_nmv_max_displacement,
+        min_net_displacement=nonmotorized_min_net_displacement,
     )
-    diagnostics["long_stationary_nonmotorized"] = static_stats
+    diagnostics["nonmotorized_short_motion"] = short_motion_stats
     _spin_dropped, spin_stats = drop_spinning_vehicle(processed)
     diagnostics["spinning_truck_bus"] = spin_stats
     output, final_diag = apply_five_class_output(processed, coords)
@@ -420,8 +410,10 @@ def main() -> None:
     parser.add_argument("--nonmotorized-score-threshold", type=float)
     parser.add_argument("--pedestrian-max-distance", type=float, default=20.0)
     parser.add_argument("--nonmotorized-max-distance", type=float, default=60.0)
-    parser.add_argument("--static-nmv-min-frames", type=int, default=8)
-    parser.add_argument("--static-nmv-max-displacement", type=float, default=1.0)
+    parser.add_argument("--nonmotorized-min-net-displacement", type=float,
+                        default=15.0,
+                        help="keep NMV tracks whose world-frame XY net "
+                             "displacement is greater than this")
     args = parser.parse_args()
     class_thresholds = {}
     for name, value in (
@@ -441,8 +433,8 @@ def main() -> None:
         class_score_thresholds=class_thresholds,
         pedestrian_max_distance=args.pedestrian_max_distance,
         nonmotorized_max_distance=args.nonmotorized_max_distance,
-        static_nmv_min_frames=args.static_nmv_min_frames,
-        static_nmv_max_displacement=args.static_nmv_max_displacement,
+        nonmotorized_min_net_displacement=(
+            args.nonmotorized_min_net_displacement),
     )
     print(json.dumps({
         "pipeline": result["pipeline"],
