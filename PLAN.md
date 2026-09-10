@@ -762,3 +762,25 @@ Pass 2（局部）:
   避免运动方向直接锁死 box yaw；后续可改成只做 π 等价翻转。
 - 当前生效的只有：moving seed / 区域扩展 / queue 拼接 /
   槽位释放 / occlusion 2.6s / 静态冻结 / 方向车道 gate。
+
+### 19.11 单帧噪点 / yaw 反转最终对齐（2026-09-10）
+
+- **queue 语义保持中位数纵向位置**：区间相邻分组的尝试已回滚，
+  因为它会把一条长轨迹的纵向区间拉宽，导致大量 track 链成一个大队列，
+  影响已有合并。130→55 如果这样拼不上，就不强行拼。
+- **单帧 overlap 噪点过滤（启用）**：
+  - 每个 frame 内，非纯停车 Car 两框 `BEV IoU > 0.02`；
+  - 读取原始 `lidar/lidar_top/*.bin`，分别统计两个框内点数；
+  - 删除点数少的那一帧 detection，只删单帧；
+  - 点数相同则不动；
+  - 纯停车 track 不参与；
+  - 示例：clip5 car130 vs car34，IoU=0.0382，点 14 vs 202，
+    删除 car130 的 t=655.8 帧。
+- **yaw 反转（启用，放在最终 ID 定下来之后）**：
+  - 用整条最终运动轨迹的 robust heading；
+  - 每帧计算 directed `yaw - heading`（wrap 到 [-pi, pi]）；
+  - 若 track 的中位 `|directed| > 150°`，整条 track 的 yaw 加 pi；
+  - 位置 / 尺寸 / 中心不动，不重跑 box fit；
+  - 纯停车不参与。
+- **moving fragment seed**：暂不加入；如果 130→55 在 pass2 拼不上，
+  就保持分开，等后续需要再评估。

@@ -20,11 +20,13 @@ from __future__ import annotations
 import copy
 import math
 from collections import Counter, defaultdict
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
+from filtering.hard_filters import count_points_in_boxes
 from geometry.car_box_fit import CarBoxFitConfig, apply_car_box_fit
 from geometry.yaw_static_direction import _world_yaw_to_local
 from region.dynamic_region import (
@@ -57,6 +59,15 @@ class Step45Config:
     # Experimental post-pass2 dynamic yaw overwrite.  Disabled by default;
     # enable only after the yaw-lock issue is resolved.
     yaw_align_enabled: bool = False
+    # Reviewed single-frame overlap noise filter (pass 1):
+    # same-frame Car boxes with IoU > threshold -> remove the one with fewer
+    # lidar points inside its box; equal points -> do nothing.
+    overlap_filter_enabled: bool = True
+    overlap_iou_threshold: float = 0.02
+    # Reviewed whole-track yaw reversal (after final IDs):
+    # if the motion trajectory is opposite to box yaw, add pi to yaw only.
+    yaw_reversal_enabled: bool = True
+    yaw_reversal_threshold_deg: float = 150.0
     # Moving seed / pure static classification (PLAN section 19).
     moving_seed_net_min_m: float = 8.0
     moving_seed_concentration_min: float = 0.5
@@ -381,6 +392,114 @@ def direction_filter(
             1 for track_id in tracks if int(track_id) in dynamic_ids),
         "noise_detections_removed": removed,
         "noise_details": details[:200],
+    }
+
+
+def _load_lidar_xyz(clip: Path, frame_id: str) -> Optional[np.ndarray]:
+    path = Path(clip) / "lidar" / "lidar_top" / f"{frame_id}.bin"
+    if not path.is_file():
+        return None
+    values = np.fromfile(path, dtype=np.float32)
+    if values.size % 4 != 0:
+        return None
+    return values.reshape(-1, 4)[:, :3]
+
+
+def single_frame_overlap_filter(
+        frames: Sequence[Mapping[str, Any]],
+        tracks: Mapping[int, Sequence[Mapping[str, Any]]],
+        clip: Path,
+        config: Step45Config,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    """Pass-1 single-frame overlap noise filter (reviewed).
+
+    Same-frame Car boxes with BEV IoU > threshold are compared by the number
+    of lidar points inside each box.  The detection with fewer points is
+    removed for that frame only; equal point counts leave both untouched.
+    Pure parked tracks are excluded.
+    """
+    stats_by_id: Dict[int, Optional[Dict[str, float]]] = {}
+    eligible: set[int] = set()
+    for track_id, items in tracks.items():
+        stats = track_motion_stats(items)
+        stats_by_id[int(track_id)] = stats
+        if stats is not None and not is_pure_static(stats, config):
+            eligible.add(int(track_id))
+
+    removed: set[Tuple[int, int]] = set()
+    details: List[Dict[str, Any]] = []
+    for frame_index, frame in enumerate(frames):
+        detections = frame.get("detections", [])
+        indices = [
+            index for index, det in enumerate(detections)
+            if det.get("track_id") is not None
+            and int(det["track_id"]) in eligible
+        ]
+        if len(indices) < 2:
+            continue
+        points = None
+        for left in range(len(indices)):
+            for right in range(left + 1, len(indices)):
+                i, j = indices[left], indices[right]
+                if (frame_index, i) in removed or (frame_index, j) in removed:
+                    continue
+                box_i = detections[i].get("box_lidar")
+                box_j = detections[j].get("box_lidar")
+                if not (isinstance(box_i, list) and len(box_i) >= 7
+                        and isinstance(box_j, list) and len(box_j) >= 7):
+                    continue
+                iou = tracking.bev_iou(
+                    box_i[:2], np.asarray(box_i[3:6], dtype=np.float64),
+                    float(box_i[6]),
+                    box_j[:2], np.asarray(box_j[3:6], dtype=np.float64),
+                    float(box_j[6]))
+                if iou <= float(config.overlap_iou_threshold):
+                    continue
+                if points is None:
+                    points = _load_lidar_xyz(
+                        Path(clip), str(frame["frame_id"]))
+                if points is None:
+                    continue
+                counts = count_points_in_boxes(points, [box_i, box_j])
+                if counts[0] < counts[1]:
+                    removed.add((frame_index, i))
+                elif counts[1] < counts[0]:
+                    removed.add((frame_index, j))
+                else:
+                    continue
+                details.append({
+                    "frame_index": frame_index,
+                    "frame_id": str(frame["frame_id"]),
+                    "kept_track_id": int(
+                        detections[j if counts[0] < counts[1] else i][
+                            "track_id"]),
+                    "removed_track_id": int(
+                        detections[i if counts[0] < counts[1] else j][
+                            "track_id"]),
+                    "iou": round(float(iou), 4),
+                    "points_kept": int(max(counts)),
+                    "points_removed": int(min(counts)),
+                })
+
+    output: List[Dict[str, Any]] = []
+    removed_count = 0
+    for frame_index, frame in enumerate(frames):
+        kept = []
+        for detection_index, det in enumerate(frame.get("detections", [])):
+            if (frame_index, detection_index) in removed:
+                removed_count += 1
+                continue
+            kept.append(copy.deepcopy(det))
+        new_frame = copy.deepcopy(frame)
+        new_frame["detections"] = kept
+        new_frame["num_detections"] = len(kept)
+        output.append(new_frame)
+    return output, details, {
+        "enabled": True,
+        "iou_threshold": float(config.overlap_iou_threshold),
+        "eligible_tracks": len(eligible),
+        "noise_detections_removed": removed_count,
+        "removed_details": details[:200],
     }
 
 
@@ -1086,7 +1205,9 @@ def queue_stitch(
     direction_by_id = {int(item["direction_id"]): item for item in directions}
 
     # Build queues: cluster lateral lanes first (lane width ~3.5m), then
-    # group longitudinal neighbours <=20m inside each lane.
+    # group longitudinal neighbours <=20m inside each lane.  This is the
+    # reviewed median-position semantics; interval-based grouping was tested
+    # and reverted because it can chain many tracks into one huge queue.
     queues: List[List[Tuple[float, float, int]]] = []
     for direction in directions:
         direction_id = int(direction["direction_id"])
@@ -1605,6 +1726,66 @@ def align_dynamic_yaw(
         "dynamic_yaw_aligned": changed,
         "tracks": len(details),
         "details": details,
+    }
+
+
+def revert_dynamic_yaw(
+        frames: List[Dict[str, Any]],
+        tracks: Mapping[int, Sequence[Mapping[str, Any]]],
+        config: Step45Config,
+) -> Dict[str, Any]:
+    """Whole-track yaw reversal after final IDs (reviewed).
+
+    If the final motion trajectory is consistently opposite to box yaw
+    (median directed difference > threshold), add pi to every detection yaw
+    of that track.  Position and size are never changed.  Pure parked tracks
+    are excluded.
+    """
+    by_final: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for items in tracks.values():
+        for item in items:
+            final_id = item["det"].get("track_id")
+            if final_id is not None:
+                by_final[int(final_id)].append(item)
+    threshold = math.radians(float(config.yaw_reversal_threshold_deg))
+    flipped = 0
+    details: List[Dict[str, Any]] = []
+    for final_id, items in by_final.items():
+        stats = track_motion_stats(items)
+        if stats is None or is_pure_static(stats, config):
+            continue
+        if float(stats["net"]) < 1.0:
+            continue
+        heading = _robust_track_heading(items)
+        if heading is None:
+            continue
+        directed = np.asarray([
+            _wrap_angle(float(item["yaw"]) - float(heading))
+            for item in items
+        ], dtype=np.float64)
+        median_abs = float(np.median(np.abs(directed)))
+        if median_abs <= threshold:
+            continue
+        for item in items:
+            box = item["det"].get("box_lidar")
+            if not isinstance(box, list) or len(box) < 7:
+                continue
+            box[6] = float(_wrap_angle(float(box[6]) + math.pi))
+            item["yaw"] = float(_wrap_angle(float(item["yaw"]) + math.pi))
+            flipped += 1
+        details.append({
+            "track_id": int(final_id),
+            "observations": len(items),
+            "trajectory_heading_deg": round(math.degrees(float(heading)), 3),
+            "median_directed_diff_deg": round(
+                math.degrees(median_abs), 3),
+        })
+    return {
+        "enabled": bool(config.yaw_reversal_enabled),
+        "threshold_deg": float(config.yaw_reversal_threshold_deg),
+        "reversed_detections": flipped,
+        "reversed_tracks": len(details),
+        "details": details[:200],
     }
 
 

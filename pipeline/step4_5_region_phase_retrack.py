@@ -32,8 +32,10 @@ from region.retrack import (
     queue_stitch,
     region_mask,
     retrack_dynamic,
+    revert_dynamic_yaw,
     seed_track_ids,
     select_retrackable,
+    single_frame_overlap_filter,
     verify_static_freeze,
 )
 from tracking import tracker_conservative as tracking
@@ -47,6 +49,20 @@ def run(step4_json: Path, clip: Path, step2_diagnostics: Path,
         raise ValueError(f"step4 input must be a list of frames: {step4_json}")
     step2 = json.loads(Path(step2_diagnostics).read_text(encoding="utf-8"))
     coords = tracking.CoordinateProvider(Path(clip))
+
+    # Pass-1 single-frame overlap noise filter.
+    tracks_pass1, _by_key = collect_world_tracks(frames, coords)
+    if config.overlap_filter_enabled:
+        frames, overlap_details, overlap_filter_diag = (
+            single_frame_overlap_filter(
+                frames, tracks_pass1, Path(clip), config))
+    else:
+        overlap_details = []
+        overlap_filter_diag = {
+            "enabled": False,
+            "noise_detections_removed": 0,
+            "removed_details": [],
+        }
 
     # Optional pass-1 driving-direction noise filter (disabled by default:
     # it can lock yaw on some vehicles).
@@ -116,6 +132,15 @@ def run(step4_json: Path, clip: Path, step2_diagnostics: Path,
             "tracks": 0,
             "details": [],
         }
+    if config.yaw_reversal_enabled:
+        yaw_reversal_diag = revert_dynamic_yaw(frames, tracks, config)
+    else:
+        yaw_reversal_diag = {
+            "enabled": False,
+            "reversed_detections": 0,
+            "reversed_tracks": 0,
+            "details": [],
+        }
     static_freeze = verify_static_freeze(
         before_step45, frames, exempt_keys)
 
@@ -141,6 +166,8 @@ def run(step4_json: Path, clip: Path, step2_diagnostics: Path,
         "candidate_track_ids": sorted(seeds),
         "direction_filter": direction_filter_diag,
         "direction_filter_details": direction_filter_details,
+        "overlap_filter": overlap_filter_diag,
+        "overlap_filter_details": overlap_details,
         "selection": selection,
         "retracking": retrack_diagnostics,
         "id_inheritance": inheritance,
@@ -155,6 +182,7 @@ def run(step4_json: Path, clip: Path, step2_diagnostics: Path,
         "phase_stitching": phase,
         "box_fit": box_fit_diagnostics,
         "dynamic_yaw_alignment": yaw_diagnostics,
+        "yaw_reversal": yaw_reversal_diag,
         "static_freeze": static_freeze,
         "final_detections": sum(
             len(frame.get("detections", [])) for frame in frames),
@@ -204,6 +232,10 @@ def main() -> None:
             "retrackable_detections"],
         "direction_noise_removed": diagnostics[
             "direction_filter"]["noise_detections_removed"],
+        "overlap_noise_removed": diagnostics[
+            "overlap_filter"]["noise_detections_removed"],
+        "yaw_reversed_detections": diagnostics[
+            "yaw_reversal"]["reversed_detections"],
         "id_assignments": len(diagnostics["id_inheritance"]["assignments"]),
         "queue_merges": len(diagnostics["queue_stitching"]["merges"]),
         "phase_merges": len(diagnostics["phase_stitching"]["applied"]),
