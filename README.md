@@ -107,7 +107,10 @@ Car/Truck/Bus 头，只训练 Pedestrian / Nonmotorized_vehicle 头）；Car 仍
 生成。默认类别分数阈值为：
 
 - `Truck` / `Bus`: `0.4`
-- `Pedestrian` / `Nonmotorized_vehicle`: `0.1`
+- `Pedestrian`: `0.15`
+- `Nonmotorized_vehicle`: `0.20`
+
+非车 raw 推理阈值默认取上述类别阈值的最小值（当前 `0.15`）。
 
 Step3 几何精修后、导出 base_link 之前，`Nonmotorized_vehicle` 只保留
 **world 系首尾净位移 `> 15m`** 的轨迹：首尾中心取该轨迹最早和最晚的可用观测，
@@ -127,11 +130,15 @@ BEV 交集面积 / Car 面积 `> 0.5`**，只删除这一帧的这个 Car，Truc
 
 RTX A4000 16GB、不与其他大任务并行时，混合链路单个 80 帧 clip：
 
-- `vod_2cls_ft_e12.pth`（默认）：约 4.5–5 分钟/clip
-- `vod_2cls_ft_e25.pth`：约 5.5–6.5 分钟/clip
+- `vod_2cls_ft_e12.pth`（默认，Ped `0.15` / NMV `0.20`）：约
+  2.5 分钟/clip；本机 4-clip 实测平均约 2.4 分钟（主链约 80–87s，非车链
+  约 54–68s）。
+- 若把 Ped/NMV 阈值调回 `0.1`：非车 raw 检测数约 2.0–2.2 万/clip，
+  单 clip 约 4.5–5 分钟。
+- `vod_2cls_ft_e25.pth`：Ped/NMV 候选比 e12 更多，耗时更长。
 
-其中 Waymo-Car 主链约 1.5–2 分钟，非车推理约 1 分钟，其余为 CPU 后处理；
-Ped/NMV 阈值为 0.1 时检测数显著增多，后处理会比默认 expD 慢。
+CPU 后处理（跟踪关联、可见度、几何精修）是主要瓶颈；阈值越低、低分候选
+越多，耗时越久。
 
 ## 目录
 

@@ -271,9 +271,9 @@ def main() -> int:
     parser.add_argument("--bus-score-threshold", type=float,
                         help="default 0.4 when --score-threshold is unset")
     parser.add_argument("--pedestrian-score-threshold", type=float,
-                        help="default 0.1 when --score-threshold is unset")
+                        help="default 0.15 when --score-threshold is unset")
     parser.add_argument("--nonmotorized-score-threshold", type=float,
-                        help="default 0.1 when --score-threshold is unset")
+                        help="default 0.2 when --score-threshold is unset")
     parser.add_argument("--pedestrian-max-distance", type=float, default=20.0)
     parser.add_argument("--nonmotorized-max-distance", type=float, default=60.0)
     parser.add_argument("--sparsity-max-points", type=int, default=10)
@@ -319,8 +319,9 @@ def main() -> int:
         base = {
             "Truck": 0.4,
             "Bus": 0.4,
-            "Pedestrian": 0.1,
-            "Nonmotorized_vehicle": 0.1,
+            # Higher-recall defaults for the VOD-finetuned non-Car heads.
+            "Pedestrian": 0.15,
+            "Nonmotorized_vehicle": 0.2,
         }
     class_thresholds: Dict[str, float] = {
         name: float(explicit[name]) if explicit[name] is not None else base[name]
