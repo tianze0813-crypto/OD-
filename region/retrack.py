@@ -1202,8 +1202,6 @@ def queue_stitch(
         items.sort(key=lambda value: value["timestamp"])
     if len(by_final) < 2:
         return {"queues": 0, "edges": 0, "merges": [], "modified_keys": []}
-    stats = {final_id: track_motion_stats(items)
-             for final_id, items in by_final.items()}
 
     directions, assignments = _direction_assignments(by_final, config)
     direction_by_id = {int(item["direction_id"]): item for item in directions}
@@ -1369,19 +1367,15 @@ def queue_stitch(
         if len(members) < 2:
             continue
         members = sorted(members)
-        # A queue component must contain at least one clear moving seed and
-        # every pair of its members must be time-disjoint.
-        has_seed = False
-        for member in members:
-            member_stats = stats.get(member)
-            if member_stats is None:
-                continue
-            if (member in seed_ids
-                    or is_moving_seed(member_stats, config)
-                    or is_weak_moving_seed(member_stats, config)):
-                has_seed = True
-                break
-        if not has_seed:
+        # A queue component must contain at least one dynamic-region member;
+        # seed evidence is only used to build the region and no longer gates
+        # in-region stitching.  Every pair of members must be time-disjoint.
+        has_dynamic = any(
+            item["det"].get("_step45_retracked")
+            or item["det"].get("region") == "dynamic"
+            for member in members for item in by_final[member]
+        )
+        if not has_dynamic:
             continue
         time_conflict = False
         for i in range(len(members)):

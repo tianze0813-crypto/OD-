@@ -800,3 +800,17 @@ Pass 2（局部）:
 - seed 只用于：建动态区域、方向/lane/queue，不再作为 pass2 第二道门槛。
 - 区域外仍然冻结；`buffer=0` 不变。
 - 效果：clip5 car130 进入 pass2，与 car55 关联，最终按观测数投票保留 55。
+
+### 19.13 seed 职责最终收口（2026-09-10）
+
+- seed 现在**只负责生成动态区域**（以及区域上的方向/lane/queue 建模）；
+- pass2 入口已经完全是：`Car detection 中心 ∈ dynamic region`；
+- `queue_stitch` 的 component 合并条件从“必须含 seed”改为：
+  ```text
+  component 至少有一个 detection:
+      _step45_retracked == True
+      或 region == "dynamic"
+  ```
+- 区域外 frozen track 没有 dynamic 标记，不会被 queue 合并。
+- 全量 5 clip 回归：labels / IDs 与上一版 region-only 结果一致，
+  说明这次只是语义收口，没有引入新的合并。

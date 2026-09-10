@@ -249,6 +249,9 @@ class Step45RetrackTest(unittest.TestCase):
             + [[det("Car", index * 2.0, 0.0, 1)] for index in range(1, 6)]
             + [[det("Car", 10.0, 0.0, 2)] for _ in range(4)]
         )
+        for frame in source:
+            for detection in frame["detections"]:
+                detection["region"] = "dynamic"
         with TemporaryDirectory() as directory:
             coords = make_coords(Path(directory))
             tracks, _ = collect_world_tracks(source, coords)
@@ -270,7 +273,7 @@ class Step45RetrackTest(unittest.TestCase):
                     "region.retrack._direction_assignments",
                     return_value=([direction], assignments)):
                 result = queue_stitch(
-                    source, tracks, {}, mask, {1}, config)
+                    source, tracks, {}, mask, set(), config)
         self.assertTrue(result["merges"])
         ids = {det["track_id"] for frame in source
                for det in frame["detections"]}
