@@ -76,6 +76,7 @@ done
 不想落盘到 SUST（只跑链路、不导出）时，给 `hybrid_run.sh` 加 `--no-export-sust`：
 
 ```bash
+DATA_ROOT=/media/moga/police/0903
 for scene in "$DATA_ROOT"/*/; do
   for clip in "${scene%/}"/step2/scene_*_clip*/; do
     [ -d "$clip" ] || continue
@@ -99,6 +100,30 @@ bash hybrid_run.sh <clip> /tmp/foo --no-export-sust --overwrite
 ```
 
 - 输出已存在时需加 `--overwrite`（先删再生成）。
+
+### 原地端到端（不导出到 SUST）
+
+加 `--in-place`：不往 SUST 拷，也不额外留一份 raw，直接把每个输入 clip
+在**原位置**改名为 `<clip>_pre` 并写入 `label/`，等价于 main-chain 的
+端到端原地产出（原 clip 路径会消失）：
+
+```bash
+bash hybrid_run.sh <clip> --in-place --overwrite
+```
+
+批量循环：
+
+```bash
+DATA_ROOT=/media/moga/police/0903
+for scene in "$DATA_ROOT"/*/; do
+  for clip in "${scene%/}"/step2/scene_*_clip[0-9]*/; do
+    [ -d "$clip" ] || continue
+    [[ "${clip%/}" == *_pre ]] && continue
+    echo "== 原地处理 ${clip%/} =="
+    bash hybrid_run.sh "$clip" --in-place --overwrite
+  done
+done
+```
 
 ## 权重（默认 e12）
 

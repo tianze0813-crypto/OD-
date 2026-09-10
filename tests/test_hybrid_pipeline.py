@@ -268,6 +268,51 @@ class HybridPipelineTest(unittest.TestCase):
             self.assertFalse((output_root / "scene_pre").exists())
             self.assertEqual(result["labels"], 2)
 
+    def test_runner_in_place_renames_input_clip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "scene"
+            (source / "lidar" / "lidar_top").mkdir(parents=True)
+            (source / "lidar" / "lidar_top" / "1.bin").write_bytes(b"")
+            output_root = root / "out"
+
+            def fake_main(_python, _clip, _work_root, **_kwargs):
+                return ({"1": [{
+                    "obj_id": "1", "obj_type": "Car", "score": 0.9,
+                }]}, {"final_detections": 1})
+
+            def fake_raw(_python, _clip, _cfg, _ckpt, work_root, name, _threshold):
+                work_root.mkdir(parents=True, exist_ok=True)
+                raw = work_root / f"{name}_raw.json"
+                raw.write_text("[]", encoding="utf-8")
+                return raw
+
+            def fake_expd(_raw, _clip, out_json, _diag, **_kwargs):
+                frames = [{"frame_id": "1", "detections": [{
+                    "track_id": 1, "class_name": "Truck", "score": 0.8,
+                    "box_lidar": [1, 2, 0, 4, 2, 1.5, 0],
+                }]}]
+                out_json.write_text(json.dumps(frames), encoding="utf-8")
+                return {"final_detections": 1}
+
+            with patch.object(hybrid_launcher, "run_main_car", fake_main), \
+                    patch.object(hybrid_launcher, "_run_raw", fake_raw), \
+                    patch.object(hybrid_launcher, "run_expd_noncar", fake_expd):
+                result = hybrid_launcher.run_clip(
+                    Path("python"), source, output_root, overwrite=False,
+                    in_place=True, drop_vis_below=0.05,
+                    score_threshold=None, short_track_max_frames=4)
+
+            destination = root / "scene_pre"
+            self.assertFalse(source.exists())
+            self.assertTrue(destination.is_dir())
+            labels = json.loads(
+                (destination / "label" / "1.json").read_text())
+            self.assertEqual([label["obj_type"] for label in labels],
+                             ["Car", "Truck"])
+            self.assertEqual(result["final_clip"], str(destination))
+            self.assertFalse((output_root / "scene_pre").exists())
+
 
 class ShortMotionNonmotorizedTest(unittest.TestCase):
     def test_static_nmv_track_is_dropped(self):

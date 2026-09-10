@@ -161,7 +161,8 @@ def _run_raw(python: Path, clip: Path, cfg: Path, ckpt: Path,
 
 
 def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
-             export_sust: bool = True, drop_vis_below: float,
+             export_sust: bool = True, in_place: bool = False,
+             drop_vis_below: float,
              score_threshold: float | None,
              short_track_max_frames: int,
              noncar_cfg: Path = NONCAR_CFG,
@@ -177,7 +178,14 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
     tag = output_tag.strip("_-")
     output_name = f"{base}_{tag}_pre" if tag else f"{base}_pre"
     destination: Path | None = None
-    if export_sust:
+    if in_place:
+        destination = clip.parent / output_name
+        if destination.exists():
+            if not overwrite:
+                raise RuntimeError(
+                    f"output exists, pass --overwrite: {destination}")
+            shutil.rmtree(destination)
+    elif export_sust:
         destination = output_root / output_name
         if destination.exists():
             if not overwrite:
@@ -216,7 +224,17 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
         merged, merge_diag = merge_label_frames(main_labels, expd_frames)
         merged_label_count = sum(len(frame["labels"]) for frame in merged)
 
-    if export_sust:
+    if in_place:
+        # 端到端原地模式：把输入 clip 改名为 <clip>_pre，再把标签写进去，
+        # 不额外保留一份 raw，也不往 SUST 拷贝。
+        try:
+            clip.rename(destination)
+            labels = _write_labels(merged, destination)
+        except Exception:
+            if destination is not None and destination.exists() and not clip.exists():
+                destination.rename(clip)
+            raise
+    elif export_sust:
         shutil.copytree(clip, destination)
         try:
             labels = _write_labels(merged, destination)
@@ -224,7 +242,7 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
             shutil.rmtree(destination, ignore_errors=True)
             raise
     else:
-        # 只跑链路、不落盘到 SUST：临时结果随上面的 TemporaryDirectory 清理。
+        # 只跑链路、不落盘：临时结果随上面的 TemporaryDirectory 清理。
         labels = merged_label_count
         destination = None
     return {
@@ -290,20 +308,29 @@ def main() -> int:
                         help="insert a tag before _pre in the exported clip "
                              "name, e.g. vod_e12 -> <clip>_vod_e12_pre")
     export_group = parser.add_mutually_exclusive_group()
-    export_group.add_argument("--export-sust", dest="export_sust",
-                              action="store_true",
-                              help="write the merged <clip>_pre into output_root")
-    export_group.add_argument("--no-export-sust", dest="export_sust",
-                              action="store_false",
-                              help="run the chain without writing to SUST")
-    parser.set_defaults(export_sust=True)
+    export_group.add_argument(
+        "--export-sust", dest="export_mode", action="store_const",
+        const="sust",
+        help="write the merged <clip>_pre into output_root")
+    export_group.add_argument(
+        "--no-export-sust", dest="export_mode", action="store_const",
+        const="none",
+        help="run the chain without writing the merged clip")
+    export_group.add_argument(
+        "--in-place", dest="export_mode", action="store_const",
+        const="in_place",
+        help="rename each input clip to <clip>_pre in place; "
+             "no SUST copy and no extra raw copy")
+    parser.set_defaults(export_mode="sust")
     args = parser.parse_args()
     input_root = args.input_root.expanduser().resolve()
     output_root = args.output_root.expanduser().resolve()
     noncar_cfg = args.noncar_cfg.expanduser().resolve()
     noncar_ckpt = args.noncar_ckpt.expanduser().resolve()
     output_tag = args.output_tag.strip("_-")
-    if input_root == output_root:
+    export_sust = args.export_mode == "sust"
+    in_place = args.export_mode == "in_place"
+    if export_sust and input_root == output_root:
         raise RuntimeError("input_root and output_root must differ")
 
     class_names = ("Truck", "Bus", "Pedestrian", "Nonmotorized_vehicle")
@@ -362,7 +389,7 @@ def main() -> int:
             "automatic installation is not enabled by hybrid runner; "
             "prepare the OpenPCDet environment and pass --python")
 
-    if args.export_sust:
+    if export_sust:
         output_root.mkdir(parents=True, exist_ok=True)
     clips = _collect_clips(input_root)
     summaries = []
@@ -370,7 +397,7 @@ def main() -> int:
         _print(f"clip [{index}/{len(clips)}]: {clip.name}")
         summaries.append(run_clip(
             python, clip, output_root, overwrite=args.overwrite,
-            export_sust=args.export_sust,
+            export_sust=export_sust, in_place=in_place,
             drop_vis_below=args.drop_vis_below,
             score_threshold=args.score_threshold,
             short_track_max_frames=args.short_track_max_frames,
