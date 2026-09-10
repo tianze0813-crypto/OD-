@@ -25,6 +25,8 @@ def _main_source() -> Path:
     required = (
         MAIN_CHAIN_ROOT / "run_end_to_end.py",
         MAIN_CHAIN_ROOT / "pipeline" / "step1_lidar_inference.py",
+        MAIN_CHAIN_ROOT / "pipeline" / "step4_5_region_phase_retrack.py",
+        MAIN_CHAIN_ROOT / "region" / "__init__.py",
         MAIN_CHAIN_ROOT / "models" / "vn_waymo_v2_4gpu_full_epoch10.pth",
     )
     missing = [str(path) for path in required if not path.is_file()]

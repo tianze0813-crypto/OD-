@@ -5,8 +5,9 @@
 SUSTechPOINTS 打开的 `<clip>_pre/label/*.json`。
 
 本分支（`hybrid-main-car-expd-noncar`）默认走**混合链路**：先用 `main_chain/` 的
-Waymo 生成并固定 Car，再用 `models/vod_2cls_ft_e12.pth` 保留其余四类，最后按 `frame_id`
-合并为一个 `<clip>_pre`。
+Waymo 生成并固定 Car（`main_chain/` 已同步到最新 OD-main-0909 快照，含 Step4.5
+动态区域重跟踪），再用 `models/vod_2cls_ft_e12.pth` 保留其余四类，最后按
+`frame_id` 合并为一个 `<clip>_pre`。
 
 ## 本机环境（已就绪）
 
@@ -130,9 +131,9 @@ BEV 交集面积 / Car 面积 `> 0.5`**，只删除这一帧的这个 Car，Truc
 
 RTX A4000 16GB、不与其他大任务并行时，混合链路单个 80 帧 clip：
 
-- `vod_2cls_ft_e12.pth`（默认，Ped `0.15` / NMV `0.20`）：约
-  2.5 分钟/clip；本机 4-clip 实测平均约 2.4 分钟（主链约 80–87s，非车链
-  约 54–68s）。
+- `vod_2cls_ft_e12.pth`（默认，Ped `0.15` / NMV `0.20`，主链含
+  Step4.5）：约 2.6–3.0 分钟/clip；本机 4-clip 实测平均约 2.8 分钟
+  （主链约 109–118s，非车链约 47–61s）。
 - 若把 Ped/NMV 阈值调回 `0.1`：非车 raw 检测数约 2.0–2.2 万/clip，
   单 clip 约 4.5–5 分钟。
 - `vod_2cls_ft_e25.pth`：Ped/NMV 候选比 e12 更多，耗时更长。
@@ -144,7 +145,7 @@ CPU 后处理（跟踪关联、可见度、几何精修）是主要瓶颈；阈�
 
 ```text
 hybrid_run.sh       本分支混合入口（main-Car + VOD-非Car）
-main_chain/         main 分支快照（Waymo Car 链路）
+main_chain/         最新 OD-main-0909 快照（Waymo Car 链路 + Step4.5）
 pipeline/           当前 Step1/Step2/Step2.5/Step3 主链路
 classification/     Step2.5 类别归一化和 track 投票
 filtering/          可见度、硬过滤、final 五类输出
