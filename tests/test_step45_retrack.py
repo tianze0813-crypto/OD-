@@ -129,8 +129,16 @@ class Step45RetrackTest(unittest.TestCase):
                 tracks, step2_diagnostics["tracking"]["slot_details"],
                 config.region)
             mask = region_mask(region, config.region)
-            retrackable, _selection = select_retrackable(
-                source, coords, mask, candidates)
+            # This test targets the slot-release boundary anchor itself, so
+            # feed only the dynamic fragment to pass 2 (region-only selection
+            # is covered by test_select_retrackable_uses_region_only).
+            retrackable = {
+                (frame_index, detection_index)
+                for frame_index, frame in enumerate(source)
+                for detection_index, det in enumerate(
+                    frame.get("detections", []))
+                if det.get("track_id") == 6
+            }
             retrack_dynamic(source, coords, retrackable, config)
             result = inherit_ids(
                 source, tracks, retrackable, candidates,
@@ -143,6 +151,20 @@ class Step45RetrackTest(unittest.TestCase):
         self.assertTrue(any(
             item["reason"].startswith("static_departure")
             for item in result["assignments"]))
+
+    def test_select_retrackable_uses_region_only(self):
+        source = frames(
+            [[det("Car", 0.0, 0.0, 5)] for _ in range(5)]
+            + [[det("Car", index * 3.0, 0.0, 6)] for index in range(6)]
+        )
+        with TemporaryDirectory() as directory:
+            coords = make_coords(Path(directory))
+            mask = DynamicRegionMask.from_polygons(
+                [[(-20.0, -20.0), (40.0, -20.0),
+                  (40.0, 20.0), (-20.0, 20.0)]], resolution=1.0)
+            keys, diagnostics = select_retrackable(source, coords, mask, {6})
+        self.assertEqual(diagnostics["retrackable_detections"], 11)
+        self.assertEqual(len(keys), 11)
 
     def test_phase_stitch_merges_dynamic_start_into_waiting_frozen_id(self):
         source = frames(

@@ -784,3 +784,19 @@ Pass 2（局部）:
   - 纯停车不参与。
 - **moving fragment seed**：暂不加入；如果 130→55 在 pass2 拼不上，
   就保持分开，等后续需要再评估。
+
+### 19.12 pass2 入口改为“区域内 Car 全进”（2026-09-10 最终确认）
+
+- 动态区域 = 道路/行驶区，**区域内不存在纯停车**；区域内静止就是等灯/排队/让行。
+- pass2 范围从原来的：
+  ```text
+  (旧 track ∈ seeds) 且 (detection ∈ dynamic region)
+  ```
+  改为：
+  ```text
+  Car detection 中心 ∈ dynamic region
+  ```
+  不再要求旧 track 是 seed。
+- seed 只用于：建动态区域、方向/lane/queue，不再作为 pass2 第二道门槛。
+- 区域外仍然冻结；`buffer=0` 不变。
+- 效果：clip5 car130 进入 pass2，与 car55 关联，最终按观测数投票保留 55。

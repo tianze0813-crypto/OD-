@@ -547,18 +547,19 @@ def select_retrackable(
         frames: Sequence[Mapping[str, Any]],
         coords: tracking.CoordinateProvider,
         mask: DynamicRegionMask,
-        candidates: Mapping[int, Mapping[str, Any]],
+        candidates: Optional[Mapping[int, Mapping[str, Any]]] = None,
 ) -> Tuple[set[Tuple[int, int]], Dict[str, Any]]:
     """Detections eligible for step-4.5 re-tracking.
 
-    A detection is retrackable only when its old track has high-speed
-    evidence and its world centre lies inside the dynamic region.  Parked
-    cars inside the region are therefore frozen, and a slow fragment of a
-    high-speed car is linked later by ID inheritance.
+    Reviewed semantics (2026-09-10): the dynamic region is the road / driven
+    area, so *every* Car detection whose centre lies inside it is eligible.
+    Outside the region stays frozen.  Seed evidence is only used to build the
+    region; it is no longer a second gate for pass 2.
     """
     keys: set[Tuple[int, int]] = set()
     frozen_tracks: set[int] = set()
     inside_region = 0
+    outside_region = 0
     for frame_index, frame in enumerate(frames):
         timestamp = int(frame["frame_id"])
         world_from_lidar = coords.world_from_lidar(timestamp)
@@ -569,20 +570,19 @@ def select_retrackable(
             if track_id is None or not _finite_box(det):
                 continue
             track_id = int(track_id)
-            if track_id not in candidates:
-                frozen_tracks.add(track_id)
-                continue
             center = tracking.center_world(det["box_lidar"], world_from_lidar)
             if mask.contains_point(float(center[0]), float(center[1])):
                 keys.add((frame_index, detection_index))
                 inside_region += 1
             else:
                 frozen_tracks.add(track_id)
+                outside_region += 1
     return keys, {
         "retrackable_detections": len(keys),
-        "candidate_tracks": len(candidates),
-        "frozen_tracks": len(frozen_tracks),
         "inside_region_detections": inside_region,
+        "outside_region_detections": outside_region,
+        "frozen_tracks": len(frozen_tracks),
+        "seed_tracks_hint": 0 if candidates is None else len(candidates),
     }
 
 
@@ -987,12 +987,14 @@ def inherit_ids(
             if any(candidate_id in used_by_frame[item["frame_index"]]
                    for item in items):
                 continue
-            # A slot id must not be reused across cars unless the explicit
-            # boundary evidence above linked this fragment to it.  When every
-            # detection in the fragment already carries that slot id, step 2
-            # itself bound them to the same car, so keeping it is safe.
+            # A slot id must not be reused across cars unless it is the
+            # dominant old id of this fragment (e.g. car5's own track with
+            # one intruding detection), or the explicit boundary evidence
+            # above linked the fragment to it.
             if candidate_id in slot_ids and not reason.startswith("static_"):
-                if set(old_counts) != {int(candidate_id)}:
+                dominant = old_counts[int(candidate_id)] >= max(
+                    1, int(0.5 * len(items)))
+                if set(old_counts) != {int(candidate_id)} and not dominant:
                     continue
             if (candidate_id in assigned_items
                     and not _continuity_ok(
@@ -1008,8 +1010,10 @@ def inherit_ids(
             # slot id is only safe when every detection already carries it
             # (step 2 itself bound them to one car).
             fallback = [
-                old_id for old_id, _count in ordered_old
-                if old_id not in slot_ids or set(old_counts) == {old_id}
+                old_id for old_id, count in ordered_old
+                if old_id not in slot_ids
+                or set(old_counts) == {old_id}
+                or count >= max(1, int(0.5 * len(items)))
             ]
             if fallback:
                 chosen = int(fallback[0])
