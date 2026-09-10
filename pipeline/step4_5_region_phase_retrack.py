@@ -48,13 +48,22 @@ def run(step4_json: Path, clip: Path, step2_diagnostics: Path,
     step2 = json.loads(Path(step2_diagnostics).read_text(encoding="utf-8"))
     coords = tracking.CoordinateProvider(Path(clip))
 
-    # Pass 1: collect step-4 car-only tracks, then apply the reviewed
-    # driving-direction filter (60 degrees from the local motion heading).
-    tracks_pass1, _by_key = collect_world_tracks(frames, coords)
-    seeds_pass1 = seed_track_ids(tracks_pass1, config.region, config)
-    frames, direction_filter_details, direction_filter_diag = (
-        direction_filter(
-            frames, tracks_pass1, set(seeds_pass1), config))
+    # Optional pass-1 driving-direction noise filter (disabled by default:
+    # it can lock yaw on some vehicles).
+    direction_filter_details = []
+    if config.direction_filter_enabled:
+        tracks_pass1, _by_key = collect_world_tracks(frames, coords)
+        seeds_pass1 = seed_track_ids(
+            tracks_pass1, config.region, config)
+        frames, direction_filter_details, direction_filter_diag = (
+            direction_filter(
+                frames, tracks_pass1, set(seeds_pass1), config))
+    else:
+        direction_filter_diag = {
+            "enabled": False,
+            "noise_detections_removed": 0,
+            "noise_details": [],
+        }
 
     # Rebuild pass-1 structures on the cleaned detections.
     tracks, _by_key = collect_world_tracks(frames, coords)
@@ -92,13 +101,21 @@ def run(step4_json: Path, clip: Path, step2_diagnostics: Path,
 
     # Final dynamic yaw: remove the 180-degree flip ambiguity and align the
     # box axis to the local driving heading.
-    dynamic_final_ids = {
-        int(det["track_id"]) for frame in frames
-        for det in frame.get("detections", [])
-        if det.get("track_id") is not None
-        and det.get("_step45_retracked")}
-    yaw_diagnostics = align_dynamic_yaw(
-        frames, tracks, coords, dynamic_final_ids, config)
+    if config.yaw_align_enabled:
+        dynamic_final_ids = {
+            int(det["track_id"]) for frame in frames
+            for det in frame.get("detections", [])
+            if det.get("track_id") is not None
+            and det.get("_step45_retracked")}
+        yaw_diagnostics = align_dynamic_yaw(
+            frames, tracks, coords, dynamic_final_ids, config)
+    else:
+        yaw_diagnostics = {
+            "enabled": False,
+            "dynamic_yaw_aligned": 0,
+            "tracks": 0,
+            "details": [],
+        }
     static_freeze = verify_static_freeze(
         before_step45, frames, exempt_keys)
 

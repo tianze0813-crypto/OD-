@@ -49,7 +49,14 @@ class Step45Config:
     # Re-track association.
     dynamic_max_gap_sec: float = 1.8
     # Dynamic-region occlusion state (PLAN section 19, final edge case).
-    occlusion_max_gap_sec: float = 2.0
+    # 2.6s is the minimum value that connects clip6 28 -> 62.
+    occlusion_max_gap_sec: float = 2.6
+    # Experimental pass-1 driving-direction noise filter.  Disabled by
+    # default because it can lock yaw on some vehicles; kept behind a flag.
+    direction_filter_enabled: bool = False
+    # Experimental post-pass2 dynamic yaw overwrite.  Disabled by default;
+    # enable only after the yaw-lock issue is resolved.
+    yaw_align_enabled: bool = False
     # Moving seed / pure static classification (PLAN section 19).
     moving_seed_net_min_m: float = 8.0
     moving_seed_concentration_min: float = 0.5

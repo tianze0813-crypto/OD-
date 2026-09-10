@@ -751,3 +751,14 @@ Pass 2（局部）:
   - 对动态/重跟踪 detection，用局部 driving heading 把 box yaw 写为运动方向；
   - 消除 180° 调转的方向歧义；
   - 静态冻结 track 的 yaw 不变。
+
+### 19.10 最新默认参数（2026-09-10）
+
+- `occlusion_max_gap_sec = 2.6s`：clip6 `28 -> 62` 的实际 gap 是 2.5s；
+  2.6s 是刚好能接上的最小余量。
+- `direction_filter_enabled = False`：行驶方向噪点过滤暂时关闭，
+  因为它会给部分车辆造成 yaw 锁死；代码保留，后续设计新的过滤约束后再启用。
+- `yaw_align_enabled = False`：pass2 后的动态 yaw 覆盖也暂时关闭，
+  避免运动方向直接锁死 box yaw；后续可改成只做 π 等价翻转。
+- 当前生效的只有：moving seed / 区域扩展 / queue 拼接 /
+  槽位释放 / occlusion 2.6s / 静态冻结 / 方向车道 gate。
