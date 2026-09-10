@@ -28,6 +28,7 @@ from region.retrack import (
     direction_filter,
     dynamic_box_fit,
     inherit_ids,
+    mark_long_gap_isolated_frames,
     phase_stitch,
     queue_stitch,
     region_mask,
@@ -105,6 +106,7 @@ def run(step4_json: Path, clip: Path, step2_diagnostics: Path,
         frames, coords, retrackable, config)
     inheritance = inherit_ids(
         frames, tracks, retrackable, seeds, step2, config)
+    isolated_gap = mark_long_gap_isolated_frames(frames, tracks, config)
     queue = queue_stitch(
         frames, tracks, step2, mask, set(seeds), config)
     exempt_keys = set(retrackable) | set(queue.get("modified_keys", []))
@@ -173,6 +175,7 @@ def run(step4_json: Path, clip: Path, step2_diagnostics: Path,
         "selection": selection,
         "retracking": retrack_diagnostics,
         "id_inheritance": inheritance,
+        "isolated_gap_frames": isolated_gap,
         "queue_stitching": {
             "queues": queue.get("queues", 0),
             "edges": queue.get("edges", 0),
@@ -180,6 +183,8 @@ def run(step4_json: Path, clip: Path, step2_diagnostics: Path,
             "modified_detections": len(queue.get("modified_keys", [])),
             "direction_assignments": queue.get(
                 "direction_assignments", {}),
+            "isolated_ids": queue.get("isolated_ids", []),
+            "edges_detail": queue.get("edges_detail", []),
         },
         "phase_stitching": phase,
         "unique_frame_ids": unique_ids,
@@ -241,6 +246,8 @@ def main() -> None:
             "yaw_reversal"]["reversed_detections"],
         "id_assignments": len(diagnostics["id_inheritance"]["assignments"]),
         "queue_merges": len(diagnostics["queue_stitching"]["merges"]),
+        "isolated_gap_frames": diagnostics[
+            "isolated_gap_frames"]["marked_detections"],
         "phase_merges": len(diagnostics["phase_stitching"]["applied"]),
         "occlusion_recoveries": diagnostics["retracking"].get(
             "occlusion_recoveries", 0),

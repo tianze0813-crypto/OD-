@@ -85,9 +85,17 @@ class Step45Config:
     # Queue / same-vehicle stitching.
     queue_longitudinal_gap_m: float = 20.0
     queue_stitch_position_tolerance_m: float = 1.5
-    queue_stitch_lateral_tolerance_m: float = 5.0
+    queue_stitch_lateral_tolerance_m: float = 2.5
     lane_change_max_lateral_m: float = 5.0
     left_turn_tail_arc_length_m: float = 5.0
+    # A physical position-jump envelope: an object cannot appear farther
+    # away than it could have moved under a conservative acceleration limit.
+    # ``position_noise_m`` covers detector/pose quantisation only.
+    physical_accel_limit_mps2: float = 1.5
+    physical_position_noise_m: float = 0.5
+    # Long-gap isolated tail rule: after this many missing frames a single
+    # resumed observation is a merge-invalid isolated frame, not an anchor.
+    long_gap_frames: int = 30
     # ID inheritance / slot release.
     boundary_max_gap_sec: float = 2.0
     boundary_max_distance_m: float = 3.5
@@ -624,6 +632,9 @@ def retrack_dynamic(
         use_yaw=False,
         occlusion_enabled=True,
         occlusion_max_gap=float(config.occlusion_max_gap_sec),
+        physical_position_jump_enabled=True,
+        physical_accel_limit_mps2=float(config.physical_accel_limit_mps2),
+        physical_position_noise_m=float(config.physical_position_noise_m),
     )
     # Occlusion gaps during motion are explicitly out of scope and two cars
     # must not be merged.  The tracker's 3 s tracklet stitching is therefore
@@ -1182,6 +1193,76 @@ def _movement_compatible(
     return True
 
 
+def _is_isolated_after_gap(item: Mapping[str, Any]) -> bool:
+    return bool(item.get("det", {}).get("_step45_isolated_after_gap"))
+
+
+def _position_jump_limit(
+        prior_speed_mps: float,
+        gap_sec: float,
+        config: Step45Config,
+) -> float:
+    """Conservative reachable distance from a stable anchor.
+
+    The object may keep its last observed speed and accelerate at
+    ``physical_accel_limit_mps2``; the small base covers pose/detection
+    quantisation.  This is a position-jump bound, not a heading gate.
+    """
+    gap = max(0.0, float(gap_sec))
+    return (
+        float(config.physical_position_noise_m)
+        + max(0.0, float(prior_speed_mps)) * gap
+        + 0.5 * float(config.physical_accel_limit_mps2) * gap * gap
+    )
+
+
+def mark_long_gap_isolated_frames(
+        frames: Sequence[Mapping[str, Any]],
+        tracks: Mapping[int, Sequence[Mapping[str, Any]]],
+        config: Step45Config,
+) -> Dict[str, Any]:
+    """Mark a terminal single frame that resumes after a long gap.
+
+    The observation is deliberately left in the output.  It is excluded
+    from queue/phase merges and its track id must not be selected as the
+    merged target; step 5 later removes the one-frame track by lifecycle.
+    Only dynamic/re-tracked detections are touched.
+    """
+    by_final: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for items in tracks.values():
+        for item in items:
+            final_id = item["det"].get("track_id")
+            if final_id is not None:
+                by_final[int(final_id)].append(item)
+    marked: List[Dict[str, Any]] = []
+    for final_id, items in by_final.items():
+        items.sort(key=lambda value: value["timestamp"])
+        if len(items) < 2:
+            continue
+        last = items[-1]
+        previous = items[-2]
+        gap_frames = int(last["frame_index"]) - int(previous["frame_index"])
+        if gap_frames < int(config.long_gap_frames):
+            continue
+        if not (last["det"].get("_step45_retracked")
+                or last["det"].get("region") == "dynamic"):
+            continue
+        last["det"]["_step45_isolated_after_gap"] = True
+        last["det"]["_step45_isolated_gap_frames"] = gap_frames
+        marked.append({
+            "track_id": int(final_id),
+            "frame_index": int(last["frame_index"]),
+            "timestamp": float(last["timestamp"]),
+            "gap_frames": gap_frames,
+        })
+    return {
+        "enabled": True,
+        "long_gap_frames": int(config.long_gap_frames),
+        "marked_detections": len(marked),
+        "details": marked,
+    }
+
+
 def queue_stitch(
         frames: List[Dict[str, Any]],
         tracks: Mapping[int, Sequence[Mapping[str, Any]]],
@@ -1198,16 +1279,34 @@ def queue_stitch(
     * the two fragments must not overlap in time;
     * the later fragment must start at the earlier fragment's end position.
     """
-    by_final: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    all_by_final: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
     for items in tracks.values():
         for item in items:
             final_id = item["det"].get("track_id")
             if final_id is not None:
-                by_final[int(final_id)].append(item)
-    for items in by_final.values():
+                all_by_final[int(final_id)].append(item)
+    for items in all_by_final.values():
         items.sort(key=lambda value: value["timestamp"])
+    isolated_ids = {
+        final_id for final_id, items in all_by_final.items()
+        if any(_is_isolated_after_gap(item) for item in items)
+    }
+    by_final: Dict[int, List[Dict[str, Any]]] = {
+        final_id: [item for item in items
+                   if not _is_isolated_after_gap(item)]
+        for final_id, items in all_by_final.items()
+    }
+    by_final = {
+        final_id: items for final_id, items in by_final.items() if items
+    }
     if len(by_final) < 2:
-        return {"queues": 0, "edges": 0, "merges": [], "modified_keys": []}
+        return {
+            "queues": 0,
+            "edges": 0,
+            "merges": [],
+            "modified_keys": [],
+            "isolated_ids": sorted(isolated_ids),
+        }
 
     directions, assignments = _direction_assignments(by_final, config)
     direction_by_id = {int(item["direction_id"]): item for item in directions}
@@ -1268,6 +1367,20 @@ def queue_stitch(
             value = parent[value]
         return value
 
+    def members_of(root: int) -> List[int]:
+        return [fid for fid in by_final if find(fid) == root]
+
+    def time_disjoint(members: Sequence[int]) -> bool:
+        for i in range(len(members)):
+            a_items = by_final[members[i]]
+            for j in range(i + 1, len(members)):
+                b_items = by_final[members[j]]
+                if (a_items[0]["timestamp"] <= b_items[-1]["timestamp"]
+                        and b_items[0]["timestamp"]
+                        <= a_items[-1]["timestamp"]):
+                    return False
+        return True
+
     edges: List[Dict[str, Any]] = []
     for queue in queues:
         for i in range(len(queue)):
@@ -1290,6 +1403,10 @@ def queue_stitch(
                     continue
                 a_end = items_a[-1]
                 b_start = items_b[0]
+                gap_sec = max(
+                    0.0,
+                    float(b_start["timestamp"]) - float(a_end["timestamp"]))
+                prior_speed = _endpoint_speed(items_a, at_end=True)
                 direction_id = assignments[id_a].get("direction_id")
                 direction = (direction_by_id.get(int(direction_id))
                              if direction_id is not None else None)
@@ -1309,7 +1426,9 @@ def queue_stitch(
                 bridge = float(np.linalg.norm(
                     np.asarray(b_start["world"], dtype=np.float64)
                     - np.asarray(a_end["world"], dtype=np.float64)))
-                if bridge > float(config.queue_stitch_position_tolerance_m):
+                reachable = _position_jump_limit(
+                    prior_speed, gap_sec, config)
+                if bridge > reachable:
                     continue
                 if abs(float(v_a) - float(v_b)) \
                         > float(config.queue_stitch_lateral_tolerance_m):
@@ -1346,6 +1465,14 @@ def queue_stitch(
                         break
                 if blocked:
                     continue
+                root_a, root_b = find(int(id_a)), find(int(id_b))
+                merge_ok = True
+                if root_a != root_b:
+                    merged = sorted(set(members_of(root_a))
+                                    | set(members_of(root_b)))
+                    merge_ok = time_disjoint(merged)
+                    if merge_ok:
+                        parent[root_b] = root_a
                 edges.append({
                     "from": int(id_a),
                     "to": int(id_b),
@@ -1353,10 +1480,8 @@ def queue_stitch(
                     "movement_a": movement_a,
                     "movement_b": movement_b,
                     "direction_id": int(direction_id),
+                    "merged": bool(root_a != root_b and merge_ok),
                 })
-                root_a, root_b = find(int(id_a)), find(int(id_b))
-                if root_a != root_b:
-                    parent[root_b] = root_a
 
     components: Dict[int, List[int]] = defaultdict(list)
     for final_id in by_final:
@@ -1365,7 +1490,7 @@ def queue_stitch(
     merges: List[Dict[str, Any]] = []
     modified_keys: List[Tuple[int, int]] = []
     occupancy: Dict[int, set[int]] = defaultdict(set)
-    for final_id, items in by_final.items():
+    for final_id, items in all_by_final.items():
         for item in items:
             occupancy[item["frame_index"]].add(int(final_id))
 
@@ -1388,23 +1513,34 @@ def queue_stitch(
             a_items = by_final[members[i]]
             for j in range(i + 1, len(members)):
                 b_items = by_final[members[j]]
-                if (a_items[0]["timestamp"] < b_items[-1]["timestamp"]
-                        and b_items[0]["timestamp"] < a_items[-1]["timestamp"]):
+                if (a_items[0]["timestamp"] <= b_items[-1]["timestamp"]
+                        and b_items[0]["timestamp"] <= a_items[-1]["timestamp"]):
                     time_conflict = True
                     break
             if time_conflict:
                 break
         if time_conflict:
             continue
-        member_set = set(members)
+        # An id carrying a long-gap isolated frame cannot be the merged
+        # target, otherwise that invalid single frame would be absorbed by
+        # a long valid track and survive step-5 lifecycle filtering.  Its
+        # stable part may still be remapped into an eligible target.
+        eligible = [member for member in members
+                    if member not in isolated_ids]
+        if not eligible:
+            continue
         counts = {member: len(by_final[member]) for member in members}
-        chosen = max(members, key=lambda member: (counts[member], -member))
+        chosen = max(
+            eligible, key=lambda member: (counts[member], -member))
+        member_set = set(members)
         collision = any(
             chosen in (occupancy[item["frame_index"]] - member_set)
             for member in members for item in by_final[member])
         if collision:
             continue
         for member in members:
+            if member == chosen:
+                continue
             for item in by_final[member]:
                 item["det"]["track_id"] = int(chosen)
                 item["det"]["_step45_queue_stitched"] = True
@@ -1415,7 +1551,7 @@ def queue_stitch(
         merges.append({
             "members": [int(member) for member in members],
             "final_id": int(chosen),
-            "detections": sum(counts.values()),
+            "detections": sum(counts[member] for member in members),
         })
     return {
         "queues": len(queues),
@@ -1423,6 +1559,8 @@ def queue_stitch(
         "merges": merges,
         "modified_keys": modified_keys,
         "direction_assignments": assignments,
+        "isolated_ids": sorted(isolated_ids),
+        "edges_detail": edges,
     }
 
 
@@ -1458,12 +1596,25 @@ def phase_stitch(
     Only tracks that contain at least one step-4.5 re-tracked detection are
     candidates.  Frozen static tracks are never merged or moved.
     """
-    by_final_id: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    all_by_final: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
     for items in tracks.values():
         for item in items:
             final_id = item["det"].get("track_id")
             if final_id is not None:
-                by_final_id[int(final_id)].append(item)
+                all_by_final[int(final_id)].append(item)
+    isolated_ids = {
+        final_id for final_id, items in all_by_final.items()
+        if any(_is_isolated_after_gap(item) for item in items)
+    }
+    by_final_id: Dict[int, List[Dict[str, Any]]] = {
+        final_id: [item for item in items
+                   if not _is_isolated_after_gap(item)]
+        for final_id, items in all_by_final.items()
+    }
+    by_final_id = {
+        final_id: items
+        for final_id, items in by_final_id.items() if items
+    }
     dynamic_ids = {
         final_id for final_id, items in by_final_id.items()
         if any(item["det"].get("_step45_retracked") for item in items)
@@ -1474,6 +1625,7 @@ def phase_stitch(
             "merges": [],
             "applied": [],
             "dynamic_tracks": 0,
+            "isolated_ids": sorted(isolated_ids),
         }
     # Frozen static tracks are included as phase context (red-light queues,
     # stop-line evidence).  Only dynamic ids are merge candidates.
@@ -1499,6 +1651,8 @@ def phase_stitch(
 
     candidates: List[Tuple[float, int, int, int, int, Dict[str, Any]]] = []
     for end_id, end_items in by_id.items():
+        if end_id in isolated_ids:
+            continue
         end = end_items[-1]
         end_state = states.get(end_id, {})
         end_signal = _state_at(
@@ -1506,7 +1660,7 @@ def phase_stitch(
             ("waiting_red", "waiting_queue", "yielding", "uncertain"))
         end_speed = _endpoint_speed(end_items, at_end=True)
         for start_id, start_items in by_id.items():
-            if start_id == end_id:
+            if start_id == end_id or start_id in isolated_ids:
                 continue
             if end_id not in dynamic_ids and start_id not in dynamic_ids:
                 continue
@@ -1631,7 +1785,7 @@ def phase_stitch(
             }))
 
     occupancy: Dict[int, set[int]] = defaultdict(set)
-    for track_id, items in by_final_id.items():
+    for track_id, items in all_by_final.items():
         for item in items:
             occupancy[item["frame_index"]].add(int(track_id))
     remapped: Dict[int, int] = {}
@@ -1667,6 +1821,7 @@ def phase_stitch(
         "merges": merges,
         "applied": applied,
         "dynamic_tracks": len(dynamic_ids),
+        "isolated_ids": sorted(isolated_ids),
     }
 
 

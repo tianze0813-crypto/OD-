@@ -347,7 +347,10 @@ class ConservativeTracker:
                  dynamic_max_velocity: float = 28.0, dynamic_max_gate: float = 9.0,
                  use_yaw: bool = True,
                  occlusion_enabled: bool = False,
-                 occlusion_max_gap: float = 0.0):
+                 occlusion_max_gap: float = 0.0,
+                 physical_position_jump_enabled: bool = False,
+                 physical_accel_limit_mps2: float = 1.5,
+                 physical_position_noise_m: float = 0.5):
         self.coords = coords
         self.min_static_hits = int(min_static_hits)
         self.min_static_duration = float(min_static_duration)
@@ -363,6 +366,14 @@ class ConservativeTracker:
         self.use_yaw = bool(use_yaw)
         self.occlusion_enabled = bool(occlusion_enabled)
         self.occlusion_max_gap = float(occlusion_max_gap)
+        # Physical position-jump envelope.  These are not association
+        # tolerances: they bound how far a real object could have moved.
+        # Enabled explicitly by the step-4.5 motion-only re-tracker so the
+        # existing step-2 static/dynamic contract keeps its behaviour.
+        self.physical_position_jump_enabled = bool(
+            physical_position_jump_enabled)
+        self.physical_accel_limit_mps2 = float(physical_accel_limit_mps2)
+        self.physical_position_noise_m = float(physical_position_noise_m)
         self.next_id = 1
         self.next_slot = 1
         self.tracks: Dict[int, Track] = {}
@@ -398,9 +409,50 @@ class ConservativeTracker:
             ))
         return out
 
+    def _recent_speed(self, tr: Track) -> float:
+        if len(tr.observations) >= 2:
+            previous, last = tr.observations[-2], tr.observations[-1]
+            gap = (last.timestamp - previous.timestamp) / 1e9
+            if gap > 1e-3:
+                return float(np.linalg.norm(
+                    (last.world - previous.world)[:2])) / gap
+        return float(np.linalg.norm(tr.velocity[:2]))
+
+    def _position_jump_gate(
+            self, tr: Track, obs: Observation) -> Optional[str]:
+        if not self.physical_position_jump_enabled:
+            return None
+        # A new fragment may already be moving when it is first observed;
+        # only a track with a stable motion estimate can prove a jump.
+        if len(tr.observations) < 3:
+            return None
+        gap = max((obs.timestamp - tr.last_ts) / 1e9, 0.0)
+        if gap <= 1e-6:
+            return None
+        prior_speed = max(
+            float(np.linalg.norm(tr.velocity[:2])),
+            self._recent_speed(tr))
+        displacement = float(np.linalg.norm(
+            (obs.world[:2] - tr.last_world[:2])))
+        # Very small frame-to-frame centre jumps are detector/pose noise and
+        # must stay associable; the physical jump gate targets real flashes.
+        if displacement <= self.dynamic_base_gate:
+            return None
+        reachable = (
+            self.physical_position_noise_m
+            + max(0.0, prior_speed) * gap
+            + 0.5 * self.physical_accel_limit_mps2 * gap * gap)
+        if displacement > reachable:
+            return "position_jump_gate"
+        return None
+
     def _cost(self, tr: Track, obs: Observation, predicted: np.ndarray,
               covariance: np.ndarray, dt: float,
               static_mode: bool = False) -> Tuple[float, str]:
+        if not static_mode:
+            jump_reason = self._position_jump_gate(tr, obs)
+            if jump_reason is not None:
+                return 1e9, jump_reason
         # Once a track has a clear recent direction, reject a single
         # significant step directly backwards.  This prevents a detector
         # jitter or ID swap from contaminating the track with one reverse

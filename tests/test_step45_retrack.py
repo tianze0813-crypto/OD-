@@ -20,6 +20,7 @@ from region.retrack import (
     direction_filter,
     inherit_ids,
     is_moving_seed,
+    mark_long_gap_isolated_frames,
     is_pure_static,
     is_weak_moving_seed,
     phase_stitch,
@@ -44,7 +45,7 @@ def make_coords(root: Path) -> CoordinateProvider:
         }
     }), encoding="utf-8")
     (transforms / "pose_data.txt").write_text("\n".join(
-        f"{index * 400000000},0,0,0,0,0,0,1" for index in range(30)
+        f"{index * 400000000},0,0,0,0,0,0,1" for index in range(80)
     ) + "\n", encoding="utf-8")
     return CoordinateProvider(root)
 
@@ -306,6 +307,83 @@ class Step45RetrackTest(unittest.TestCase):
                 result = queue_stitch(
                     source, tracks, {}, mask, {1}, config)
         self.assertFalse(result["merges"])
+
+    def test_long_gap_isolated_tail_is_excluded_from_merge_and_target(self):
+        rows = [[det("Car", index * 2.0, 0.0, 1)]
+                for index in range(6)]
+        rows.extend([[] for _ in range(31)])
+        rows.append([det("Car", 10.0, 0.0, 1)])
+        rows.extend([[det("Car", 10.0 + index * 2.0, 0.0, 2)]
+                     for index in range(1, 7)])
+        source = frames(rows)
+        for frame in source:
+            for detection in frame["detections"]:
+                detection["region"] = "dynamic"
+                detection["_step45_retracked"] = True
+        with TemporaryDirectory() as directory:
+            coords = make_coords(Path(directory))
+            tracks, _ = collect_world_tracks(source, coords)
+            config = Step45Config()
+            isolated = mark_long_gap_isolated_frames(
+                source, tracks, config)
+            mask = DynamicRegionMask.from_polygons(
+                [[(-20.0, -20.0), (80.0, -20.0),
+                  (80.0, 40.0), (-20.0, 40.0)]], resolution=1.0)
+            direction = {
+                "direction_id": 0,
+                "origin": [0.0, 0.0],
+                "forward": [1.0, 0.0],
+                "right": [0.0, 1.0],
+            }
+            assignments = {
+                1: {"direction_id": 0, "movement": None},
+                2: {"direction_id": 0, "movement": None},
+            }
+            with mock.patch(
+                    "region.retrack._direction_assignments",
+                    return_value=([direction], assignments)):
+                result = queue_stitch(
+                    source, tracks, {}, mask, set(), config)
+        self.assertEqual(isolated["marked_detections"], 1)
+        isolated_frame = next(
+            frame for frame in source
+            if any(det.get("_step45_isolated_after_gap")
+                   for det in frame["detections"]))
+        self.assertEqual(isolated_frame["detections"][0]["track_id"], 1)
+        self.assertEqual(result["isolated_ids"], [1])
+        self.assertTrue(result["merges"])
+        self.assertEqual(result["merges"][0]["final_id"], 2)
+        for frame in source:
+            for detection in frame["detections"]:
+                if detection.get("_step45_isolated_after_gap"):
+                    self.assertEqual(detection["track_id"], 1)
+                else:
+                    self.assertEqual(detection["track_id"], 2)
+
+    def test_position_jump_gate_rejects_stationary_flash(self):
+        def make_frame(timestamp, x):
+            return {
+                "frame_id": str(timestamp),
+                "num_points": 0,
+                "num_detections": 1,
+                "detections": [det("Car", x, 0.0, None)],
+            }
+        times = [index * 400000000 for index in range(11)]
+        times += [index * 400000000 for index in range(16, 21)]
+        positions = [0.0] * 11 + [5.7, 7.7, 9.7, 11.7, 13.7]
+        frames_input = [make_frame(t, p)
+                        for t, p in zip(times, positions)]
+        with TemporaryDirectory() as directory:
+            coords = make_coords(Path(directory))
+            tracker = ConservativeTracker(
+                coords, min_static_hits=10 ** 9,
+                dynamic_max_gap=1.8, use_yaw=False,
+                occlusion_enabled=True, occlusion_max_gap=2.6,
+                physical_position_jump_enabled=True)
+            output, _diag = tracker.process(frames_input)
+        ids = {det["track_id"] for frame in output
+               for det in frame["detections"]}
+        self.assertGreater(len(ids), 1)
 
     def test_turn_extension_uses_swept_area_forward(self):
         config = DynamicRegionConfig()
