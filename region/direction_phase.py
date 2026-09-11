@@ -1062,12 +1062,23 @@ def build_direction_phase_diagnostics(
     grid = build_time_grid(
         classified, float(_cfg(config, "phase_bin_sec", 0.2)))
     if grid is None:
+        # No robust motor-vehicle track produced a usable time grid.  Keep
+        # the full empty schema so callers can no-op instead of touching
+        # missing keys.
         return {
             "directions": records,
             "axes": axes,
             "grid": None,
             "group_signals": {},
-            "axis_phase": {"phases": [], "timeline": [], "state_counts": {}},
+            "direction_signal_timeline": [],
+            "axis_phase": {
+                "phases": [],
+                "timeline": [],
+                "state_counts": {},
+                "phase_flip_count": 0,
+                "axis_conflict_bins": {},
+                "axis_conflict_count": 0,
+            },
             "track_traffic_states": {},
         }
     evidence = collect_group_evidence(

@@ -57,6 +57,23 @@ def _enabled_config(**kwargs):
 
 
 class TrafficLightTest(unittest.TestCase):
+    def test_no_robust_track_returns_empty_model(self):
+        # Two short/slow parked tracks: no track passes the robust motion
+        # gate, so the direction/phase model must skip instead of raising.
+        tracks = {
+            1: _track([(0.0, 0.0), (0.1, 0.0)]),
+            2: _track([(10.0, 0.0), (10.1, 0.0)]),
+        }
+        result = build_traffic_light_model(
+            tracks, config=TrafficLightConfig())
+        self.assertFalse(result.traffic_light_enabled)
+        self.assertEqual(result.track_classification, [])
+        self.assertEqual(result.direction_signal_timeline, [])
+        self.assertEqual(result.axis_phase_timeline, [])
+        self.assertEqual(result.track_traffic_states, [])
+        self.assertEqual(
+            result.diagnostics["direction_phase"]["directions"], [])
+
     def test_movement_classification(self):
         result = build_traffic_light_model(
             {1: _straight_track(), 2: _left_track(), 3: _right_track()},
