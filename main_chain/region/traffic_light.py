@@ -1657,6 +1657,53 @@ def build_traffic_light_model(
                 non_motor_vehicle_class_counts.get(key, 0) + 1)
             continue
         classified.append((int(track_id), stats))
+
+    if not classified:
+        # No track passed the robust motion gate (short / slow / jittery
+        # tracks only).  Skip the direction / phase / traffic-light model
+        # entirely: queue and phase stitching then see empty directions and
+        # states and perform no merges.
+        return TrafficLightResult(
+            bounds=_compute_bounds(all_points, config.bounds_margin),
+            resolution=float(config.resolution),
+            traffic_light_enabled=False,
+            diagnostics={
+                "traffic_light_enabled": False,
+                "gate_passed": False,
+                "gating_enabled": bool(getattr(config, "enable_gating", False)),
+                "tracks_total": len(dynamic_tracks),
+                "robust_tracks": 0,
+                "motor_vehicle_tracks": 0,
+                "non_motor_vehicle_tracks": int(non_motor_vehicle_tracks),
+                "non_motor_vehicle_class_counts": (
+                    non_motor_vehicle_class_counts),
+                "movement_counts": {"straight": 0, "left": 0, "right": 0},
+                "raw_movement_counts": {
+                    "straight": 0, "left": 0, "right": 0, "uturn": 0,
+                    "lane_change": 0, "waiting_left": 0,
+                },
+                "groups": 0,
+                "stop_events": 0,
+                "phase_intervals": 0,
+                "legacy_phase_flip_count": 0,
+                "axis_count": 0,
+                "direction_phase": {
+                    "axes": [],
+                    "directions": [],
+                    "direction_signal_timeline": [],
+                    "axis_phase_timeline": [],
+                    "axis_phase_state_counts": {},
+                    "axis_phase_flip_count": 0,
+                    "axis_conflict_bins": {},
+                    "axis_conflict_count": 0,
+                    "track_traffic_state_counts": {},
+                    "movement_lane_mismatch_count": 0,
+                    "grid": None,
+                },
+            },
+            config=config.to_dict(),
+        )
+
     lane_diagnostics = _apply_lane_context(classified, config)
     groups = _cluster_groups(classified, config)
     stop_events = [
