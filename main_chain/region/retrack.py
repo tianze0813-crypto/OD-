@@ -91,11 +91,6 @@ class Step45Config:
     queue_stitch_lateral_tolerance_m: float = 2.5
     lane_change_max_lateral_m: float = 5.0
     left_turn_tail_arc_length_m: float = 5.0
-    # A physical position-jump envelope: an object cannot appear farther
-    # away than it could have moved under a conservative acceleration limit.
-    # ``position_noise_m`` covers detector/pose quantisation only.
-    physical_accel_limit_mps2: float = 1.5
-    physical_position_noise_m: float = 0.5
     # Hard lateral-jump protection for step-4.5 ID association only:
     # reject a candidate whose centre is farther than this from the track's
     # recent motion axis.  This is deliberately separate from the
@@ -642,9 +637,6 @@ def retrack_dynamic(
         use_yaw=False,
         occlusion_enabled=True,
         occlusion_max_gap=float(config.occlusion_max_gap_sec),
-        physical_position_jump_enabled=True,
-        physical_accel_limit_mps2=float(config.physical_accel_limit_mps2),
-        physical_position_noise_m=float(config.physical_position_noise_m),
         lateral_jump_gate_enabled=bool(config.lateral_jump_gate_enabled),
         lateral_jump_max_m=float(config.lateral_jump_max_m),
         lateral_jump_min_prior_step_m=float(
@@ -1364,25 +1356,6 @@ def _is_isolated_after_gap(item: Mapping[str, Any]) -> bool:
     return bool(item.get("det", {}).get("_step45_isolated_after_gap"))
 
 
-def _position_jump_limit(
-        prior_speed_mps: float,
-        gap_sec: float,
-        config: Step45Config,
-) -> float:
-    """Conservative reachable distance from a stable anchor.
-
-    The object may keep its last observed speed and accelerate at
-    ``physical_accel_limit_mps2``; the small base covers pose/detection
-    quantisation.  This is a position-jump bound, not a heading gate.
-    """
-    gap = max(0.0, float(gap_sec))
-    return (
-        float(config.physical_position_noise_m)
-        + max(0.0, float(prior_speed_mps)) * gap
-        + 0.5 * float(config.physical_accel_limit_mps2) * gap * gap
-    )
-
-
 def mark_long_gap_isolated_frames(
         frames: Sequence[Mapping[str, Any]],
         tracks: Mapping[int, Sequence[Mapping[str, Any]]],
@@ -1575,7 +1548,6 @@ def queue_stitch(
                 gap_sec = max(
                     0.0,
                     float(b_start["timestamp"]) - float(a_end["timestamp"]))
-                prior_speed = _endpoint_speed(items_a, at_end=True)
                 direction_id = assignments[id_a].get("direction_id")
                 direction = (direction_by_id.get(int(direction_id))
                              if direction_id is not None else None)
@@ -1595,10 +1567,6 @@ def queue_stitch(
                 bridge = float(np.linalg.norm(
                     np.asarray(b_start["world"], dtype=np.float64)
                     - np.asarray(a_end["world"], dtype=np.float64)))
-                reachable = _position_jump_limit(
-                    prior_speed, gap_sec, config)
-                if bridge > reachable:
-                    continue
                 if abs(float(v_a) - float(v_b)) \
                         > float(config.queue_stitch_lateral_tolerance_m):
                     continue

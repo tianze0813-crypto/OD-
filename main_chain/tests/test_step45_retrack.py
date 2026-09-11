@@ -363,31 +363,6 @@ class Step45RetrackTest(unittest.TestCase):
                 else:
                     self.assertEqual(detection["track_id"], 2)
 
-    def test_position_jump_gate_rejects_stationary_flash(self):
-        def make_frame(timestamp, x):
-            return {
-                "frame_id": str(timestamp),
-                "num_points": 0,
-                "num_detections": 1,
-                "detections": [det("Car", x, 0.0, None)],
-            }
-        times = [index * 400000000 for index in range(11)]
-        times += [index * 400000000 for index in range(16, 21)]
-        positions = [0.0] * 11 + [5.7, 7.7, 9.7, 11.7, 13.7]
-        frames_input = [make_frame(t, p)
-                        for t, p in zip(times, positions)]
-        with TemporaryDirectory() as directory:
-            coords = make_coords(Path(directory))
-            tracker = ConservativeTracker(
-                coords, min_static_hits=10 ** 9,
-                dynamic_max_gap=1.8, use_yaw=False,
-                occlusion_enabled=True, occlusion_max_gap=2.6,
-                physical_position_jump_enabled=True)
-            output, _diag = tracker.process(frames_input)
-        ids = {det["track_id"] for frame in output
-               for det in frame["detections"]}
-        self.assertGreater(len(ids), 1)
-
     def test_retrack_lateral_jump_gate_rejects_sideways_step(self):
         def make_frame(timestamp, x, y):
             return {
@@ -403,7 +378,6 @@ class Step45RetrackTest(unittest.TestCase):
             disabled = ConservativeTracker(
                 coords, min_static_hits=10 ** 9,
                 dynamic_max_gap=1.8, use_yaw=False,
-                physical_position_jump_enabled=False,
                 lateral_jump_gate_enabled=False)
             output, _diagnostics = disabled.process(
                 [make_frame(t, x, y)
@@ -420,7 +394,6 @@ class Step45RetrackTest(unittest.TestCase):
             enabled = ConservativeTracker(
                 coords, min_static_hits=10 ** 9,
                 dynamic_max_gap=1.8, use_yaw=False,
-                physical_position_jump_enabled=False,
                 lateral_jump_gate_enabled=True,
                 lateral_jump_max_m=2.5)
             output, enabled_diagnostics = enabled.process(
