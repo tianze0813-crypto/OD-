@@ -348,9 +348,6 @@ class ConservativeTracker:
                  use_yaw: bool = True,
                  occlusion_enabled: bool = False,
                  occlusion_max_gap: float = 0.0,
-                 physical_position_jump_enabled: bool = False,
-                 physical_accel_limit_mps2: float = 1.5,
-                 physical_position_noise_m: float = 0.5,
                  lateral_jump_gate_enabled: bool = False,
                  lateral_jump_max_m: float = 2.5,
                  lateral_jump_min_prior_step_m: float = 0.5):
@@ -369,14 +366,6 @@ class ConservativeTracker:
         self.use_yaw = bool(use_yaw)
         self.occlusion_enabled = bool(occlusion_enabled)
         self.occlusion_max_gap = float(occlusion_max_gap)
-        # Physical position-jump envelope.  These are not association
-        # tolerances: they bound how far a real object could have moved.
-        # Enabled explicitly by the step-4.5 motion-only re-tracker so the
-        # existing step-2 static/dynamic contract keeps its behaviour.
-        self.physical_position_jump_enabled = bool(
-            physical_position_jump_enabled)
-        self.physical_accel_limit_mps2 = float(physical_accel_limit_mps2)
-        self.physical_position_noise_m = float(physical_position_noise_m)
         # Hard lateral-jump rejection.  This is enabled only by the step-4.5
         # motion-only re-tracker: when a track already has a stable recent
         # motion axis, a candidate whose centre is more than
@@ -429,34 +418,6 @@ class ConservativeTracker:
                     (last.world - previous.world)[:2])) / gap
         return float(np.linalg.norm(tr.velocity[:2]))
 
-    def _position_jump_gate(
-            self, tr: Track, obs: Observation) -> Optional[str]:
-        if not self.physical_position_jump_enabled:
-            return None
-        # A new fragment may already be moving when it is first observed;
-        # only a track with a stable motion estimate can prove a jump.
-        if len(tr.observations) < 3:
-            return None
-        gap = max((obs.timestamp - tr.last_ts) / 1e9, 0.0)
-        if gap <= 1e-6:
-            return None
-        prior_speed = max(
-            float(np.linalg.norm(tr.velocity[:2])),
-            self._recent_speed(tr))
-        displacement = float(np.linalg.norm(
-            (obs.world[:2] - tr.last_world[:2])))
-        # Very small frame-to-frame centre jumps are detector/pose noise and
-        # must stay associable; the physical jump gate targets real flashes.
-        if displacement <= self.dynamic_base_gate:
-            return None
-        reachable = (
-            self.physical_position_noise_m
-            + max(0.0, prior_speed) * gap
-            + 0.5 * self.physical_accel_limit_mps2 * gap * gap)
-        if displacement > reachable:
-            return "position_jump_gate"
-        return None
-
     def _lateral_jump_gate(
             self, tr: Track, obs: Observation) -> Optional[str]:
         """Reject a candidate that jumps sideways off the recent motion axis.
@@ -491,9 +452,6 @@ class ConservativeTracker:
             lateral_reason = self._lateral_jump_gate(tr, obs)
             if lateral_reason is not None:
                 return 1e9, lateral_reason
-            jump_reason = self._position_jump_gate(tr, obs)
-            if jump_reason is not None:
-                return 1e9, jump_reason
         # Once a track has a clear recent direction, reject a single
         # significant step directly backwards.  This prevents a detector
         # jitter or ID swap from contaminating the track with one reverse
