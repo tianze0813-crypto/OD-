@@ -97,6 +97,24 @@ class HybridPipelineTest(unittest.TestCase):
             ["Truck", "Nonmotorized_vehicle"],
         )
 
+    def test_early_non_car_filter_folds_bus_into_truck(self):
+        frames = [{
+            "frame_id": "1",
+            "detections": [
+                _det(1, "Truck"), _det(2, "Bus"), _det(3, "bus"),
+                _det(4, "Pedestrian"),
+            ],
+        }]
+
+        stats = _noncar_filter(frames)
+
+        self.assertEqual(stats["detections_removed"], 0)
+        self.assertEqual(stats["class_folding"], {"Bus->Truck": 2})
+        self.assertEqual(
+            [det["class_name"] for det in frames[0]["detections"]],
+            ["Truck", "Truck", "Truck", "Pedestrian"],
+        )
+
     def test_merge_is_frame_aligned_and_remaps_exp_d_ids(self):
         main = [{"frame_id": "1", "num_points": 7,
                  "detections": [_det(1, "Car")]}]

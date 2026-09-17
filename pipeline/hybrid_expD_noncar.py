@@ -32,21 +32,37 @@ NON_CAR_CLASSES = (
     "Truck", "Bus", "Pedestrian", "Nonmotorized_vehicle",
 )
 
+# The non-Car route keeps a single heavy-vehicle class.  Bus is folded into
+# Truck as the very first thing that happens to a raw detection so every later
+# stage (score thresholds, identity tracking, class voting, geometry
+# refinement, Car merge) sees one class and needs no Bus special case.
+NON_CAR_CLASS_FOLDING = {"Bus": "Truck"}
+
 
 def _count(frames: List[Dict[str, Any]]) -> int:
     return sum(len(frame.get("detections", [])) for frame in frames)
 
 
 def _noncar_filter(frames: List[Dict[str, Any]]) -> Dict[str, int]:
+    """Keep only non-Car classes and fold Bus into Truck.
+
+    This is the first stage of the non-Car route, applied to the raw inference
+    output before any filtering, tracking, or geometry work.
+    """
     before = _count(frames)
     removed = 0
     removed_by_class: Dict[str, int] = {}
+    folded: Dict[str, int] = {}
     for frame in frames:
         kept = []
         for det in frame.get("detections", []):
             canonical = tracking.canonical_class_name(det.get("class_name", ""))
-            if canonical in NON_CAR_CLASSES:
-                det["class_name"] = canonical
+            target = NON_CAR_CLASS_FOLDING.get(canonical, canonical)
+            if target in NON_CAR_CLASSES:
+                if target != canonical:
+                    key = f"{canonical}->{target}"
+                    folded[key] = folded.get(key, 0) + 1
+                det["class_name"] = target
                 kept.append(det)
             else:
                 removed += 1
@@ -59,6 +75,7 @@ def _noncar_filter(frames: List[Dict[str, Any]]) -> Dict[str, int]:
         "detections_after": _count(frames),
         "detections_removed": removed,
         "removed_by_class": dict(sorted(removed_by_class.items())),
+        "class_folding": dict(sorted(folded.items())),
     }
 
 

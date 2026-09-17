@@ -1,7 +1,7 @@
 # 五类别 LiDAR 预标注流水线（混合链路）
 
 输入：SUSTechPOINTS 原始 clip（含 `lidar/lidar_top/*.bin` 与 `transforms/`）。
-输出：五类预标注 **Car / Truck / Bus / Pedestrian / Nonmotorized_vehicle**，
+输出：**Car / Truck / Pedestrian / Nonmotorized_vehicle** 四类预标注，
 每帧写在 `<clip>_pre/label/<frame_id>.json`，可直接用 SUSTechPOINTS 打开。
 
 混合链路：
@@ -9,8 +9,14 @@
 ```text
 main_chain/（最新 OD-main-0909 快照，Waymo Car + Step4.5）
   -> VOD e12 非车四类（Ped / NMV / Truck / Bus）
-  -> 按 frame_id 合并为五类
+  -> 非车链第一步把 Bus 折叠成 Truck
+  -> 按 frame_id 合并为四类
 ```
+
+> Bus 的折叠发生在非车链最早的 `early_non_car_class_filter`
+> （`pipeline/hybrid_expD_noncar.py::_noncar_filter`）里，紧跟 raw 推理输出，
+> 早于打分过滤 / 跟踪 / 类别投票 / 几何精修。因此 Bus 框会完全按 Truck 规则走，
+> 最终标签中不会出现 `Bus`；五类模型与 main 车链不受影响。
 
 入口是 `hybrid_run.sh`，会自动探测本机 OpenPCDet 环境（默认
 `~/miniconda3/envs/openpcdet`），不需要手动激活 conda。
@@ -104,7 +110,7 @@ bash hybrid_run.sh /path/to/clips --in-place --overwrite
 导出 SUST：
 
 ```bash
-bash hybrid_run.sh /path/to/clips /home/moga/桌面/SUSTechPOINTS/data --overwrite
+bash hybrid_run.sh /home/moga/桌面/预标测效/ /home/moga/桌面/SUSTechPOINTS/data --overwrite
 ```
 
 ### 批量 B：分场景 / step2 的嵌套结构（police/0903）
@@ -112,7 +118,7 @@ bash hybrid_run.sh /path/to/clips /home/moga/桌面/SUSTechPOINTS/data --overwri
 `/media/moga/police/0903` 是 `<scene>/step2/<clip>/` 结构，需要用 shell 逐层遍历：
 
 ```bash
-DATA_ROOT=/media/moga/police/0903
+DATA_ROOT=/media/moga/GEN2/0915/
 SUST=/home/moga/桌面/SUSTechPOINTS/data
 
 for scene in "$DATA_ROOT"/*/; do
@@ -166,7 +172,7 @@ done
 | `--noncar-cfg` | `models/voxelnext_fiveclass_nuscenes_infer.yaml` | 推理配置 |
 | `--noncar-raw-threshold` | `0.15`（= 类别阈值最小值） | 非车 raw 推理分数门槛 |
 | `--truck-score-threshold` | `0.4` | Truck 最终分数阈值 |
-| `--bus-score-threshold` | `0.4` | Bus 最终分数阈值 |
+| `--bus-score-threshold` | `0.4` | 非车链已把 Bus 折叠为 Truck，此参数不再生效（保留仅为兼容） |
 | `--pedestrian-score-threshold` | `0.15` | Pedestrian 最终分数阈值 |
 | `--nonmotorized-score-threshold` | `0.20` | NMV 最终分数阈值 |
 | `--score-threshold` | 未设置 | 一次性覆盖以上四个类别阈值；raw 门槛仍取最小值 |
@@ -205,7 +211,7 @@ Car 由 `main_chain/` 的 Waymo 权重生成。
 
 默认非车类别分数阈值：
 
-- Truck / Bus：`0.4`
+- Truck：`0.4`（Bus 在非车链开头即折叠为 Truck，沿用 Truck 阈值）
 - Pedestrian：`0.15`
 - Nonmotorized_vehicle：`0.20`
 - raw 门槛：`min(...) = 0.15`
@@ -216,7 +222,8 @@ Car 由 `main_chain/` 的 Waymo 权重生成。
 合并阶段还有两条后处理规则：
 
 1. NMV 只保留 world 系首尾净位移 `> 15m` 的轨迹；
-2. Truck/Bus 与 Car 在单帧内 BEV 重叠面积 / Car 面积 `> 0.5` 时，只删该帧的 Car。
+2. Truck 与 Car 在单帧内 BEV 重叠面积 / Car 面积 `> 0.5` 时，只删该帧的 Car
+   （Bus 已折叠为 Truck，走同一条规则）。
 
 ## 实测耗时
 
