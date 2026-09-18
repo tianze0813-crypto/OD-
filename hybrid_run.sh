@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Serial hybrid runner: main-branch Car first, current expD non-Car second.
+# Serial hybrid runner: Car -> Truck -> VRU (see README.md).
 # Picks a healthy OpenPCDet python (or $PYTHON) so the launcher can import
 # the post-processing pipeline.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
