@@ -37,6 +37,7 @@ def run(
         *,
         hard_filter_config: HardFilterConfig = HardFilterConfig(),
         same_center_gate: float = 0.35,
+        disable_slot_binding: bool = False,     # 【改动】不把动态轨迹钉到停车位 id
 ) -> Dict[str, Any]:
     source = json.loads(Path(in_json).read_text(encoding="utf-8"))
     if not isinstance(source, list):
@@ -44,7 +45,8 @@ def run(
 
     frames: List[Dict[str, Any]] = copy.deepcopy(source)
     coords = tracking.CoordinateProvider(Path(clip))
-    tracker = static_first.StaticFirstTracker(coords)
+    tracker = static_first.StaticFirstTracker(
+        coords, disable_slot_binding=bool(disable_slot_binding))   # 【改动】
     tracked, tracking_diagnostics = tracker.process(frames)
     identity_check = static_first.verify_identity_only(source, tracked)
 

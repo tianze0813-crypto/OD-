@@ -89,6 +89,15 @@ def run(
         truck_config: TruckOverlapConfig = TruckOverlapConfig(),
         nonmotorized_config: NonmotorizedSizeConfig = NonmotorizedSizeConfig(),
         car_refinement_enabled: bool = True,
+        # 【改动】yaw 实现可切换："legacy" = 原非车链 yaw（会用运动航向覆盖 detector yaw）；
+        # "v2" = 新版（apply_motion_yaw=False，动态段/拐弯保留 detector yaw）。Truck 链用 v2。
+        yaw_impl: str = "legacy",
+        # 【改动】False = 跳过静态 yaw 稳定（不把静止段 yaw 锁到停车方向）
+        static_yaw_enabled: bool = True,
+        yaw_vehicle_config=None,
+        # 【改动】False = 跳过 step3 自带的 Truck 重叠 ID 合并
+        # （Truck 链改用 geometry.truck_postprocess 的【并集长框】合并）
+        truck_merge_enabled: bool = True,
 ) -> Dict[str, Any]:
     source = json.loads(Path(step2_5_json).read_text(encoding="utf-8"))
     if not isinstance(source, list):
@@ -100,12 +109,32 @@ def run(
 
     frames: List[Dict[str, Any]] = copy.deepcopy(source)
     before_yaw = copy.deepcopy(frames)
-    static_yaw_diagnostics = stabilize_static_yaw(
-        frames, coords, slots,
-        tracking_diagnostics.get("slot_motion_coordination", {}))
-    yawed, yaw_diagnostics = apply_yaw_integrated(
-        frames, before_yaw, coords, Path(clip), tracking_diagnostics,
-        static_yaw_diagnostics)
+    # 【改动】按 yaw_impl 选择实现；v2 从 geometry_yaw_v2 导入，与旧版完全隔离
+    if str(yaw_impl).lower() in ("v2", "new"):
+        from geometry_yaw_v2.static_yaw import stabilize_static_yaw as _stab_yaw
+        from geometry_yaw_v2.yaw_integrated import apply_yaw_integrated as _apply_yaw
+    else:
+        _stab_yaw = stabilize_static_yaw
+        _apply_yaw = apply_yaw_integrated
+    if static_yaw_enabled:                                   # 【改动】
+        static_yaw_diagnostics = _stab_yaw(
+            frames, coords, slots,
+            tracking_diagnostics.get("slot_motion_coordination", {}))
+    else:
+        static_yaw_diagnostics = {"policy": {"skipped": "static_yaw_disabled"},
+                                  "static_slots_available": 0,
+                                  "static_slots_stabilized": 0,
+                                  "parking_boxes_stabilized": 0,
+                                  "parking_boxes_changed": 0, "slots": []}
+    if yaw_vehicle_config is not None:                       # 【改动】
+        yawed, yaw_diagnostics = _apply_yaw(
+            frames, before_yaw, coords, Path(clip), tracking_diagnostics,
+            static_yaw_diagnostics, vehicle_config=yaw_vehicle_config)
+    else:
+        yawed, yaw_diagnostics = _apply_yaw(
+            frames, before_yaw, coords, Path(clip), tracking_diagnostics,
+            static_yaw_diagnostics)
+    yaw_diagnostics.setdefault("policy", {})["yaw_impl"] = str(yaw_impl)  # 【改动】
 
     # Match the reviewed police-pipeline Car route: feed the post-yaw boxes
     # directly into the dedicated shrink-only point-cloud fitter. In
@@ -134,7 +163,8 @@ def run(
     before_multiclass = copy.deepcopy(generic_output)
     yawed = generic_output
     truck_diagnostics = merge_overlapping_truck_tracks(
-        yawed, coords, truck_config)
+        yawed, coords, truck_config) if truck_merge_enabled else (
+        yawed, {"enabled": False, "reason": "truck_merge_disabled", "removed": 0})   # 【改动】
     nonmotorized_diagnostics = unify_nonmotorized_track_sizes(
         yawed, coords, nonmotorized_config)
     output = yawed

@@ -111,6 +111,7 @@ class StaticFirstTracker:
         duplicate_slot_along_gate: float = 0.45,
         duplicate_slot_cross_gate: float = 2.2,
         duplicate_slot_iou_gate: float = 0.35,
+        disable_slot_binding: bool = False,   # 【改动】
         duplicate_slot_max_weak_fraction: float = 0.5,
         topology_gap_max_frames: int = 3,
         stop_frames: int = 10,
@@ -138,6 +139,8 @@ class StaticFirstTracker:
         self.duplicate_slot_along_gate = float(duplicate_slot_along_gate)
         self.duplicate_slot_cross_gate = float(duplicate_slot_cross_gate)
         self.duplicate_slot_iou_gate = float(duplicate_slot_iou_gate)
+        # 【改动】True = 不把动态轨迹"钉"到停车位的固定 id（保留跟踪器其余逻辑）
+        self.disable_slot_binding = bool(disable_slot_binding)
         self.duplicate_slot_max_weak_fraction = float(
             duplicate_slot_max_weak_fraction)
         self.topology_gap_max_frames = int(topology_gap_max_frames)
@@ -1224,6 +1227,8 @@ class StaticFirstTracker:
         stop_bound_slots: set[int] = set()
         stop_binds = []
         for tid, items in sorted(dynamic.items()):
+            if self.disable_slot_binding:      # 【改动】跳过"停车绑定"
+                break
             stopped, dwell_center, dwell_start, dwell_end = self._explicit_stop(
                 items, self.stop_frames, self.stop_step_gate)
             if not stopped or dwell_center is None:
@@ -1278,6 +1283,8 @@ class StaticFirstTracker:
         arrival_bound_slots: set[int] = set()
         arrival_binds = []
         for tid, items in sorted(dynamic.items()):
+            if self.disable_slot_binding:      # 【改动】跳过"到达绑定"
+                break
             end = items[-1]
             # Parking is the reverse of departure: require a sustained inward
             # approach so a passing track cannot claim a parked slot.

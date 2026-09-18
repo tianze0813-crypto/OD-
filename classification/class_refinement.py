@@ -15,6 +15,12 @@ from tracking import tracker_conservative as tracking
 
 VEHICLE_FAMILY = frozenset({"Vehicle", "Car", "Truck"})
 
+# 【测试改动】VRU（行人/非机动车）类：彼此之间不做 ID 关联，
+# 且同一 track_id 内不再按尺寸改写类别（保持检测器输出的类别）。
+VRU_CLASSES = frozenset({
+    "Pedestrian", "Nonmotorized_vehicle", "Cyclist", "Bicycle", "Motorcycle",
+})
+
 
 @dataclass(frozen=True)
 class ClassRefinementConfig:
@@ -23,6 +29,8 @@ class ClassRefinementConfig:
     max_cross_class_speed: float = 12.0
     max_relative_size_delta: float = 0.55
     uniqueness_margin: float = 0.35
+    # 【测试改动】True = Ped/NMV 之间不关联、同一 id 内不改类别
+    preserve_vru_model_class: bool = True
     truck_length_min: float = 6.0
     pedestrian_length_max: float = 1.25
     pedestrian_width_max: float = 1.10
@@ -203,6 +211,14 @@ def preassociate_and_unify(
             if left.original_class == right.original_class:
                 union(index, index + 1)
                 continue
+            if (config.preserve_vru_model_class
+                    and {left.original_class, right.original_class} <= VRU_CLASSES):
+                transitions_diag.append({
+                    "shadow_track_id": shadow_id,
+                    "skipped": "vru_no_cross_class_merge",
+                    "classes": [left.original_class, right.original_class],
+                })
+                continue
             accepted, detail = _valid_cross_class_edge(
                 left, right, by_frame, config)
             detail["shadow_track_id"] = shadow_id
@@ -305,6 +321,9 @@ def finalize_track_classes(
             # and mixed-class tracks.
             continue
         if len(class_counts) > 1:
+            if (config.preserve_vru_model_class
+                    and original_classes <= VRU_CLASSES):
+                continue          # 【测试改动】同一 track_id 内不改类别
             target = (_vehicle_target(items, config)
                       if original_classes <= VEHICLE_FAMILY
                       else _mixed_target(items, config))
@@ -356,6 +375,7 @@ def finalize_track_classes(
 def finalize_model_track_classes(
         frames: List[Dict[str, Any]],
         target_classes: Sequence[str] = tracking.TARGET_CLASSES,
+        preserve_vru_model_class: bool = True,
 ) -> Dict[str, Any]:
     """Normalize model labels after identity assignment without size relabeling.
 
@@ -381,6 +401,19 @@ def finalize_model_track_classes(
     details = []
     for track_id, detections in sorted(tracks.items()):
         counts = Counter(str(det["class_name"]) for det in detections)
+        if preserve_vru_model_class and set(counts) <= VRU_CLASSES:
+            # 【测试改动】同一 track_id 内不再改类别：保留每一帧模型自己输出的类别。
+            # 原行为是 track 内多数投票后把整条轨迹改成 winer，会把
+            # 行人和非机动车（或自行车与骑行者）在 track 内统一成一类。
+            details.append({
+                "track_id": track_id,
+                "class_counts": dict(sorted(counts.items())),
+                "target_class": None,
+                "skipped": "vru_preserve_model_class",
+                "detections": len(detections),
+                "detections_changed": 0,
+            })
+            continue
         # Score is only a deterministic tie-breaker; the majority vote remains
         # the primary evidence for a track-level semantic label.
         winner = max(sorted(counts), key=lambda name: (

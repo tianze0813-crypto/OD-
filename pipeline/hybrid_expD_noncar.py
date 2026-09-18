@@ -19,6 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from classification.class_refinement import ClassRefinementConfig
 from filtering.five_class_output import apply_five_class_output
+from filtering.pedestrian_row_filter import drop_pedestrian_rows   # 【改动】
 from filtering.hard_filters import HardFilterConfig, apply_category_score_filter
 from geometry.box_geometry import GeometryConfig
 from geometry.multiclass_refinement import NonmotorizedSizeConfig, TruckOverlapConfig
@@ -39,15 +40,75 @@ NON_CAR_CLASSES = (
 NON_CAR_CLASS_FOLDING = {"Bus": "Truck"}
 
 
+def _early_range_filter(frames: List[Dict[str, Any]], *,
+                        range_front: float, range_rear: float, range_side: float,
+                        pedestrian_max_distance: float,
+                        nonmotorized_max_distance: float) -> Dict[str, Any]:
+    """【改动】把范围过滤提到链路最前面（一个 O(n) 比较），避免为注定被丢的框做跟踪/精修。
+
+    口径与 filtering/hard_filters.py 完全一致：
+      检测器局部系 x 为横向、纵向前方为 -y
+        方框:  |x| <= range_side 且 -range_front <= y <= range_rear
+        行人:  hypot(x, y) <= pedestrian_max_distance
+        非机动车: hypot(x, y) <= nonmotorized_max_distance
+    """
+    import math as _math
+    before = _count(frames)
+    removed = 0
+    by_reason: Dict[str, int] = {}
+    for frame in frames:
+        kept = []
+        for det in frame.get("detections", []):
+            box = det.get("box_lidar") or [0.0, 0.0]
+            try:
+                x, y = float(box[0]), float(box[1])
+            except (TypeError, ValueError, IndexError):
+                removed += 1
+                by_reason["bad_box"] = by_reason.get("bad_box", 0) + 1
+                continue
+            cls = tracking.canonical_class_name(det.get("class_name", ""))
+            reason = None
+            if not (abs(x) <= range_side and -range_front <= y <= range_rear):
+                reason = "annotation_range"
+            elif cls == "Pedestrian" and _math.hypot(x, y) > pedestrian_max_distance:
+                reason = "distant_pedestrian"
+            elif cls == "Nonmotorized_vehicle" and _math.hypot(x, y) > nonmotorized_max_distance:
+                reason = "distant_nonmotorized"
+            if reason:
+                removed += 1
+                by_reason[reason] = by_reason.get(reason, 0) + 1
+            else:
+                kept.append(det)
+        frame["detections"] = kept
+    after = before - removed
+    return {"detections_before": before, "detections_after": after,
+            "detections_removed": removed, "removed_by_reason": by_reason,
+            "range_front": range_front, "range_rear": range_rear,
+            "range_side": range_side,
+            "pedestrian_max_distance": pedestrian_max_distance,
+            "nonmotorized_max_distance": nonmotorized_max_distance}
+
+
+def _yaw_v2_config(flags):        # 【改动】
+    """把 dict 形式的开关转成 geometry_yaw_v2 的 YawVehicleDynamicConfig。"""
+    if not flags:
+        return None
+    from geometry_yaw_v2.yaw_vehicle_dynamic import YawVehicleDynamicConfig
+    return YawVehicleDynamicConfig(**dict(flags))
+
+
 def _count(frames: List[Dict[str, Any]]) -> int:
     return sum(len(frame.get("detections", [])) for frame in frames)
 
 
-def _noncar_filter(frames: List[Dict[str, Any]]) -> Dict[str, int]:
+def _noncar_filter(frames: List[Dict[str, Any]],
+                   keep_classes=NON_CAR_CLASSES) -> Dict[str, int]:
     """Keep only non-Car classes and fold Bus into Truck.
 
     This is the first stage of the non-Car route, applied to the raw inference
     output before any filtering, tracking, or geometry work.
+    【改动】keep_classes 可收窄：Truck 链只要 ("Truck",)，VRU 链只要
+    ("Pedestrian", "Nonmotorized_vehicle")。
     """
     before = _count(frames)
     removed = 0
@@ -58,7 +119,7 @@ def _noncar_filter(frames: List[Dict[str, Any]]) -> Dict[str, int]:
         for det in frame.get("detections", []):
             canonical = tracking.canonical_class_name(det.get("class_name", ""))
             target = NON_CAR_CLASS_FOLDING.get(canonical, canonical)
-            if target in NON_CAR_CLASSES:
+            if target in keep_classes:   # 【改动】原为 NON_CAR_CLASSES
                 if target != canonical:
                     key = f"{canonical}->{target}"
                     folded[key] = folded.get(key, 0) + 1
@@ -83,8 +144,12 @@ def _hard_config(*, sparsity_max_points: int,
                  visibility_min_ratio: float,
                  score_threshold: float | None,
                  class_score_thresholds: Mapping[str, float] | None = None,
-                 pedestrian_max_distance: float = 20.0,
-                 nonmotorized_max_distance: float = 60.0) -> HardFilterConfig:
+                 pedestrian_max_distance: float = 15.0,   # 【改动】20 -> 15
+                 nonmotorized_max_distance: float = 60.0,
+                 # 【改动】范围过滤口径：前 60 / 后 20 / 左右 40
+                 range_front: float = 60.0,
+                 range_rear: float = 20.0,
+                 range_side: float = 40.0) -> HardFilterConfig:
     fallback = 0.3 if score_threshold is None else float(score_threshold)
     defaults = {
         "Truck": 0.4,
@@ -103,6 +168,9 @@ def _hard_config(*, sparsity_max_points: int,
         for name, default in defaults.items()
     )
     return HardFilterConfig(
+        range_front=float(range_front),   # 【改动】
+        range_rear=float(range_rear),
+        range_side=float(range_side),
         score_threshold=fallback,
         class_score_thresholds=per_class,
         sparsity_max_points=int(sparsity_max_points),
@@ -300,21 +368,45 @@ def run(raw_json: Path, clip: Path, out_json: Path,
         short_track_max_frames: int = 4,
         score_threshold: float | None = None,
         class_score_thresholds: Mapping[str, float] | None = None,
-        pedestrian_max_distance: float = 20.0,
+        pedestrian_max_distance: float = 15.0,   # 【改动】20 -> 15
         nonmotorized_max_distance: float = 60.0,
-        nonmotorized_min_net_displacement: float = 15.0) -> Dict[str, Any]:
+        nonmotorized_min_net_displacement: float = 15.0,
+        # 【改动】范围过滤：前 60 / 后 20 / 左右 40
+        range_front: float = 60.0,
+        range_rear: float = 20.0,
+        range_side: float = 40.0,
+        # 【改动】拆分用：类别白名单 + yaw 实现 + 静态旋转过滤作用类
+        keep_classes=NON_CAR_CLASSES,
+        yaw_impl: str = "legacy",
+        # 【改动】以下四个用于 Truck 链：关掉"钉停车位"与静态 yaw 锁，并启用直线行驶 yaw 修正
+        disable_slot_binding: bool = False,
+        static_yaw_enabled: bool = True,
+        yaw_vehicle_flags=None,
+        # 【改动】行人"一排"过滤（VRU 链）
+        pedestrian_row_filter: bool = False,
+        pedestrian_row_min: int = 6,
+        pedestrian_row_tolerance: float = 1.0,
+        # 【改动】Truck 专用后处理：① yaw旋转帧修正 ② IoU并集合并 ③ xy贴合 ④ yaw翻转
+        truck_postprocess: bool = False,
+        truck_postprocess_config=None,
+        truck_merge_enabled: bool = True,     # 【改动】step3 自带的 Truck 合并开关
+        static_rotation_classes=("Truck", "Bus", "Nonmotorized_vehicle"),
+) -> Dict[str, Any]:
     source = json.loads(Path(raw_json).read_text(encoding="utf-8"))
     if not isinstance(source, list):
         raise ValueError(f"input must be a list of frames: {raw_json}")
     frames: List[Dict[str, Any]] = copy.deepcopy(source)
     diagnostics: Dict[str, Any] = {
         "pipeline": "hybrid_expD_noncar",
+        "keep_classes": list(keep_classes),   # 【改动】
+        "yaw_impl": str(yaw_impl),            # 【改动】
         "source_raw_json": str(Path(raw_json).resolve()),
         "clip": str(Path(clip).resolve()),
         "input_frames": len(frames),
         "input_detections": _count(frames),
         "stage_order": [
             "early_non_car_class_filter",
+            "early_range_filter",   # 【改动】提到最前
             "category_score_filter_non_car_only",
             "current_identity_tracking",
             "current_class_correction_and_filters_without_static_car_pass",
@@ -323,9 +415,17 @@ def run(raw_json: Path, clip: Path, out_json: Path,
             "base_link_conversion",
         ],
     }
-    diagnostics["early_non_car_filter"] = _noncar_filter(frames)
+    diagnostics["early_non_car_filter"] = _noncar_filter(
+        frames, keep_classes=keep_classes)   # 【改动】
+    # 【改动】紧接类别过滤后，立刻做范围过滤（便宜且能砍掉 ~2/3 的框）
+    diagnostics["early_range_filter"] = _early_range_filter(
+        frames, range_front=range_front, range_rear=range_rear,
+        range_side=range_side,
+        pedestrian_max_distance=pedestrian_max_distance,
+        nonmotorized_max_distance=nonmotorized_max_distance)
 
     hard_config = _hard_config(
+        range_front=range_front, range_rear=range_rear, range_side=range_side,
         sparsity_max_points=sparsity_max_points,
         visibility_min_ratio=visibility_min_ratio,
         score_threshold=score_threshold,
@@ -346,6 +446,7 @@ def run(raw_json: Path, clip: Path, out_json: Path,
         filtered_input, Path(clip), step2_json,
         diagnostics_path=step2_diag,
         hard_filter_config=hard_config,
+        disable_slot_binding=bool(disable_slot_binding),   # 【改动】
     )
 
     step2_5_json = work_root / (Path(out_json).stem + "_step2_5.json")
@@ -357,7 +458,7 @@ def run(raw_json: Path, clip: Path, out_json: Path,
         class_config=ClassRefinementConfig(),
         min_lifecycle=int(short_track_max_frames),
         static_rotation_enabled=True,
-        static_rotation_classes=("Truck", "Bus", "Nonmotorized_vehicle"),
+        static_rotation_classes=tuple(static_rotation_classes),   # 【改动】
     )
 
     step3_json = work_root / (Path(out_json).stem + "_step3.json")
@@ -369,15 +470,30 @@ def run(raw_json: Path, clip: Path, out_json: Path,
         truck_config=TruckOverlapConfig(),
         nonmotorized_config=NonmotorizedSizeConfig(),
         car_refinement_enabled=False,
+        yaw_impl=str(yaw_impl),   # 【改动】Truck 链传 "v2"
+        static_yaw_enabled=bool(static_yaw_enabled),        # 【改动】
+        yaw_vehicle_config=_yaw_v2_config(yaw_vehicle_flags),  # 【改动】
+        truck_merge_enabled=bool(truck_merge_enabled),       # 【改动】
     )
 
     processed = json.loads(step3_json.read_text(encoding="utf-8"))
     coords = tracking.CoordinateProvider(Path(clip))
+    if truck_postprocess:                       # 【改动】Truck 专用后处理 ①->②->③->④
+        from geometry.truck_postprocess import (apply_truck_postprocess,
+                                                TruckPostConfig)
+        diagnostics["truck_postprocess"] = apply_truck_postprocess(
+            processed, coords, Path(clip),
+            truck_postprocess_config or TruckPostConfig())
     _short_dropped, short_motion_stats = drop_short_motion_nonmotorized(
         processed, coords,
         min_net_displacement=nonmotorized_min_net_displacement,
     )
     diagnostics["nonmotorized_short_motion"] = short_motion_stats
+    if pedestrian_row_filter:                # 【改动】世界系"一排行人"过滤（后段：
+        # 在跟踪+过滤之后，与 SUST 里看到/统计的最终结果口径一致）
+        diagnostics["pedestrian_row_filter"] = drop_pedestrian_rows(
+            processed, coords, min_row=int(pedestrian_row_min),
+            tolerance=float(pedestrian_row_tolerance), box_frame="lidar_top")
     _spin_dropped, spin_stats = drop_spinning_vehicle(processed)
     diagnostics["spinning_truck_bus"] = spin_stats
     output, final_diag = apply_five_class_output(processed, coords)
@@ -425,7 +541,7 @@ def main() -> None:
     parser.add_argument("--bus-score-threshold", type=float)
     parser.add_argument("--pedestrian-score-threshold", type=float)
     parser.add_argument("--nonmotorized-score-threshold", type=float)
-    parser.add_argument("--pedestrian-max-distance", type=float, default=20.0)
+    parser.add_argument("--pedestrian-max-distance", type=float, default=15.0)  # 【改动】20 -> 15
     parser.add_argument("--nonmotorized-max-distance", type=float, default=60.0)
     parser.add_argument("--nonmotorized-min-net-displacement", type=float,
                         default=15.0,

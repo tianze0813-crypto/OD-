@@ -195,8 +195,10 @@ def run(
     frames: List[Dict[str, Any]] = copy.deepcopy(source)
 
     before_class = copy.deepcopy(frames)
+    # 【测试改动】preserve_vru_model_class=True：同一 track_id 内不改类别
+    # （Ped/NMV 不做多数投票统一）。改成 False 即恢复原行为。
     class_correction = finalize_model_track_classes(
-        frames, tracking.TARGET_CLASSES)
+        frames, tracking.TARGET_CLASSES, preserve_vru_model_class=True)
     class_only_check = _assert_class_only(before_class, frames)
 
     static_rotation = {"enabled": False}

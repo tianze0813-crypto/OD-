@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""串行运行 main-Car + VOD-non-Car 并合并为一个 SUST 预标注结果。"""
+"""串行运行三条链并合并为一个 SUST 预标注结果（【改动】2026-09-18）。
+
+接入顺序（用户指定）：**先 Car -> 再 Truck -> 最后 Pedestrian/Nonmotorized_vehicle**
+
+  1. Car   : main_chain（Waymo Car + Step4.5），权重 main_chain/models/vn_waymo_v2_4gpu_full_epoch10.pth
+  2. Truck : pipeline/hybrid_expD_truck.py，权重 models/voxelnext_truckB_epoch15.pth（obj_id +1000）
+  3. VRU   : pipeline/hybrid_expD_vru.py，权重 models/voxelnext_vru_1head2cls_epoch20.pth（obj_id +2000）
+
+三条链各自独立推理，最后按 frame_id 合成一份 label/。
+用 --chains 可选子集，例如 --chains car,truck；旧五类单链用 --chains car,noncar。
+"""
 
 from __future__ import annotations
 
@@ -11,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -19,6 +30,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from pipeline.hybrid_expD_noncar import run as run_expd_noncar
+from pipeline.hybrid_expD_truck import run as run_expd_truck
+from pipeline.hybrid_expD_vru import run as run_expd_vru
 from pipeline.hybrid_main_car import run as run_main_car
 from pipeline.hybrid_merge import merge_label_frames
 
@@ -29,6 +42,14 @@ NONCAR_CFG = ROOT / "models" / "voxelnext_fiveclass_nuscenes_infer.yaml"
 # (checkpoint stores epoch 6).  The older expD_e8.pth remains available via
 # --noncar-ckpt but is no longer the default.
 NONCAR_CKPT = ROOT / "models" / "vod_2cls_ft_e12.pth"
+# 【改动】三条链各自的权重/配置
+TRUCK_CFG = ROOT / "models" / "voxelnext_truck_infer.yaml"
+TRUCK_CKPT = ROOT / "models" / "voxelnext_truckB_epoch15.pth"
+VRU_CFG = ROOT / "models" / "voxelnext_vru_infer.yaml"
+VRU_CKPT = ROOT / "models" / "voxelnext_vru_1head2cls_epoch20.pth"
+TRUCK_ID_OFFSET = 1000
+VRU_ID_OFFSET = 2000
+DEFAULT_CHAINS = ("car", "truck", "vru")
 REQUIRED_MODULES = ("numpy", "scipy", "cv2", "PIL", "pandas", "av2",
                     "kornia", "yaml", "torch", "spconv", "pcdet")
 
@@ -160,6 +181,174 @@ def _run_raw(python: Path, clip: Path, cfg: Path, ckpt: Path,
     return output
 
 
+def _frames_to_labels(frames: List[Dict[str, Any]],
+                      id_offset: int) -> Dict[str, List[Dict[str, Any]]]:
+    """把某条链的 frames(detections) 转成 {frame_id: [SUST label]}，obj_id 统一加偏移。"""
+    from tracking import tracker_conservative as tracking
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for frame in frames:
+        items = []
+        for det in frame.get("detections", []):
+            if det.get("track_id") is None:
+                continue
+            item = tracking.box_to_label(det)
+            try:
+                item["obj_id"] = str(int(item["obj_id"]) + int(id_offset))
+            except (TypeError, ValueError):
+                item["obj_id"] = "x" + str(item["obj_id"])
+            items.append(item)
+        out[str(frame["frame_id"])] = items
+    return out
+
+
+def _label_box7(label: Dict[str, Any]) -> tuple:
+    """SUST label -> box7 (x, y, z, dx, dy, dz, yaw)，用于算 BEV IoU。"""
+    psr = label["psr"]
+    return (float(psr["position"]["x"]), float(psr["position"]["y"]),
+            float(psr["position"]["z"]), float(psr["scale"]["x"]),
+            float(psr["scale"]["y"]), float(psr["scale"]["z"]),
+            float(psr["rotation"]["z"]))
+
+
+def _car_cover_ratio(car_box: tuple, truck_box: tuple) -> tuple:
+    """【改动】Car 被 Truck 覆盖的面积比 = 交面积 / Car 面积；同时给出 BEV IoU 作参考。"""
+    from tracking import tracker_conservative as tracking
+    car_poly = tracking.rectangle_corners(car_box[:2], car_box[3:5], car_box[6])
+    truck_poly = tracking.rectangle_corners(truck_box[:2], truck_box[3:5],
+                                            truck_box[6])
+    inter = tracking.polygon_area(
+        tracking.convex_intersection(car_poly, truck_poly))
+    car_area = tracking.polygon_area(car_poly)
+    truck_area = tracking.polygon_area(truck_poly)
+    union = car_area + truck_area - inter
+    cover = 0.0 if car_area <= 1e-9 else inter / car_area
+    iou = 0.0 if union <= 1e-9 else inter / union
+    return cover, iou
+
+
+def _drop_cars_covered_by_trucks(
+        frames: List[Dict[str, Any]], threshold: float = 0.8
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """【改动】Car 被 Truck 覆盖的面积 >= Car 面积的阈值 → 删掉【该 Car id 的全部帧】。
+
+    规则来自用户 2026-09-18：不是用 IoU（Truck 比 Car 大得多，IoU 天然偏小），
+    而是「交面积 / Car 面积」>= 80% 时以 Truck 为准；且不是只删重叠那一帧，
+    而是整条 Car 轨迹都删。
+    """
+    from tracking import tracker_conservative as tracking
+    if threshold is None or float(threshold) <= 0:
+        return frames, {"enabled": False}
+    dropped_ids: set = set()
+    matched_pairs = 0
+    worst: List[Dict[str, Any]] = []
+    for frame in frames:
+        cars = [item for item in frame.get("labels", [])
+                if item.get("obj_type") == "Car"]
+        trucks = [item for item in frame.get("labels", [])
+                  if item.get("obj_type") == "Truck"]
+        if not cars or not trucks:
+            continue
+        truck_boxes = [_label_box7(item) for item in trucks]
+        for car in cars:
+            car_id = str(car.get("obj_id"))
+            if car_id in dropped_ids:
+                continue
+            car_box = _label_box7(car)
+            best_cover = 0.0
+            best_iou = 0.0
+            best_truck = None
+            for truck, truck_box in zip(trucks, truck_boxes):
+                cover, iou = _car_cover_ratio(car_box, truck_box)
+                if cover > best_cover:
+                    best_cover, best_iou = cover, iou
+                    best_truck = str(truck.get("obj_id"))
+            if best_cover >= float(threshold):
+                dropped_ids.add(car_id)
+                matched_pairs += 1
+                worst.append({"frame_id": frame.get("frame_id"),
+                              "car_id": car_id, "truck_id": best_truck,
+                              "cover": round(best_cover, 3),
+                              "iou": round(best_iou, 3)})
+    if not dropped_ids:
+        return frames, {"enabled": True, "threshold": float(threshold),
+                        "metric": "intersection / car_area",
+                        "dropped_car_ids": 0, "dropped_boxes": 0,
+                        "matched_pairs": 0}
+    kept_frames: List[Dict[str, Any]] = []
+    dropped_boxes = 0
+    for frame in frames:
+        labels = []
+        for item in frame.get("labels", []):
+            if (item.get("obj_type") == "Car"
+                    and str(item.get("obj_id")) in dropped_ids):
+                dropped_boxes += 1
+                continue
+            labels.append(item)
+        kept_frames.append({**frame, "labels": labels})
+    return kept_frames, {"enabled": True, "threshold": float(threshold),
+                         "metric": "intersection / car_area",
+                         "dropped_car_ids": len(dropped_ids),
+                         "dropped_boxes": dropped_boxes,
+                         "matched_pairs": matched_pairs,
+                         "dropped_ids": sorted(dropped_ids)[:40],
+                         "examples": worst[:10]}
+
+
+def _merge_chain_labels(chain_labels: Dict[str, Dict[str, List[Dict[str, Any]]]],
+                        order: List[str],
+                        car_truck_cover_threshold: float = 0.5
+                        ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """【改动】按 order 顺序把多条链的 label 合成一份（帧内 obj_id 去重）。
+
+    合成后执行 Car/Truck 重叠规则：Car 被 Truck 覆盖的面积 >=
+    car_truck_cover_threshold 时，删掉该 Car id 的所有帧。
+    """
+    frame_ids: List[str] = []
+    for name in order:
+        for frame_id in chain_labels.get(name, {}):
+            if frame_id not in frame_ids:
+                frame_ids.append(frame_id)
+    frame_ids.sort()
+    output: List[Dict[str, Any]] = []
+    counts: Counter[str] = Counter()
+    collisions = 0
+    for frame_id in frame_ids:
+        labels: List[Dict[str, Any]] = []
+        for name in order:
+            labels.extend(copy.deepcopy(chain_labels.get(name, {}).get(frame_id, [])))
+        seen: set[str] = set()
+        kept: List[Dict[str, Any]] = []
+        for item in labels:
+            key = str(item.get("obj_id"))
+            if key in seen:                      # 同帧 id 冲突：换一个空闲 id
+                collisions += 1
+                spare = 900000
+                while str(spare) in seen:
+                    spare += 1
+                item["obj_id"] = str(spare)
+                key = str(spare)
+            seen.add(key)
+            kept.append(item)
+            counts[str(item.get("obj_type"))] += 1
+        output.append({"frame_id": frame_id, "labels": kept})
+    overlapping, overlap_stats = _drop_cars_covered_by_trucks(
+        output, car_truck_cover_threshold)
+    if overlap_stats.get("enabled"):
+        counts = Counter()
+        for frame in overlapping:
+            for item in frame.get("labels", []):
+                counts[str(item.get("obj_type"))] += 1
+        output = overlapping
+    missing = {name: sorted(set(frame_ids) - set(chain_labels.get(name, {})))
+               for name in order}
+    return output, {"frames": len(output), "labels": dict(counts),
+                    "total": int(sum(counts.values())),
+                    "id_collisions": collisions,
+                    "car_truck_overlap": overlap_stats,
+                    "chains": {name: len(chain_labels.get(name, {})) for name in order},
+                    "frames_missing_per_chain": {k: len(v) for k, v in missing.items()}}
+
+
 def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
              export_sust: bool = True, in_place: bool = False,
              drop_vis_below: float,
@@ -168,12 +357,21 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
              noncar_cfg: Path = NONCAR_CFG,
              noncar_ckpt: Path = NONCAR_CKPT,
              output_tag: str = "",
-             raw_score_threshold: float = 0.3,
+             raw_score_threshold: float = 0.2,   # 【改动】0.3 -> 0.2
              class_score_thresholds: Dict[str, float] | None = None,
-             pedestrian_max_distance: float = 20.0,
+             pedestrian_max_distance: float = 15.0,   # 【改动】20 -> 15
              nonmotorized_max_distance: float = 60.0,
              sparsity_max_points: int = 10,
-             nonmotorized_min_net_displacement: float = 15.0) -> Dict[str, Any]:
+             nonmotorized_min_net_displacement: float = 15.0,
+             chains: tuple = DEFAULT_CHAINS,          # 【改动】car,truck,vru
+             truck_cfg: Path = TRUCK_CFG,
+             truck_ckpt: Path = TRUCK_CKPT,
+             truck_raw_threshold: float = 0.4,
+             vru_cfg: Path = VRU_CFG,
+             vru_ckpt: Path = VRU_CKPT,
+             vru_raw_threshold: float = 0.3,
+             keep_chain_labels: bool = False,
+             car_truck_cover_threshold: float = 0.5) -> Dict[str, Any]:
     base = clip.name
     tag = output_tag.strip("_-")
     output_name = f"{base}_{tag}_pre" if tag else f"{base}_pre"
@@ -193,36 +391,93 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
                     f"output exists, pass --overwrite: {destination}")
             shutil.rmtree(destination)
 
+    selected = [name for name in ("car", "truck", "vru", "noncar") if name in set(chains)]
+    if not selected:
+        raise RuntimeError("--chains 至少选一条")
+    chain_labels: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+    chain_stats: Dict[str, Any] = {}
+    merged: List[Dict[str, Any]] | None = None
+    merge_diag: Dict[str, Any] | None = None
     with tempfile.TemporaryDirectory(prefix=f"hybrid_{base}_") as temp:
         work = Path(temp)
-        _print(f"{base}: 1/2 main inference + Car chain")
-        main_labels, main_result = run_main_car(
-            python, clip, work / "main", overwrite=True)
-
-        _print(f"{base}: 2/2 non-Car inference + chain "
-               f"({noncar_ckpt.name})")
-        _print(f"{base}: non-Car raw threshold={raw_score_threshold:.3f}, "
-               f"class thresholds={class_score_thresholds or 'default'}")
-        expd_raw = _run_raw(
-            python, clip, noncar_cfg, noncar_ckpt, work / "expd", "expd",
-            raw_score_threshold)
-        expd_json = work / "expd_noncar.json"
-        expd_diag = work / "expd_noncar_diagnostics.json"
-        expd_result = run_expd_noncar(
-            expd_raw, clip, expd_json, expd_diag,
-            visibility_min_ratio=drop_vis_below,
-            short_track_max_frames=short_track_max_frames,
-            score_threshold=score_threshold,
-            class_score_thresholds=class_score_thresholds,
-            pedestrian_max_distance=pedestrian_max_distance,
-            nonmotorized_max_distance=nonmotorized_max_distance,
-            sparsity_max_points=sparsity_max_points,
-            nonmotorized_min_net_displacement=(
-                nonmotorized_min_net_displacement),
-        )
-        expd_frames = json.loads(expd_json.read_text(encoding="utf-8"))
-        merged, merge_diag = merge_label_frames(main_labels, expd_frames)
+        total = len(selected)
+        step = 0
+        if "car" in selected:
+            step += 1
+            _print(f"{base}: {step}/{total} Car 链（main_chain: Waymo Car + Step4.5）")
+            main_labels, main_result = run_main_car(
+                python, clip, work / "main", overwrite=True)
+            chain_labels["car"] = {str(key): list(value)
+                                   for key, value in main_labels.items()}
+            chain_stats["car"] = {
+                "checkpoint": "main_chain/models/vn_waymo_v2_4gpu_full_epoch10.pth",
+                "final_detections": main_result.get("final_detections"),
+                "frames": len(chain_labels["car"])}
+        if "truck" in selected:
+            step += 1
+            _print(f"{base}: {step}/{total} Truck 链（{truck_ckpt.name}）")
+            raw = _run_raw(python, clip, truck_cfg, truck_ckpt,
+                           work / "truck_raw", "truck", truck_raw_threshold)
+            out = work / "truck.json"
+            diag_path = work / "truck_diagnostics.json"
+            result = run_expd_truck(raw, clip, out, diag_path)
+            frames = json.loads(out.read_text(encoding="utf-8"))
+            chain_labels["truck"] = _frames_to_labels(frames, TRUCK_ID_OFFSET)
+            chain_stats["truck"] = {
+                "checkpoint": str(truck_ckpt), "config": str(truck_cfg),
+                "raw_score_threshold": float(truck_raw_threshold),
+                "final_detections": (result or {}).get("final_detections"),
+                "frames": len(chain_labels["truck"])}
+        if "vru" in selected:
+            step += 1
+            _print(f"{base}: {step}/{total} VRU 链（{vru_ckpt.name}: Pedestrian + Nonmotorized_vehicle）")
+            raw = _run_raw(python, clip, vru_cfg, vru_ckpt,
+                           work / "vru_raw", "vru", vru_raw_threshold)
+            out = work / "vru.json"
+            diag_path = work / "vru_diagnostics.json"
+            result = run_expd_vru(raw, clip, out, diag_path)
+            frames = json.loads(out.read_text(encoding="utf-8"))
+            chain_labels["vru"] = _frames_to_labels(frames, VRU_ID_OFFSET)
+            chain_stats["vru"] = {
+                "checkpoint": str(vru_ckpt), "config": str(vru_cfg),
+                "raw_score_threshold": float(vru_raw_threshold),
+                "final_detections": (result or {}).get("final_detections"),
+                "frames": len(chain_labels["vru"])}
+        if "noncar" in selected:
+            step += 1
+            _print(f"{base}: {step}/{total} 旧五类非车链（{noncar_ckpt.name}）")
+            expd_raw = _run_raw(python, clip, noncar_cfg, noncar_ckpt,
+                                work / "expd", "expd", raw_score_threshold)
+            expd_json = work / "expd_noncar.json"
+            expd_diag = work / "expd_noncar_diagnostics.json"
+            expd_result = run_expd_noncar(
+                expd_raw, clip, expd_json, expd_diag,
+                visibility_min_ratio=drop_vis_below,
+                short_track_max_frames=short_track_max_frames,
+                score_threshold=score_threshold,
+                class_score_thresholds=class_score_thresholds,
+                pedestrian_max_distance=pedestrian_max_distance,
+                nonmotorized_max_distance=nonmotorized_max_distance,
+                sparsity_max_points=sparsity_max_points,
+                nonmotorized_min_net_displacement=(
+                    nonmotorized_min_net_displacement),
+            )
+            expd_frames = json.loads(expd_json.read_text(encoding="utf-8"))
+            chain_stats["noncar"] = {
+                "checkpoint": str(noncar_ckpt), "config": str(noncar_cfg),
+                "final_detections": (expd_result or {}).get("final_detections")}
+            chain_labels["noncar"] = _frames_to_labels(expd_frames, 0)
+            if "car" in chain_labels and len(selected) == 2:
+                # 旧的 Car + 五类非车 两链模式：沿用原有 Car/非车 互斥吸收逻辑
+                merged, merge_diag = merge_label_frames(
+                    chain_labels["car"], expd_frames)
+        if merged is None:
+            merged, merge_diag = _merge_chain_labels(
+                chain_labels, selected,
+                car_truck_cover_threshold=car_truck_cover_threshold)
         merged_label_count = sum(len(frame["labels"]) for frame in merged)
+        merge_diag = dict(merge_diag or {})
+        merge_diag["chain_stats"] = chain_stats
 
     if in_place:
         # 端到端原地模式：把输入 clip 改名为 <clip>_pre，再把标签写进去，
@@ -245,26 +500,23 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
         # 只跑链路、不落盘：临时结果随上面的 TemporaryDirectory 清理。
         labels = merged_label_count
         destination = None
+    if keep_chain_labels and destination is not None and destination.exists():
+        for name, subdir in (("truck", "label_truck"), ("vru", "label_vru")):
+            items = chain_labels.get(name) or {}
+            if not items:
+                continue
+            target = destination / subdir
+            target.mkdir(parents=True, exist_ok=True)
+            for frame_id, frame_labels in items.items():
+                (target / f"{frame_id}.json").write_text(
+                    json.dumps(frame_labels, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8")
+        _print(f"{base}: 已另存 label_truck/ label_vru/ 供对比")
     return {
         "input_clip": str(clip),
         "final_clip": str(destination) if destination is not None else None,
         "labels": labels,
-        "main": {
-            "final_detections": main_result["final_detections"],
-        },
-        "expD": {
-            "checkpoint": str(noncar_ckpt),
-            "config": str(noncar_cfg),
-            "raw_score_threshold": float(raw_score_threshold),
-            "class_score_thresholds": dict(class_score_thresholds or {}),
-            "pedestrian_max_distance": float(pedestrian_max_distance),
-            "nonmotorized_max_distance": float(nonmotorized_max_distance),
-            "sparsity_max_points": int(sparsity_max_points),
-            "nonmotorized_min_net_displacement": float(
-                nonmotorized_min_net_displacement),
-            "raw_json": "temporary (cleaned after merge)",
-            "final_detections": expd_result["final_detections"],
-        },
+        "chains": chain_stats,
         "merge": merge_diag,
     }
 
@@ -289,10 +541,10 @@ def main() -> int:
     parser.add_argument("--bus-score-threshold", type=float,
                         help="default 0.4 when --score-threshold is unset")
     parser.add_argument("--pedestrian-score-threshold", type=float,
-                        help="default 0.15 when --score-threshold is unset")
+                        help="default 0.2 when --score-threshold is unset")  # 【改动】0.15 -> 0.2
     parser.add_argument("--nonmotorized-score-threshold", type=float,
                         help="default 0.2 when --score-threshold is unset")
-    parser.add_argument("--pedestrian-max-distance", type=float, default=20.0)
+    parser.add_argument("--pedestrian-max-distance", type=float, default=15.0)  # 【改动】20 -> 15
     parser.add_argument("--nonmotorized-max-distance", type=float, default=60.0)
     parser.add_argument("--sparsity-max-points", type=int, default=10)
     parser.add_argument("--nonmotorized-min-net-displacement",
@@ -304,6 +556,20 @@ def main() -> int:
                         help="non-Car inference config (default: expD config)")
     parser.add_argument("--noncar-ckpt", type=Path, default=NONCAR_CKPT,
                         help="non-Car checkpoint (default: expD_e8.pth)")
+    parser.add_argument("--chains", type=str, default=",".join(DEFAULT_CHAINS),
+                        help="要跑的链，逗号分隔，按 car -> truck -> vru 顺序执行；"
+                             "可选 car,truck,vru,noncar（noncar=旧五类单链）")
+    parser.add_argument("--truck-cfg", type=Path, default=TRUCK_CFG)
+    parser.add_argument("--truck-ckpt", type=Path, default=TRUCK_CKPT)
+    parser.add_argument("--truck-raw-threshold", type=float, default=0.4)
+    parser.add_argument("--vru-cfg", type=Path, default=VRU_CFG)
+    parser.add_argument("--vru-ckpt", type=Path, default=VRU_CKPT)
+    parser.add_argument("--vru-raw-threshold", type=float, default=0.3)
+    parser.add_argument("--car-truck-cover-threshold", type=float, default=0.5,
+                        help="Car 被 Truck 覆盖的面积 / Car 面积 达到该值就删掉这条 "
+                             "Car 轨迹的全部帧（0 关闭）")
+    parser.add_argument("--keep-chain-labels", action="store_true",
+                        help="额外把 label_truck/ label_vru/ 写进输出 clip")
     parser.add_argument("--output-tag", type=str, default="",
                         help="insert a tag before _pre in the exported clip "
                              "name, e.g. vod_e12 -> <clip>_vod_e12_pre")
@@ -347,7 +613,7 @@ def main() -> int:
             "Truck": 0.4,
             "Bus": 0.4,
             # Higher-recall defaults for the VOD-finetuned non-Car heads.
-            "Pedestrian": 0.15,
+            "Pedestrian": 0.2,   # 【改动】0.15 -> 0.2
             "Nonmotorized_vehicle": 0.2,
         }
     class_thresholds: Dict[str, float] = {
@@ -371,9 +637,27 @@ def main() -> int:
            f"sparsity_max_points={args.sparsity_max_points}, "
            f"nonmotorized_min_net_displacement="
            f"{args.nonmotorized_min_net_displacement}")
-    _validate_weight(noncar_ckpt)
-    if not noncar_cfg.is_file():
-        raise RuntimeError(f"config not found: {noncar_cfg}")
+    chains = tuple(name.strip() for name in args.chains.split(",") if name.strip())
+    unknown = [name for name in chains if name not in ("car", "truck", "vru", "noncar")]
+    if unknown:
+        raise RuntimeError(f"--chains 里有未知链: {unknown}")
+    truck_cfg = args.truck_cfg.expanduser().resolve()
+    truck_ckpt = args.truck_ckpt.expanduser().resolve()
+    vru_cfg = args.vru_cfg.expanduser().resolve()
+    vru_ckpt = args.vru_ckpt.expanduser().resolve()
+    if "truck" in chains:
+        _validate_weight(truck_ckpt)
+        if not truck_cfg.is_file():
+            raise RuntimeError(f"config not found: {truck_cfg}")
+    if "vru" in chains:
+        _validate_weight(vru_ckpt)
+        if not vru_cfg.is_file():
+            raise RuntimeError(f"config not found: {vru_cfg}")
+    _print(f"chains={chains}  truck={truck_ckpt.name}  vru={vru_ckpt.name}")
+    if "noncar" in chains:
+        _validate_weight(noncar_ckpt)
+        if not noncar_cfg.is_file():
+            raise RuntimeError(f"config not found: {noncar_cfg}")
 
     python = None
     for candidate in _python_candidates(args.python):
@@ -411,6 +695,15 @@ def main() -> int:
             sparsity_max_points=args.sparsity_max_points,
             nonmotorized_min_net_displacement=(
                 args.nonmotorized_min_net_displacement),
+            chains=chains,
+            truck_cfg=truck_cfg,
+            truck_ckpt=truck_ckpt,
+            truck_raw_threshold=args.truck_raw_threshold,
+            vru_cfg=vru_cfg,
+            vru_ckpt=vru_ckpt,
+            vru_raw_threshold=args.vru_raw_threshold,
+            keep_chain_labels=args.keep_chain_labels,
+            car_truck_cover_threshold=args.car_truck_cover_threshold,
         ))
     print(json.dumps({"clips": summaries}, ensure_ascii=False, indent=2))
     return 0
