@@ -246,10 +246,27 @@ done
 
 ### 实测耗时
 
-RTX A4000 16GB、不与其他大任务并行时，单个 80 帧 clip 跑完整三链约 **2.5–3 分钟**
-（Car 链约 70–90 秒，Truck 链约 35 秒，VRU 链约 45 秒）。
-CPU 后处理（跟踪关联、可见度、几何精修）是主要瓶颈；阈值越低耗时越久。
-只改 Truck 时用 `scripts/remerge_truck_car.py` 可压到约 30 秒/clip。
+本机 RTX A4000 16GB、不与其他大任务并行时，单个 80 帧 clip（`155112_clip6`）：
+
+| 阶段 | 耗时 |
+| --- | --- |
+| Car 链（main_chain：raw 推理 + Step2~Step5 + Step4.5） | 102.6 s |
+| Truck 链（raw 推理 + 后处理） | 23.5 s |
+| VRU 链（raw 推理 + 后处理） | 39.1 s |
+| 三链合并 + Car/Truck 覆盖规则 | 0.5 s |
+| 导出 `<clip>_pre`（约 600 MB copytree） | 0.6 s |
+| **合计** | **166.5 s（≈2 分 47 秒）/clip** |
+
+每次运行入口都会打印这一行，可直接看自己机器/场景的实测值：
+
+```text
+[hybrid] <clip>: 计时 car=102.6s, truck=23.5s, vru=39.1s, merge=0.5s, export=0.6s,
+                total_without_export=165.7s, total=166.5s
+```
+
+- Car 链占约 6 成；CPU 后处理（跟踪关联、可见度、几何精修）是主要瓶颈，阈值越低越慢。
+- 框越多越慢：同批三条 clip 实测 150–167 s/clip。
+- 只改 Truck 时用 `scripts/remerge_truck_car.py` 约 **25 s/clip**（复用 Car/VRU 标签，只重跑 Truck 链）。
 
 ## 目录
 

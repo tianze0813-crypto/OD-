@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List
@@ -398,6 +399,8 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
     chain_stats: Dict[str, Any] = {}
     merged: List[Dict[str, Any]] | None = None
     merge_diag: Dict[str, Any] | None = None
+    timings: Dict[str, float] = {}
+    clip_start = time.monotonic()
     with tempfile.TemporaryDirectory(prefix=f"hybrid_{base}_") as temp:
         work = Path(temp)
         total = len(selected)
@@ -405,8 +408,10 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
         if "car" in selected:
             step += 1
             _print(f"{base}: {step}/{total} Car 链（main_chain: Waymo Car + Step4.5）")
+            _t = time.monotonic()
             main_labels, main_result = run_main_car(
                 python, clip, work / "main", overwrite=True)
+            timings["car"] = round(time.monotonic() - _t, 1)
             chain_labels["car"] = {str(key): list(value)
                                    for key, value in main_labels.items()}
             chain_stats["car"] = {
@@ -416,12 +421,14 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
         if "truck" in selected:
             step += 1
             _print(f"{base}: {step}/{total} Truck 链（{truck_ckpt.name}）")
+            _t = time.monotonic()
             raw = _run_raw(python, clip, truck_cfg, truck_ckpt,
                            work / "truck_raw", "truck", truck_raw_threshold)
             out = work / "truck.json"
             diag_path = work / "truck_diagnostics.json"
             result = run_expd_truck(raw, clip, out, diag_path)
             frames = json.loads(out.read_text(encoding="utf-8"))
+            timings["truck"] = round(time.monotonic() - _t, 1)
             chain_labels["truck"] = _frames_to_labels(frames, TRUCK_ID_OFFSET)
             chain_stats["truck"] = {
                 "checkpoint": str(truck_ckpt), "config": str(truck_cfg),
@@ -431,12 +438,14 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
         if "vru" in selected:
             step += 1
             _print(f"{base}: {step}/{total} VRU 链（{vru_ckpt.name}: Pedestrian + Nonmotorized_vehicle）")
+            _t = time.monotonic()
             raw = _run_raw(python, clip, vru_cfg, vru_ckpt,
                            work / "vru_raw", "vru", vru_raw_threshold)
             out = work / "vru.json"
             diag_path = work / "vru_diagnostics.json"
             result = run_expd_vru(raw, clip, out, diag_path)
             frames = json.loads(out.read_text(encoding="utf-8"))
+            timings["vru"] = round(time.monotonic() - _t, 1)
             chain_labels["vru"] = _frames_to_labels(frames, VRU_ID_OFFSET)
             chain_stats["vru"] = {
                 "checkpoint": str(vru_ckpt), "config": str(vru_cfg),
@@ -445,6 +454,7 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
                 "frames": len(chain_labels["vru"])}
         if "noncar" in selected:
             step += 1
+            _t = time.monotonic()
             _print(f"{base}: {step}/{total} 旧五类非车链（{noncar_ckpt.name}）")
             expd_raw = _run_raw(python, clip, noncar_cfg, noncar_ckpt,
                                 work / "expd", "expd", raw_score_threshold)
@@ -463,6 +473,7 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
                     nonmotorized_min_net_displacement),
             )
             expd_frames = json.loads(expd_json.read_text(encoding="utf-8"))
+            timings["noncar"] = round(time.monotonic() - _t, 1)
             chain_stats["noncar"] = {
                 "checkpoint": str(noncar_ckpt), "config": str(noncar_cfg),
                 "final_detections": (expd_result or {}).get("final_detections")}
@@ -471,14 +482,17 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
                 # 旧的 Car + 五类非车 两链模式：沿用原有 Car/非车 互斥吸收逻辑
                 merged, merge_diag = merge_label_frames(
                     chain_labels["car"], expd_frames)
+        _t = time.monotonic()
         if merged is None:
             merged, merge_diag = _merge_chain_labels(
                 chain_labels, selected,
                 car_truck_cover_threshold=car_truck_cover_threshold)
         merged_label_count = sum(len(frame["labels"]) for frame in merged)
+        timings["merge"] = round(time.monotonic() - _t, 1)
         merge_diag = dict(merge_diag or {})
         merge_diag["chain_stats"] = chain_stats
 
+    _t = time.monotonic()
     if in_place:
         # 端到端原地模式：把输入 clip 改名为 <clip>_pre，再把标签写进去，
         # 不额外保留一份 raw，也不往 SUST 拷贝。
@@ -500,6 +514,14 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
         # 只跑链路、不落盘：临时结果随上面的 TemporaryDirectory 清理。
         labels = merged_label_count
         destination = None
+    timings["export"] = round(time.monotonic() - _t, 1)
+    timings["total_without_export"] = round(
+        timings.get("car", 0.0) + timings.get("truck", 0.0)
+        + timings.get("vru", 0.0) + timings.get("noncar", 0.0)
+        + timings.get("merge", 0.0), 1)
+    timings["total"] = round(time.monotonic() - clip_start, 1)
+    _print(f"{base}: 计时 " + ", ".join(
+        f"{key}={value}s" for key, value in timings.items()))
     if keep_chain_labels and destination is not None and destination.exists():
         for name, subdir in (("truck", "label_truck"), ("vru", "label_vru")):
             items = chain_labels.get(name) or {}
@@ -517,6 +539,7 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
         "final_clip": str(destination) if destination is not None else None,
         "labels": labels,
         "chains": chain_stats,
+        "timings": timings,
         "merge": merge_diag,
     }
 
