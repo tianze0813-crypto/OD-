@@ -19,7 +19,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from classification.class_refinement import ClassRefinementConfig
 from filtering.five_class_output import apply_five_class_output
-from filtering.pedestrian_row_filter import drop_pedestrian_rows   # 【改动】
 from filtering.hard_filters import HardFilterConfig, apply_category_score_filter
 from geometry.box_geometry import GeometryConfig
 from geometry.multiclass_refinement import NonmotorizedSizeConfig, TruckOverlapConfig
@@ -366,6 +365,9 @@ def run(raw_json: Path, clip: Path, out_json: Path,
         *, sparsity_max_points: int = 10,
         visibility_min_ratio: float = 0.05,
         short_track_max_frames: int = 4,
+        # 【改动】2026-09-19：仅对行人的生命周期门槛（严格小于：帧数 < 该值即整条删），
+        # 0 = 关闭。非机动车/其它类别仍走 short_track_max_frames。
+        pedestrian_min_frames: int = 0,
         score_threshold: float | None = None,
         class_score_thresholds: Mapping[str, float] | None = None,
         pedestrian_max_distance: float = 15.0,   # 【改动】20 -> 15
@@ -382,10 +384,6 @@ def run(raw_json: Path, clip: Path, out_json: Path,
         disable_slot_binding: bool = False,
         static_yaw_enabled: bool = True,
         yaw_vehicle_flags=None,
-        # 【改动】行人"一排"过滤（VRU 链）
-        pedestrian_row_filter: bool = False,
-        pedestrian_row_min: int = 6,
-        pedestrian_row_tolerance: float = 1.0,
         # 【改动】Truck 专用后处理：① yaw旋转帧修正 ② IoU并集合并 ③ xy贴合 ④ yaw翻转
         truck_postprocess: bool = False,
         truck_postprocess_config=None,
@@ -457,6 +455,8 @@ def run(raw_json: Path, clip: Path, out_json: Path,
         hard_filter_config=hard_config,
         class_config=ClassRefinementConfig(),
         min_lifecycle=int(short_track_max_frames),
+        class_min_frames=({"Pedestrian": int(pedestrian_min_frames)}
+                          if int(pedestrian_min_frames) > 0 else None),   # 【改动】
         static_rotation_enabled=True,
         static_rotation_classes=tuple(static_rotation_classes),   # 【改动】
     )
@@ -489,11 +489,6 @@ def run(raw_json: Path, clip: Path, out_json: Path,
         min_net_displacement=nonmotorized_min_net_displacement,
     )
     diagnostics["nonmotorized_short_motion"] = short_motion_stats
-    if pedestrian_row_filter:                # 【改动】世界系"一排行人"过滤（后段：
-        # 在跟踪+过滤之后，与 SUST 里看到/统计的最终结果口径一致）
-        diagnostics["pedestrian_row_filter"] = drop_pedestrian_rows(
-            processed, coords, min_row=int(pedestrian_row_min),
-            tolerance=float(pedestrian_row_tolerance), box_frame="lidar_top")
     _spin_dropped, spin_stats = drop_spinning_vehicle(processed)
     diagnostics["spinning_truck_bus"] = spin_stats
     output, final_diag = apply_five_class_output(processed, coords)

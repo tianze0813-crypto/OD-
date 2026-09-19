@@ -29,7 +29,7 @@ import math
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
@@ -789,20 +789,37 @@ class ConservativeTracker:
         return output, self.diagnostics
 
 
-def apply_post_filters(frames: List[Dict[str, Any]], min_lifecycle: int = 4) -> Dict[str, Any]:
+def apply_post_filters(frames: List[Dict[str, Any]], min_lifecycle: int = 4,
+                       class_min_frames: Mapping[str, int] | None = None
+                       ) -> Dict[str, Any]:
     """Apply only the agreed hard filter after association.
 
     ``<= min_lifecycle`` means number of distinct observed frames, not number
     of detections. No interpolation, box smoothing, or geometry filtering is
     performed here; those are intentionally separate future policies.
+
+    ``class_min_frames``（【改动】2026-09-19）按类别覆盖上面的默认值，语义是
+    **严格小于**：``观测帧数 < class_min_frames[类别]`` 的轨迹整条删除
+    （即门槛 20 = 少于 20 帧的行人轨迹删掉，20 帧及以上保留）。
+    不在映射里的类别仍走 ``min_lifecycle``（<= 语义）。
     """
     by_id: Dict[int, set] = {}
+    class_of: Dict[int, str] = {}
     for frame in frames:
         for det in frame.get("detections", []):
             tid = det.get("track_id")
             if tid is not None:
                 by_id.setdefault(int(tid), set()).add(int(frame["frame_id"]))
-    dropped = {tid for tid, ids in by_id.items() if len(ids) <= int(min_lifecycle)}
+                class_of.setdefault(int(tid), str(det.get("class_name", "")))
+    class_min_frames = {str(k): int(v) for k, v in (class_min_frames or {}).items()}
+    dropped = set()
+    for tid, ids in by_id.items():
+        threshold = class_min_frames.get(class_of.get(tid, ""))
+        if threshold is not None:
+            if len(ids) < threshold:
+                dropped.add(tid)
+        elif len(ids) <= int(min_lifecycle):
+            dropped.add(tid)
     removed = 0
     for frame in frames:
         old = frame.get("detections", [])
@@ -810,6 +827,7 @@ def apply_post_filters(frames: List[Dict[str, Any]], min_lifecycle: int = 4) -> 
         removed += len(old) - len(frame["detections"])
         frame["num_detections"] = len(frame["detections"])
     return {"min_lifecycle": int(min_lifecycle), "tracks_before": len(by_id),
+            "class_min_frames": class_min_frames,   # 【改动】
             "tracks_dropped": len(dropped), "boxes_removed": removed,
             "dropped_track_ids": sorted(dropped)}
 

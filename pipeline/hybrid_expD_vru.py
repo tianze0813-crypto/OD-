@@ -3,10 +3,14 @@
 与 Truck 链完全分离的参数（【改动】按用户 2026-09-18 需求）：
   * 范围      方框 前 60 / 后 20 / 左右 40；行人另加 15m 半径
   * 分数阈值  Pedestrian 0.2 / Nonmotorized_vehicle 0.2
-  * 短轨迹    4
+  * 短轨迹    4（链级，非机动车等照旧）
+  * 行人门槛  20  （【改动】2026-09-19 用户要求：**只对行人**，生命周期 <20 帧的轨迹整条删；
+                     非机动车不受影响。实现在 tracking.apply_post_filters 的 class_min_frames）
   * 静止过滤  非机动车净位移 < 15m 丢弃（行人不过滤）
   * yaw       沿用旧版 legacy（用户要求新版 yaw 只给 Truck）
   * obj_id    从 2000 开始（与 Truck 链的 1000 起互不冲突）
+  * 【改动】2026-09-19：原"世界系一排行人"整排过滤规则已按用户要求删除，
+             行人噪点改由 pedestrian_min_frames（生命周期 <20 帧整条删）处理。
 """
 from __future__ import annotations
 
@@ -36,16 +40,13 @@ DEFAULTS: Dict[str, Any] = dict(
     range_side=40.0,
     sparsity_max_points=10,
     visibility_min_ratio=0.05,
-    short_track_max_frames=4,
+    short_track_max_frames=4,    # 链级短轨迹阈值（<= 语义），非机动车等照旧
+    pedestrian_min_frames=20,    # 【改动】只对行人：帧数 <20 的轨迹整条删（2026-09-19 用户要求）
     pedestrian_max_distance=15.0,            # 【改动】行人 15m 半径
     nonmotorized_max_distance=60.0,
     nonmotorized_min_net_displacement=15.0,  # 【改动】非机动车静止过滤
     yaw_impl="legacy",         # 【改动】用户要求新版 yaw 只给 Truck
     static_rotation_classes=("Nonmotorized_vehicle",),
-    # 【改动】世界系"一排行人"过滤：同一帧内 >=6 个行人共线(垂距<=1.0m) 则整排删除
-    pedestrian_row_filter=True,
-    pedestrian_row_min=6,
-    pedestrian_row_tolerance=1.0,
 )
 
 
@@ -102,6 +103,8 @@ def main() -> None:
     parser.add_argument("--nonmotorized-max-distance", type=float, default=60.0)
     parser.add_argument("--nonmotorized-min-net-displacement", type=float, default=15.0)
     parser.add_argument("--short-track-max-frames", type=int, default=4)
+    parser.add_argument("--pedestrian-min-frames", type=int, default=20,
+                        help="【改动】仅行人：生命周期 < 该帧数的轨迹整条过滤（默认 20，0=关闭）")
     parser.add_argument("--sparsity-max-points", type=int, default=10)
     parser.add_argument("--yaw-impl", default="legacy")
     args = parser.parse_args()
@@ -114,6 +117,7 @@ def main() -> None:
                range_front=args.range_front, range_rear=args.range_rear,
                range_side=args.range_side,
                short_track_max_frames=int(args.short_track_max_frames),
+               pedestrian_min_frames=int(args.pedestrian_min_frames),   # 【改动】
                sparsity_max_points=int(args.sparsity_max_points),
                yaw_impl=str(args.yaw_impl))
     if not args.no_export:

@@ -179,6 +179,7 @@ def run(
         hard_filter_config: HardFilterConfig = HardFilterConfig(),
         class_config: ClassRefinementConfig = ClassRefinementConfig(),
         min_lifecycle: int = 4,
+        class_min_frames: Optional[Mapping[str, int]] = None,   # 【改动】按类别的生命周期门槛（严格 <）
         static_rotation_enabled: bool = True,
         static_rotation_classes: Tuple[str, ...] = ("Car",),
         rot_center_gate: float = 3.0,
@@ -219,7 +220,8 @@ def run(
     # authority on which detections enter annotation export.
     second_filter = apply_hard_filters(frames, Path(clip), hard_filter_config)
     short_track_filter = tracking.apply_post_filters(
-        frames, min_lifecycle=int(min_lifecycle))
+        frames, min_lifecycle=int(min_lifecycle),
+        class_min_frames=class_min_frames)   # 【改动】
 
     diagnostics: Dict[str, Any] = {
         "pipeline": "step2_5_class_correction",
