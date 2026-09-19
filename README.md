@@ -72,11 +72,16 @@ Truck 专用后处理 `geometry/truck_postprocess.py`，执行顺序：
 
 - 保留 `Pedestrian` + `Nonmotorized_vehicle`
 - 范围：前 60 / 后 20 / 左右 40 m；行人额外 15 m 半径
-- 分数阈值：Pedestrian `0.2`、Nonmotorized_vehicle `0.2`；短轨迹过滤 4 帧
+- 分数阈值：Pedestrian `0.2`、Nonmotorized_vehicle `0.2`；短轨迹过滤 4 帧（链级，`<=` 语义）
 - yaw：沿用旧版 `legacy`
-- NMV 静止过滤：world 系首尾净位移 ≤ 15 m 的轨迹丢弃
-- "一排行人"过滤：世界系同一帧内 ≥ 6 个行人共线（垂距 ≤ 1.0 m）时整排删除
+- NMV 静止过滤：world 系首尾净位移 ≤ 15 m 的轨迹丢弃（行人不过滤）
+- 行人生命周期过滤：**只对行人**，观测帧数 < 20 的轨迹整条删除
+  （`pedestrian_min_frames=20`，严格 `<`；非机动车仍走链级 4 帧规则，输出不受影响）
 - `obj_id` 从 2000 起
+
+> 原「世界系一排行人共线（同一帧内 ≥ 6 个、垂距 ≤ 1.0 m）整排删除」规则已废弃：
+> 它区分不了真行人与噪声——车旁行人的世界轨迹与车辆路径共线，而真正的绿篱排 id 太少触发不了。
+> 行人噪点（以短命碎片为主）改由上面的 `pedestrian_min_frames` 处理。
 
 ## 只改了 Truck 时：复用 Car/VRU 标签重跑
 
@@ -228,7 +233,11 @@ done
 | `--vru-raw-threshold` | `0.3` | VRU raw 推理分数门槛 |
 
 其余（范围 60/20/40、Ped/NMV 阈值 0.2/0.2、短轨迹 4、行人 15m、NMV 静止 15m、
-一排行人过滤）是 `pipeline/hybrid_expD_vru.py::DEFAULTS` 的模块默认值。
+行人生命周期 20 帧）是 `pipeline/hybrid_expD_vru.py::DEFAULTS` 的模块默认值。
+
+`pedestrian_min_frames` 目前只在 VRU 链自己的 CLI 上透出
+（`hybrid_expD_vru.py --pedestrian-min-frames`，`0` = 关闭）；hybrid 入口暂未加对应参数，
+要改就动 `DEFAULTS`。
 
 ### main_chain Car 参数（OD-main-0909 默认）
 
@@ -278,7 +287,7 @@ pipeline/               各链主体：hybrid_expD_noncar / hybrid_expD_truck / 
 geometry/truck_postprocess.py   Truck 专用后处理（yaw 修正 / 静止平滑 / 可选并集与贴合）
 geometry_yaw_v2/        Truck 链用的新版 yaw（直线运动方向 / 静态方向 / 动态 yaw）
 classification/         类别归一化与 track 投票
-filtering/              可见度、硬过滤、五类输出、一排行人过滤
+filtering/              可见度、硬过滤、五类输出、低置信类别过滤
 tracking/               跟踪、坐标变换、SUST label 映射
 geometry/               yaw、Car 几何、Truck/NMV 精修
 inference/              OpenPCDet LiDAR 推理
