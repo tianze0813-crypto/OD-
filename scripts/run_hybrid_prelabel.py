@@ -66,9 +66,26 @@ def _run(command: List[Any], *, check: bool = True,
                           text=True, capture_output=capture)
 
 
+# 【改动】跳过滤镜目录/权限不足的条目：移动盘上常有 root 权限的 lost+found，
+# 旧代码对它 stat() 会直接 PermissionError 崩掉整批收集。
+_SKIP_DIR_NAMES = {"lost+found", ".Trash-1000", ".Trash", "$RECYCLE.BIN",
+                   "System Volume Information"}
+
+
+def _skip_entry(path: Path) -> bool:
+    name = path.name
+    return (name in _SKIP_DIR_NAMES or name.startswith(".")
+            or name.endswith("_pre"))
+
+
 def _is_clip(path: Path) -> bool:
-    lidar = path / "lidar" / "lidar_top"
-    return path.is_dir() and lidar.is_dir() and any(lidar.glob("*.bin"))
+    try:
+        if _skip_entry(path) or not path.is_dir():
+            return False
+        lidar = path / "lidar" / "lidar_top"
+        return lidar.is_dir() and any(lidar.glob("*.bin"))
+    except OSError:      # 权限不足（如移动盘的 lost+found）-> 视为不是 clip
+        return False
 
 
 def _collect_clips(input_root: Path) -> List[Path]:
@@ -77,8 +94,14 @@ def _collect_clips(input_root: Path) -> List[Path]:
     # Accept a single clip directory directly, or a parent holding many clips.
     if _is_clip(input_root):
         return [input_root.resolve()]
-    clips = [path.resolve() for path in sorted(input_root.iterdir())
-             if _is_clip(path) and not path.name.endswith("_pre")]
+    clips = []
+    for path in sorted(input_root.iterdir()):
+        try:
+            if _skip_entry(path) or not _is_clip(path):
+                continue
+            clips.append(path.resolve())
+        except OSError:      # 【改动】权限不足的条目直接跳过
+            continue
     if not clips:
         raise RuntimeError(
             f"no raw clips found under {input_root}; expected lidar/lidar_top/*.bin")
@@ -448,7 +471,8 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
         if "truck" in selected:
             step += 1
             if truck_detector == "bevfusion":
-                _print(f"{base}: {step}/{total} Truck 链（BEVFusion C+L 官方20ep + 货车/挂车规则）")
+                _print(f"{base}: {step}/{total} Truck 链（BEVFusion "
+                       f"{'纯雷达' if truck_detector_mode == 'lidar' else 'C+L'} 官方20ep + 货车/挂车规则）")
                 _t = time.monotonic()
                 raw = _run_raw_bevfusion(python, clip, work / "truck_raw", truck_raw_threshold,
                                          truck_detector_mode)
@@ -736,6 +760,13 @@ def main() -> int:
         if not vru_cfg.is_file():
             raise RuntimeError(f"config not found: {vru_cfg}")
     _print(f"chains={chains}  truck={truck_ckpt.name}  vru={vru_ckpt.name}")
+    # 【改动】把 Truck 链真正用的检测器/模式/阈值打出来（避免只看 ckpt 名字误解）
+    if "truck" in chains:
+        weights = (truck_ckpt.name if args.truck_detector == "voxelnext"
+                   else "models/bevfusion_mmdet3d_lidaronly.pth")
+        _print(f"truck chain: detector={args.truck_detector} mode={args.truck_detector_mode} "
+               f"thresholds={{'Truck': 0.2, 'Trailer': {args.trailer_score_threshold}}} "
+               f"trailer_rules={not args.no_trailer_rules} weights={weights}")
     if "noncar" in chains:
         _validate_weight(noncar_ckpt)
         if not noncar_cfg.is_file():

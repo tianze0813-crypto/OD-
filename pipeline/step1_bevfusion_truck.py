@@ -130,9 +130,14 @@ def collect_clips(args):
     clips = [Path(c).resolve() for c in args.clip]
     for root in args.clip_dir:
         root = Path(root).resolve()
-        for cand in sorted(root.iterdir()) if root.is_dir() else []:
-            if (cand / "lidar" / "lidar_top").is_dir():
-                clips.append(cand)
+        for cand in (sorted(root.iterdir()) if root.is_dir() else []):
+            try:      # 【改动】跳过 lost+found 等权限不足/无关条目
+                if cand.name in {"lost+found", ".Trash-1000"} or cand.name.startswith("."):
+                    continue
+                if (cand / "lidar" / "lidar_top").is_dir():
+                    clips.append(cand)
+            except OSError:
+                continue
     if not clips:
         raise SystemExit("没有输入 clip（--clip 或 --clip-dir）")
     return clips

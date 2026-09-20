@@ -29,8 +29,13 @@ DEFAULT_CKPT = PROJECT_ROOT / "models" / "vn5_nuscenes_checkpoint_epoch_12.pth"
 
 
 def is_clip_dir(path: Path) -> bool:
-    lidar_top = path / "lidar" / "lidar_top"
-    return path.is_dir() and lidar_top.is_dir() and any(lidar_top.glob("*.bin"))
+    try:
+        if path.name in {"lost+found", ".Trash-1000"} or path.name.startswith("."):
+            return False
+        lidar_top = path / "lidar" / "lidar_top"
+        return path.is_dir() and lidar_top.is_dir() and any(lidar_top.glob("*.bin"))
+    except OSError:
+        return False
 
 
 def validate_clip(clip: Path) -> None:
@@ -49,7 +54,12 @@ def collect_clips(args) -> list[Path]:
         root = Path(root).resolve()
         if not root.is_dir():
             raise ValueError(f"--clip-dir 不是目录：{root}")
-        clips.extend(sorted(p for p in root.iterdir() if is_clip_dir(p)))
+        for candidate in sorted(root.iterdir()):      # 【改动】权限不足的条目跳过
+            try:
+                if is_clip_dir(candidate):
+                    clips.append(candidate)
+            except OSError:
+                continue
     if not clips:
         raise ValueError("请至少给一个 --clip 或 --clip-dir")
     seen = set()
