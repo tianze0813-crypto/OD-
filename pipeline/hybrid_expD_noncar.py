@@ -383,6 +383,12 @@ def run(raw_json: Path, clip: Path, out_json: Path,
         # 【改动】以下四个用于 Truck 链：关掉"钉停车位"与静态 yaw 锁，并启用直线行驶 yaw 修正
         disable_slot_binding: bool = False,
         static_yaw_enabled: bool = True,
+        # 【改动】2026-09-20 透传 step2_5 的「静止旋转轨迹整条删除」开关。
+        # 默认 True（Car/VRU 链行为完全不变）；只有 Truck 链传 False —— 见 hybrid_expD_truck.py。
+        static_rotation_enabled: bool = True,
+        # 【改动】2026-09-20 是否在【跟踪之前】做范围/分数过滤。默认 True（Car/VRU 行为不变）；
+        # Truck 链传 False —— 先跟踪 ID、再过滤（见 hybrid_expD_truck.py）。
+        pre_tracking_filters: bool = True,
         yaw_vehicle_flags=None,
         # 【改动】Truck 专用后处理：① yaw旋转帧修正 ② IoU并集合并 ③ xy贴合 ④ yaw翻转
         truck_postprocess: bool = False,
@@ -416,11 +422,15 @@ def run(raw_json: Path, clip: Path, out_json: Path,
     diagnostics["early_non_car_filter"] = _noncar_filter(
         frames, keep_classes=keep_classes)   # 【改动】
     # 【改动】紧接类别过滤后，立刻做范围过滤（便宜且能砍掉 ~2/3 的框）
-    diagnostics["early_range_filter"] = _early_range_filter(
-        frames, range_front=range_front, range_rear=range_rear,
-        range_side=range_side,
-        pedestrian_max_distance=pedestrian_max_distance,
-        nonmotorized_max_distance=nonmotorized_max_distance)
+    if pre_tracking_filters:   # 【改动】Truck 链：跳过跟踪前范围过滤，改由 step2/step2_5 跟踪后过滤
+        diagnostics["early_range_filter"] = _early_range_filter(
+            frames, range_front=range_front, range_rear=range_rear,
+            range_side=range_side,
+            pedestrian_max_distance=pedestrian_max_distance,
+            nonmotorized_max_distance=nonmotorized_max_distance)
+    else:
+        diagnostics["early_range_filter"] = {
+            "enabled": False, "skipped": "pre_tracking_filters=False (tracks first, filters after)"}
 
     hard_config = _hard_config(
         range_front=range_front, range_rear=range_rear, range_side=range_side,
@@ -432,8 +442,12 @@ def run(raw_json: Path, clip: Path, out_json: Path,
         nonmotorized_max_distance=nonmotorized_max_distance,
     )
     work_root = Path(out_json).parent
-    diagnostics["pre_step2_score_filter"] = apply_category_score_filter(
-        frames, hard_config)
+    if pre_tracking_filters:   # 【改动】Truck 链：分数阈值也挪到跟踪之后（step2/step2_5）
+        diagnostics["pre_step2_score_filter"] = apply_category_score_filter(
+            frames, hard_config)
+    else:
+        diagnostics["pre_step2_score_filter"] = {
+            "enabled": False, "skipped": "pre_tracking_filters=False (tracks first, filters after)"}
     filtered_input = work_root / (Path(out_json).stem + "_filtered_raw.json")
     filtered_input.write_text(
         json.dumps(frames, ensure_ascii=False, indent=2) + "\n",
@@ -457,7 +471,7 @@ def run(raw_json: Path, clip: Path, out_json: Path,
         min_lifecycle=int(short_track_max_frames),
         class_min_frames=({"Pedestrian": int(pedestrian_min_frames)}
                           if int(pedestrian_min_frames) > 0 else None),   # 【改动】
-        static_rotation_enabled=True,
+        static_rotation_enabled=bool(static_rotation_enabled),   # 【改动】Truck 链传 False
         static_rotation_classes=tuple(static_rotation_classes),   # 【改动】
     )
 

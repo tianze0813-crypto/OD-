@@ -182,6 +182,24 @@ def _run_raw(python: Path, clip: Path, cfg: Path, ckpt: Path,
     return output
 
 
+def _run_raw_bevfusion(python: Path, clip: Path, work_root: Path,
+                       score_thresh: float, mode: str = "lidar") -> Path:
+    """【改动】2026-09-20：Truck 链改用 BEVFusion 检测器（pipeline/step1_bevfusion_truck.py）。
+
+    该脚本内部会：去畸变+5列bin+infos（幂等缓存）-> mmdet3d BEVFusion 推理（z 已统一到框中心）
+    -> 挂相机可见性；产物仍是 <clip>_raw.json，结构与旧链路一致。
+    """
+    output = work_root / f"{clip.name}_raw.json"
+    _run([
+        python, ROOT / "pipeline" / "step1_bevfusion_truck.py",
+        "--clip", clip, "--work-root", work_root,
+        "--score-thresh", score_thresh, "--mode", str(mode),
+    ])
+    if not output.is_file():
+        raise RuntimeError(f"BEVFusion 推理没有创建 raw JSON: {output}")
+    return output
+
+
 def _frames_to_labels(frames: List[Dict[str, Any]],
                       id_offset: int) -> Dict[str, List[Dict[str, Any]]]:
     """把某条链的 frames(detections) 转成 {frame_id: [SUST label]}，obj_id 统一加偏移。"""
@@ -368,6 +386,15 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
              truck_cfg: Path = TRUCK_CFG,
              truck_ckpt: Path = TRUCK_CKPT,
              truck_raw_threshold: float = 0.4,
+             # 【改动】2026-09-20 Truck 链检测器与货车/挂车规则
+             truck_detector: str = "bevfusion",
+             truck_detector_mode: str = "lidar",     # 【改动】fusion | lidar
+             trailer_rules: bool = True,
+             trailer_score_threshold: float = 0.25,
+             trailer_dup_iom: float = 0.70,
+             trailer_dup_iou: float = 0.50,
+             trailer_merge_iou: float = 0.05,
+             trailer_policy: str = "keep",
              vru_cfg: Path = VRU_CFG,
              vru_ckpt: Path = VRU_CKPT,
              vru_raw_threshold: float = 0.3,
@@ -420,19 +447,37 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
                 "frames": len(chain_labels["car"])}
         if "truck" in selected:
             step += 1
-            _print(f"{base}: {step}/{total} Truck 链（{truck_ckpt.name}）")
-            _t = time.monotonic()
-            raw = _run_raw(python, clip, truck_cfg, truck_ckpt,
-                           work / "truck_raw", "truck", truck_raw_threshold)
+            if truck_detector == "bevfusion":
+                _print(f"{base}: {step}/{total} Truck 链（BEVFusion C+L 官方20ep + 货车/挂车规则）")
+                _t = time.monotonic()
+                raw = _run_raw_bevfusion(python, clip, work / "truck_raw", truck_raw_threshold,
+                                         truck_detector_mode)
+            else:
+                _print(f"{base}: {step}/{total} Truck 链（{truck_ckpt.name}）")
+                _t = time.monotonic()
+                raw = _run_raw(python, clip, truck_cfg, truck_ckpt,
+                               work / "truck_raw", "truck", truck_raw_threshold)
             out = work / "truck.json"
             diag_path = work / "truck_diagnostics.json"
-            result = run_expd_truck(raw, clip, out, diag_path)
+            result = run_expd_truck(
+                raw, clip, out, diag_path,
+                class_score_thresholds={"Truck": 0.2,   # 【改动】0.4 -> 0.2
+                                        "Trailer": float(trailer_score_threshold)},
+                trailer_rules=bool(trailer_rules),
+                trailer_dup_iom=float(trailer_dup_iom),
+                trailer_dup_iou=float(trailer_dup_iou),
+                trailer_merge_iou=float(trailer_merge_iou),
+                trailer_policy=str(trailer_policy))
             frames = json.loads(out.read_text(encoding="utf-8"))
             timings["truck"] = round(time.monotonic() - _t, 1)
             chain_labels["truck"] = _frames_to_labels(frames, TRUCK_ID_OFFSET)
             chain_stats["truck"] = {
+                "detector": str(truck_detector),
+                "detector_mode": str(truck_detector_mode),
                 "checkpoint": str(truck_ckpt), "config": str(truck_cfg),
                 "raw_score_threshold": float(truck_raw_threshold),
+                "trailer_rules": bool(trailer_rules),
+                "trailer_score_threshold": float(trailer_score_threshold),
                 "final_detections": (result or {}).get("final_detections"),
                 "frames": len(chain_labels["truck"])}
         if "vru" in selected:
@@ -584,7 +629,21 @@ def main() -> int:
                              "可选 car,truck,vru,noncar（noncar=旧五类单链）")
     parser.add_argument("--truck-cfg", type=Path, default=TRUCK_CFG)
     parser.add_argument("--truck-ckpt", type=Path, default=TRUCK_CKPT)
-    parser.add_argument("--truck-raw-threshold", type=float, default=0.4)
+    parser.add_argument("--truck-raw-threshold", type=float, default=0.1)
+    # 【改动】2026-09-20 Truck 链检测器（BEVFusion / 旧 VoxelNeXt）与货车/挂车规则
+    parser.add_argument("--truck-detector-mode", choices=["lidar", "fusion"], default="lidar",
+                        help="lidar=纯雷达 BEVFusion（默认，快）；fusion=C+L（读相机图）")
+    parser.add_argument("--truck-detector", choices=["bevfusion", "voxelnext"],
+                        default="bevfusion",
+                        help="bevfusion: pipeline/step1_bevfusion_truck.py（默认）；"
+                             "voxelnext: 旧 VoxelNeXt truckB 权重")
+    parser.add_argument("--no-trailer-rules", action="store_true",
+                        help="关掉挂车去重/并集与轨迹级 Truck 统一")
+    parser.add_argument("--trailer-score-threshold", type=float, default=0.25)
+    parser.add_argument("--trailer-dup-iom", type=float, default=0.70)
+    parser.add_argument("--trailer-dup-iou", type=float, default=0.50)
+    parser.add_argument("--trailer-merge-iou", type=float, default=0.05)
+    parser.add_argument("--trailer-policy", choices=["keep", "to-truck"], default="keep")
     parser.add_argument("--vru-cfg", type=Path, default=VRU_CFG)
     parser.add_argument("--vru-ckpt", type=Path, default=VRU_CKPT)
     parser.add_argument("--vru-raw-threshold", type=float, default=0.3)
@@ -722,6 +781,14 @@ def main() -> int:
             truck_cfg=truck_cfg,
             truck_ckpt=truck_ckpt,
             truck_raw_threshold=args.truck_raw_threshold,
+            truck_detector=args.truck_detector,
+            truck_detector_mode=args.truck_detector_mode,
+            trailer_rules=not args.no_trailer_rules,
+            trailer_score_threshold=args.trailer_score_threshold,
+            trailer_dup_iom=args.trailer_dup_iom,
+            trailer_dup_iou=args.trailer_dup_iou,
+            trailer_merge_iou=args.trailer_merge_iou,
+            trailer_policy=args.trailer_policy,
             vru_cfg=vru_cfg,
             vru_ckpt=vru_ckpt,
             vru_raw_threshold=args.vru_raw_threshold,

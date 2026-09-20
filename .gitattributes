@@ -2,3 +2,4 @@ models/exp*.pth filter=lfs diff=lfs merge=lfs -text
 models/vod_2cls_ft_*.pth filter=lfs diff=lfs merge=lfs -text
 models/voxelnext_truckB_*.pth filter=lfs diff=lfs merge=lfs -text
 models/voxelnext_vru_*.pth filter=lfs diff=lfs merge=lfs -text
+models/bevfusion_mmdet3d_*.pth filter=lfs diff=lfs merge=lfs -text

@@ -9,3 +9,7 @@ __pycache__/
 .idea/
 *.swp
 *~
+
+# BEVFusion truck 链：预处理缓存（5 列 bin / 去畸变图 / infos），随时可由 step1 重新生成
+bevfusion/data/
+bevfusion/work/
