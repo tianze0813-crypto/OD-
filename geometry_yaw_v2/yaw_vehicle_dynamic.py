@@ -1,7 +1,12 @@
-"""V2 yaw preview with motion confirmation and stationary point-cloud axes.
+"""V2 yaw preview with motion confirmation.
 
 This stage runs after identity tracking and all filters. Motion/static evidence
 selects only the source of ``box_lidar[6]`` and never feeds back into tracking.
+
+【改动】2026-09-20：删除「静止多帧点云主轴」规则
+（原 yaw_mode ``stationary_multiframe_pointcloud_axis``）。该规则用一段被路面/邻车
+污染的多帧点云 PCA 轴去覆盖静止车的 yaw，在 0914 clip17 的 obj 1011 上把 yaw 拉歪
+16.4°（用户要求整条去掉）。现在静止且没有运动证据的轨迹一律保留 detector 原始 yaw。
 """
 
 from __future__ import annotations
@@ -44,18 +49,12 @@ class YawVehicleDynamicConfig:
     # A single distant ID-switch frame must not make a parked fragment look
     # stationary and overwrite its raw yaw.
     stationary_max_center_radius: float = 1.0
-    pointcloud_min_valid_frames: int = 5
-    pointcloud_min_points_per_frame: int = 15
-    pointcloud_axis_ratio: float = 2.0
-    pointcloud_axis_inlier_deviation: float = math.radians(15.0)
-    pointcloud_axis_min_inlier_fraction: float = 0.60
-    pointcloud_direction_min_margin: float = 0.15
-    pointcloud_raw_yaw_stability: float = 0.98
-    pointcloud_raw_axis_conflict: float = math.radians(20.0)
+    # 【改动】2026-09-20 删除「静止多帧点云主轴」规则时，把它的 8 个 pointcloud_*
+    # 阈值一并删掉（点云采样帧数/每帧点数/轴比/内点偏离/内点率/方向裕度/原始 yaw 稳定性/
+    # 原始轴冲突）。
     # Dynamic detector yaw is accurate enough; the motion model must not
     # overwrite it during sharp turns / occlusion.  Motion evidence is still
-    # computed for diagnostics and for excluding moving tracks from the
-    # stationary point-cloud branch.
+    # computed for diagnostics.
     apply_motion_yaw: bool = False
     # 【改动】True = 保留"静态方向投票"（把静止段 yaw 锁到停车方向）。
     # Truck 链设为 False：不再静态锁死。
@@ -333,202 +332,6 @@ def _raw_detection_map(
     return result
 
 
-def _pca_axis(points: np.ndarray) -> Tuple[float, float] | None:
-    if len(points) < 3:
-        return None
-    radius = np.linalg.norm(points, axis=1)
-    trimmed = points[radius <= np.percentile(radius, 90.0)]
-    if len(trimmed) < 3:
-        return None
-    covariance = np.cov(trimmed.T)
-    values, vectors = np.linalg.eigh(covariance)
-    if float(values[-2]) <= 1e-9:
-        return None
-    axis = vectors[:, int(np.argmax(values))]
-    return (math.atan2(float(axis[1]), float(axis[0])),
-            float(values[-1] / values[-2]))
-
-
-def _count_points_in_raw_box(points: np.ndarray,
-                             box: Sequence[float]) -> int:
-    x, y, z, dx, dy, dz, yaw = (float(value) for value in box[:7])
-    cosine, sine = math.cos(-yaw), math.sin(-yaw)
-    relative_x = points[:, 0] - x
-    relative_y = points[:, 1] - y
-    local_x = relative_x * cosine - relative_y * sine
-    local_y = relative_x * sine + relative_y * cosine
-    return int(np.count_nonzero(
-        (np.abs(local_x) <= dx / 2.0)
-        & (np.abs(local_y) <= dy / 2.0)
-        & (np.abs(points[:, 2] - z) <= dz / 2.0)
-    ))
-
-
-def _raw_yaw_conflicts_with_pointcloud(
-        frame_evidence: Sequence[Tuple[float, float, int]],
-        pointcloud_axis: float,
-        config: YawVehicleDynamicConfig,
-) -> Tuple[bool, Dict[str, float]]:
-    """Protect a stable detector yaw from a contradictory PCA axis.
-
-    Circular point extraction can include a nearby wall, kerb, or another
-    object. A PCA axis is therefore not allowed to replace an already stable
-    directed yaw when the two axes strongly disagree.
-    """
-    raw_yaws = np.asarray([value for value, _weight, _count in frame_evidence],
-                          dtype=np.float64)
-    directed_vector = np.mean(np.exp(1j * raw_yaws))
-    axial_vector = np.mean(np.exp(2j * raw_yaws))
-    directed_stability = float(abs(directed_vector))
-    raw_axis = 0.5 * float(np.angle(axial_vector))
-    axis_conflict = float(tracking.angle_distance(
-        raw_axis, pointcloud_axis, modulo_pi=True))
-    rejected = (
-        directed_stability >= config.pointcloud_raw_yaw_stability
-        and axis_conflict >= config.pointcloud_raw_axis_conflict
-    )
-    return rejected, {
-        "raw_directed_yaw_stability": round(directed_stability, 4),
-        "raw_axis_world_yaw": round(raw_axis, 6),
-        "raw_pointcloud_axis_conflict": round(axis_conflict, 6),
-    }
-
-
-def _stationary_pointcloud_targets(
-        tracks: Mapping[int, Sequence[Dict[str, Any]]], moving_ids: set[int],
-        pre_yaw_frames: Sequence[Dict[str, Any]], clip: Path,
-        config: YawVehicleDynamicConfig,
-) -> Tuple[
-        Dict[Tuple[int, int], float],
-        List[Dict[str, Any]],
-        List[Dict[str, Any]],
-]:
-    raw = _raw_detection_map(pre_yaw_frames)
-    lidar_cache: Dict[str, np.ndarray] = {}
-    targets: Dict[Tuple[int, int], float] = {}
-    details = []
-    rejections = []
-    for tid, items in tracks.items():
-        if tid in moving_ids or len(items) < config.stationary_min_observations:
-            continue
-        centers = np.asarray([x["world"][:2] for x in items], dtype=np.float64)
-        center = np.median(centers, axis=0)
-        radii = np.linalg.norm(centers - center, axis=1)
-        spread90 = float(np.percentile(radii, 90))
-        max_radius = float(np.max(radii))
-        if (spread90 > config.stationary_center_spread90
-                or max_radius > config.stationary_max_center_radius):
-            continue
-
-        aggregate = []
-        per_frame_axes = []
-        frame_evidence = []
-        for item in items:
-            frame_id = item["frame_id"]
-            if frame_id not in lidar_cache:
-                values = np.fromfile(
-                    clip / "lidar" / "lidar_top" / f"{frame_id}.bin",
-                    dtype=np.float32)
-                if values.size % 4 != 0:
-                    continue
-                lidar_cache[frame_id] = values.reshape(-1, 4)[:, :3]
-            points = lidar_cache[frame_id]
-            box = np.asarray(item["det"]["box_lidar"][:7], dtype=np.float64)
-            delta_xy = points[:, :2] - box[:2]
-            radius = 0.58 * math.hypot(float(box[3]), float(box[4]))
-            delta_z = points[:, 2] - float(box[2])
-            mask = (
-                np.linalg.norm(delta_xy, axis=1) <= radius
-            ) & (
-                delta_z >= -float(box[5]) / 2.0 + 0.12
-            ) & (
-                delta_z <= float(box[5]) / 2.0 + 0.15
-            )
-            local_points = points[mask]
-            if len(local_points) < config.pointcloud_min_points_per_frame:
-                continue
-            homogeneous = np.c_[local_points, np.ones(len(local_points))]
-            world_points = (item["world_from_lidar"] @ homogeneous.T).T[:, :2]
-            relative = world_points - item["world"][:2]
-            per_axis = _pca_axis(relative)
-            if per_axis is None:
-                continue
-            aggregate.append(relative)
-            per_frame_axes.append(per_axis[0])
-            raw_det = raw.get((item["timestamp"], tid), item["det"])
-            raw_world_yaw = tracking.yaw_world(
-                float(raw_det["box_lidar"][6]), item["world_from_lidar"])
-            raw_point_count = _count_points_in_raw_box(
-                points, raw_det["box_lidar"])
-            weight = raw_point_count * max(
-                float(raw_det.get("score", 0.0)), 0.05)
-            frame_evidence.append((raw_world_yaw, weight, raw_point_count))
-        if len(aggregate) < config.pointcloud_min_valid_frames:
-            continue
-        combined = _pca_axis(np.concatenate(aggregate, axis=0))
-        if combined is None:
-            continue
-        axis, ratio = combined
-        if ratio < config.pointcloud_axis_ratio:
-            continue
-        deviations = np.asarray([
-            tracking.angle_distance(value, axis, modulo_pi=True)
-            for value in per_frame_axes
-        ])
-        inliers = deviations <= config.pointcloud_axis_inlier_deviation
-        inlier_fraction = float(np.mean(inliers))
-        if inlier_fraction < config.pointcloud_axis_min_inlier_fraction:
-            continue
-
-        raw_conflict, raw_conflict_detail = _raw_yaw_conflicts_with_pointcloud(
-            frame_evidence, axis, config)
-        if raw_conflict:
-            rejections.append({
-                "track_id": tid,
-                "observations": len(items),
-                "reason": "stable_raw_yaw_conflicts_with_pointcloud_axis",
-                "axis_world_yaw": round(float(axis), 6),
-                **raw_conflict_detail,
-            })
-            continue
-
-        votes = [0.0, 0.0]
-        raw_vote_counts = Counter()
-        for raw_yaw, weight, _point_count in frame_evidence:
-            side = 0 if abs(_wrap(raw_yaw - axis)) <= math.pi / 2.0 else 1
-            votes[side] += float(weight)
-            raw_vote_counts[side] += 1
-        winner = 0 if votes[0] >= votes[1] else 1
-        direction_margin = abs(votes[0] - votes[1]) / max(sum(votes), 1e-9)
-        if direction_margin < config.pointcloud_direction_min_margin:
-            # Direction is ambiguous but the geometric axis remains valid.
-            first_raw = frame_evidence[0][0]
-            winner = 0 if abs(_wrap(first_raw - axis)) <= math.pi / 2.0 else 1
-        target = _wrap(axis + (math.pi if winner else 0.0))
-        for item in items:
-            box = item["det"]["box_lidar"]
-            box_axis_target = target
-            if float(box[3]) < float(box[4]):
-                box_axis_target -= math.pi / 2.0
-            targets[(item["frame_index"], item["detection_index"])] = box_axis_target
-        details.append({
-            "track_id": tid,
-            "observations": len(items),
-            "yaw_mode": "stationary_multiframe_pointcloud_axis",
-            "center_spread90": round(spread90, 4),
-            "center_max_radius": round(max_radius, 4),
-            "valid_pointcloud_frames": len(aggregate),
-            "aggregate_points": int(sum(len(x) for x in aggregate)),
-            "axis_ratio": round(float(ratio), 4),
-            "axis_inlier_fraction": round(inlier_fraction, 4),
-            "axis_world_yaw": round(float(axis), 6),
-            "direction_votes_weighted": [round(x, 3) for x in votes],
-            "direction_votes_frames": [raw_vote_counts[0], raw_vote_counts[1]],
-            "direction_margin": round(float(direction_margin), 4),
-            "target_world_yaw": round(float(target), 6),
-            **raw_conflict_detail,
-        })
-    return targets, details, rejections
 
 
 def apply_yaw_vehicle_dynamic(
@@ -549,10 +352,6 @@ def apply_yaw_vehicle_dynamic(
         output, coords, tracking_diagnostics, static_yaw_diagnostics)
     motion_targets, moving_ids, motion_details, straight_ids = _motion_targets(
         tracks, config)   # 【改动】
-    point_targets, point_details, point_rejections = (
-        _stationary_pointcloud_targets(
-        tracks, moving_ids, pre_yaw_frames, Path(clip), config)
-    )
     cutoffs = _departure_cutoffs(static_yaw_diagnostics)
 
     counts = Counter()
@@ -583,13 +382,9 @@ def apply_yaw_vehicle_dynamic(
                     target = motion_target
                     mode = ("confirmed_motion_heading" if config.apply_motion_yaw
                             else "straight_motion_heading")       # 【改动】
-                else:
-                    # When motion yaw is disabled the detector yaw is kept for
-                    # moving boxes.  Stationary point-cloud yaw is still
-                    # allowed for non-moving tracks.
-                    target = point_targets.get((frame_index, detection_index))
-                    if target is not None:
-                        mode = "stationary_multiframe_pointcloud_axis"
+                # 【改动】2026-09-20 这里原来还有一条「静止多帧点云主轴」兜底
+                # （point_targets -> stationary_multiframe_pointcloud_axis），已按用户
+                # 要求删除：运动证据用不上时不再改写 yaw，保留 detector 原始朝向。
             if target is None:
                 continue
             det["box_lidar"][6] = _world_yaw_to_local(target, world_from_lidar)
@@ -606,16 +401,18 @@ def apply_yaw_vehicle_dynamic(
                 ["static_direction_vote"]
                 + (["confirmed_motion_heading"] if config.apply_motion_yaw
                    else [])
-                + ["stationary_multiframe_pointcloud_axis", "keep_original"]
+                + ["keep_original"]                                  # 【改动】删掉静止点云主轴
             ),
         },
         "boxes_by_mode": dict(sorted(counts.items())),
         "static": {"tracks": len(static_details), "details": static_details},
         "motion": {"tracks": len(motion_details), "details": motion_details},
+        # 【改动】2026-09-20 规则已删除，这里保留一条显式记录便于排查（旧日志里
+        # 该键带 tracks/details，现在恒为 enabled=False）。
         "stationary_pointcloud": {
-            "tracks": len(point_details), "details": point_details,
-            "stable_raw_yaw_rejections": len(point_rejections),
-            "rejection_details": point_rejections,
+            "enabled": False,
+            "reason": "rule removed (2026-09-20): 静止多帧点云 PCA 主轴覆盖已删除，"
+                      "静止且无运动证据的轨迹保留 detector yaw",
         },
     }
 

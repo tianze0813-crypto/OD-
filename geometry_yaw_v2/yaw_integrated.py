@@ -128,7 +128,7 @@ def apply_yaw_integrated(
     if getattr(vehicle_config, "apply_straight_motion_yaw", False):
         priority.append("straight_motion_heading")       # 【改动】
     priority += [
-        "stationary_multiframe_pointcloud_axis",
+        # 【改动】2026-09-20 删除静止多帧点云主轴（stationary_multiframe_pointcloud_axis）
         "pedestrian_two_frame_heading",
         "keep_original",
     ]
