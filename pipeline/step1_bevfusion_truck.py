@@ -78,7 +78,8 @@ def prepare(clip: Path, jobs: int = 6, images: bool = True) -> None:
     _run(cmd)
     # 【改动】再生成 mmdet3d 需要的 middle-format infos（纯雷达模式下图片时间戳回退到原始 image/）
     _run([BEVFUSION_PYTHON, BEVFUSION_ROOT / "scripts" / "mmdet3d_prep.py",
-          "--data-root", clip.parent, "--out-root", BEVFUSION_ROOT])
+          "--data-root", clip.parent, "--out-root", BEVFUSION_ROOT,
+          "--clips", clip.name])
 
 
 def infer(clip: Path, raw_json: Path, score_thresh: float, cfg: str, ckpt: str,

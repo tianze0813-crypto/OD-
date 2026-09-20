@@ -17,8 +17,7 @@
 三条链各自独立推理、独立后处理、独立调参（范围 / 阈值 / yaw 策略互不干扰），
 最后才合并。顺序固定为 **Car -> Truck -> 最后 Pedestrian/Nonmotorized_vehicle**。
 
-> Truck 链 2026-09-20 起改用 BEVFusion（默认纯雷达权重）+ 货车/挂车类别合并，
-> 详见文末《Truck 链（2026-09-20：BEVFusion 检测器 + 货车/挂车类别合并）》。
+> Truck 链 2026-09-20 起改用 BEVFusion（默认纯雷达权重）+ 货车/挂车类别合并，详见下文《Truck 链》一节。
 
 > 旧的两链模式（main Car + VOD 五类非车，Bus 在非车链开头折叠成 Truck）仍保留：
 > 加 `--chains car,noncar`，参数见《附录：旧五类非车链》。
@@ -31,7 +30,7 @@
 | 链 | 权重 | 推理配置 | raw 分数门槛 |
 | --- | --- | --- | --- |
 | Car | `main_chain/models/vn_waymo_v2_4gpu_full_epoch10.pth` | `main_chain/models/voxelnext_v2_waymo_infer.yaml` | main_chain 内部固定 |
-| Truck | `models/voxelnext_truckB_epoch15.pth` | `models/voxelnext_truck_infer.yaml` | `--truck-raw-threshold`（默认 `0.4`） |
+| Truck | `models/bevfusion_mmdet3d_lidaronly.pth`（默认，纯雷达）<br>可选 `models/bevfusion_mmdet3d_lidarcam.pth`（C+L） | `bevfusion/configs/police_bevfusion_mmdet3d_lidaronly.py`<br>可选 `..._mmdet3d.py` | `--truck-raw-threshold`（默认 `0.1`） |
 | VRU | `models/voxelnext_vru_1head2cls_epoch20.pth` | `models/voxelnext_vru_infer.yaml` | `--vru-raw-threshold`（默认 `0.3`） |
 
 `models/*.pth` 只有 133 字节 = Git LFS 指针，先 `git lfs pull` 再跑。
@@ -44,33 +43,111 @@
    - 判据是"交面积 / Car 面积"，**不是 IoU** —— Truck 比 Car 大得多，IoU 天然偏小；
    - 同一 Car id 只要有任意一帧命中，**整条轨迹（所有帧）都删**，不是只删重叠那一帧。
 
-## Truck 链（`pipeline/hybrid_expD_truck.py`）
+## Truck 链（`pipeline/hybrid_expD_truck.py` + `bevfusion/`）
 
-- 只保留 `Truck`（该链的类别归一化已把 Bus 并入 Truck）
-- 范围：前 80 / 后 20 / 左右 40 m
-- 分数阈值：Truck `0.4`；短轨迹过滤 4 帧
-- yaw：`v2` —— 直线行驶的轨迹用运动方向作 yaw，拐弯保留 detector yaw；
-  不做静态方向投票、不把动态轨迹钉到停车位 id、跳过静态 yaw 稳定
-- `obj_id` 从 1000 起
+2026-09-20 起检测器换成 **BEVFusion**（mmdet3d 1.x 官方 20 epoch 权重），并引入 **Trailer（挂车）** 与「货车/挂车类别合并」。
+只动这条链：Car（main_chain）与 VRU 链的代码路径、阈值、行为都没变
+（`pipeline/hybrid_expD_noncar.py` 只多了两个默认保持旧行为的透传开关）。
 
-Truck 专用后处理 `geometry/truck_postprocess.py`，执行顺序：
+### 顺序（用户 2026-09-20 明确）
+
+```text
+检测 → 范围/分数过滤（早期）→ 类别合并 → ID 跟踪 → 短轨迹/硬过滤 → 精修 → 轨迹级类别统一 → 导出 SUST
+```
+
+| # | 阶段 | 判据 / 阈值 | 产物 |
+| --- | --- | --- | --- |
+| 0 | 检测：`pipeline/step1_bevfusion_truck.py` → `bevfusion/scripts/infer_mmdet3d.py` | 10 类，raw 阈值 `0.1`，**z 在出口统一成框中心** | `<work>/step1_*/<clip>_raw.json` |
+| 1 | 早期过滤（链内原有，位置不变） | 类别范围（Truck/Trailer）+ ROI 前 80 / 后 20 / 左右 40 + 分数 **Truck 0.2** / Trailer 0.25 | `truck_filtered_raw.json` |
+| 2 | **类别合并** `geometry/truck_trailer_rules.py::merge_classes_pre`（跟踪前、lidar 系） | ①`truck`/`bus`→Truck、`trailer`→Trailer；②**重复**：挂车被货车罩住（IoM ≥ 0.70 或 IoU ≥ 0.50）→ 丢挂车、以 Truck 为准；③**有交集**：IoU ≥ 0.05 → **并集合并成一个大长 Truck**（分数取两者较大者） | `<clip>_raw_classmerge.json` |
+| 3 | ID 跟踪 `pipeline/step2_identity.py` | 静态 slot 优先（Truck 链 `disable_slot_binding=True`，不用）+ 匈牙利关联；只加 `track_id`，不改几何 | `truck_step2.json` |
+| 4 | 短轨迹 / 硬过滤 `step2_5`（跟踪之后） | 类别纠正 → 硬过滤第二遍（稀疏度 ≥10 点、可见性 ≥0.05、ROI/分数复核）→ **轨迹观测 < 4 帧整条删**；「静止 + 相邻帧 IoU≥0.35 + yaw 抖动 → 整条删」在 Truck 链**已关** | `truck_step2_5.json` |
+| 5 | 精修 `step3` | 通用几何 + Truck 专用 `geometry/truck_postprocess.py`（见下表） | `truck_step3.json` → `truck.json` |
+| 6 | **轨迹级类别统一** `truck_trailer_rules.unify_track_classes` | 同一 `obj_id` 里出现过 Truck → 该 id 的所有框都算 Truck（`--trailer-policy keep` 时纯挂车轨迹保留 Trailer，`to-truck` 则一律并成 Truck） | `truck.json` |
+| 7 | 导出 SUST | 已转 base_link（只转一次），`obj_id` 从 1000 起 | `<clip>/label_truck/*.json`；整批合成后 `<clip>_pre/label/*.json` |
+
+### 检测器两种模式（默认纯雷达）
+
+| 模式 | 权重 | 单帧 | 单 clip 全链 | 预处理 |
+| --- | --- | --- | --- | --- |
+| `lidar`（默认） | `models/bevfusion_mmdet3d_lidaronly.pth`（46 MB） | 108 ms | 30~38 s | 只写 5 列 bin + infos（**不去畸变**） |
+| `fusion` | `models/bevfusion_mmdet3d_lidarcam.pth`（160 MB） | 前向 191 ms + 读图 495 ms/帧 | 80~100 s | 4 路鱼眼去畸变 + bin + infos |
+
+实测（5 条交警 clip / 400 帧，过完整条链）：纯雷达 1330 个 Truck 标签、长度 P50 8.84 / max 17.00 / >12 m 357；
+C+L 1340 / 9.14 / 13.89 / 351 —— 基本持平，纯雷达快约 2.5 倍，故设为默认。
+
+### Truck 专用后处理（`geometry/truck_postprocess.py`）
 
 | 步 | 内容 | 默认 |
 | --- | --- | --- |
-| ① | yaw 旋转帧修正：与局部运动方向偏差 ≥ 阈值的帧，yaw 改成局部运动方向 | 开，阈值 `15°` |
-| ①b | 静止 Truck 的 yaw 平滑：yaw 取 mod π 后分箱众数投票 + 圆中位（取抖动中间方向） | 开 |
+| ① | yaw 旋转帧修正：与局部运动方向偏差 ≥ `15°` 的帧，yaw 改成局部运动方向（按 π 等价取与前一帧连续的分支） | 开 |
+| ①b | 静止 Truck 的 yaw 平滑：yaw 取 mod π 后 5° 分箱众数投票 + 箱内圆中位 | 开 |
 | ② | IoU 并集合并（把"长车被拆成两段"并成并集长框，含合并 id 的统一尺寸/朝向） | **关**（`merge_enabled=False`） |
 | ③ | xy 贴合（复用 main 链 Car 的单面收缩逻辑） | **关**（`xy_fit_mode="off"`） |
 
-②③ 关掉的原因（实测）：
+②③ 关掉的原因（实测）：并集会把同一目标的重复框并成超宽框（实测 13.07×3.00 + 13.39×3.02 → 13.96×7.96），
+且并集框 yaw 用点云 PCA 重算时可能被掰歪 90°；xy 贴合即使只贴合长轴，273 个 Truck 框里也有 20.5%
+被沿长轴挪中心（29/273 挪 >2 m，最大 4.9 m）、25/273 长度被砍半（卡车常只看到一个端面，
+face-visibility 拟合把可见点簇边缘当成了"面"）。需要时改 `TruckPostConfig` 即可回退。
 
-- 并集会把"同一目标重复检出"的两个平行框并成超宽框（实测 13.07×3.00 + 13.39×3.02
-  被并成 13.96×7.96），并且并集框的 yaw 用点云 PCA 重算时可能被掰歪 90°；
-- xy 贴合即使只贴合长轴，273 个 Truck 框里也有 20.5% 被沿长轴挪中心
-  （56/273 挪 >0.5m，29/273 挪 >2m，最大 4.9m）、25/273 的框长度被砍掉一半
-  —— 框会"突出"（卡车常只看到一个端面，face-visibility 拟合把可见点簇边缘当成了"面"）。
+> 注意区分：② 是**链内**的 Truck-Truck 并集（默认关）；第 2 步的挂车→货车并集是**类别合并**（默认开）。
 
-需要时改 `TruckPostConfig` 的 `merge_enabled=True` / `xy_fit_mode="long_axis"` 即可回退。
+### yaw 与 box 精修现状
+
+- yaw 五层：①detector 原始 yaw 为主（`apply_motion_yaw=False`）；②`geometry_yaw_v2` —— 静止轨迹用点云 PCA 主轴
+  （≥5 帧、每帧 ≥15 点、长宽比 ≥2、内点偏差 ≤15°、内点占比 ≥60%），直线运动段用运动方向（≥5 步、路径 ≥1.5 m、
+  净速 ≥1.0 m/s、集中度 ≥0.75），转弯/遮挡保留 detector yaw，且不做静态方向投票；③④ 上表 ①/①b；⑤链级 `static_yaw_enabled=False`。
+- box 尺寸：只有 step3 通用几何的**轨迹级分位数统一**（Truck 长轴取 0.75 分位），点云 span 只作下界不允许收缩；
+  此外 Truck 的长度就是检测器输出 + 类别合并带来的并集增长。
+- z：出口统一为框中心 + 通用几何的环形地面估计（clearance 4 cm，单次最多移 0.32 m）。
+
+### 运行
+
+```bash
+# 单条 clip（默认纯雷达；结果写 <clip>/label_truck/）
+python pipeline/hybrid_expD_truck.py --clip <clip> --out-json work/truck.json \
+    --detector bevfusion --detector-mode lidar --label-subdir label_truck
+
+# 整批（Car -> Truck -> VRU 合成 <clip>_pre/label）
+bash hybrid_run.sh <input_root> --in-place --overwrite
+python scripts/run_hybrid_prelabel.py <input_root> <output_root> --chains truck
+
+# 回退
+... --truck-detector voxelnext      # 旧 VoxelNeXt truckB 权重
+... --no-trailer-rules              # 只保留 Truck，不做挂车去重/并集/统一
+... --truck-detector-mode fusion    # 改用 C+L 权重
+```
+
+### 缓存与 in-place 注意事项
+
+- Truck 链第一次处理某条 clip 时，会在 `bevfusion/data/police/<clip>/` 生成 **5 列 bin 副本 + 标定副本**
+  （`fusion` 模式还会在 `bevfusion/work/undist/<clip>/` 生成去畸变图），并生成 infos；
+  这些都在 `.gitignore` 里，属于**可随时删除的缓存**，删掉后重跑会自动重建。
+- 缓存**自足**：标定是复制（不是软链），所以即使源 clip 被改过名，也能从缓存重建 infos；
+  但 `--clip` 指向的源路径本身仍要存在才能重新预处理。
+- **`--in-place` 会把源 clip 改名成 `<clip>_pre`**（标签写在里面），这是该模式的预期行为：
+  下次批跑收集时会跳过 `*_pre`，所以**已标注的 clip 不会被重复处理**；
+  若要重跑某条，把它改回不带 `_pre` 的名字即可（或直接对 `<clip>_pre` 用 `--chains truck` 重跑，
+  因为缓存还在，只需重新推理+后处理）。
+
+### 依赖（BEVFusion 相关）
+
+| 依赖 | 说明 |
+| --- | --- |
+| conda 环境 `mmdet3d` | torch 2.1.2+cu121 / mmcv 2.1.0 / mmdet 3.3.0 / mmdet3d 1.4.0（editable） |
+| mmdetection3d 源码 | 环境变量 `MMDET3D_ROOT`（默认 `~/MMDetection/mmdetection3d` 等常见位置） |
+| CUDA 算子 | 首次需 `~/miniconda3/envs/mmdet3d/bin/python bevfusion/scripts/build_bev_pool.py`（编 `bev_pool_ext` + `voxel_layer`，缓存到 `~/.cache/torch_extensions`） |
+| 环境变量 | `BEVFUSION_ROOT`（默认 `<project>/bevfusion`）、`BEVFUSION_PYTHON`、`BEVFUSION_TRUCK_CFG/CKPT`、`BEVFUSION_TRUCK_LIDAR_CFG/CKPT`、`BEVFUSION_DATA_ROOT` |
+
+细节见 `bevfusion/README.md`（含 z 约定、9 列框、鱼眼去畸变等 5 个坑）。
+
+### 已知问题
+
+1. **并集长框会被 4 帧生命周期门槛删掉**：挂车与货车只在 3 帧贴合时（"路过贴一下"），并出的 17~18 m 长框
+   自成短轨迹被删；真·铰接车（每帧都在）不受影响。要保留可用 `--short-track-max-frames 2`，或给
+   `merged_from≥2` 的框豁免。实测 clip14 的并集框被跟踪器接成了同一条 id（17.4/17.7/18.0 m），只是轨迹只有 3 帧。
+2. 纯挂车轨迹（与任何货车都不相交）在 5 条测试 clip 里都没能活过 4 帧门槛，所以目前输出几乎只有 Truck。
+3. H800 / 云端尚未同步（云端没有 mmdet3d 环境，需要在云端建环境 + 编算子）。
 
 ## VRU 链（`pipeline/hybrid_expD_vru.py`）
 
@@ -221,11 +298,17 @@ done
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `--truck-ckpt` | `models/voxelnext_truckB_epoch15.pth` | Truck 权重 |
-| `--truck-cfg` | `models/voxelnext_truck_infer.yaml` | 推理配置 |
-| `--truck-raw-threshold` | `0.4` | Truck raw 推理分数门槛 |
+| `--truck-detector` | `bevfusion` | Truck 检测器：`bevfusion`（BEVFusion）或 `voxelnext`（旧 VoxelNeXt truckB） |
+| `--truck-detector-mode` | `lidar` | BEVFusion 模式：`lidar`（纯雷达，46 MB，快）或 `fusion`（C+L，160 MB，读 4 路相机图） |
+| `--truck-ckpt` / `--truck-cfg` | `models/voxelnext_truckB_epoch15.pth` / `models/voxelnext_truck_infer.yaml` | 仅 `--truck-detector voxelnext` 时使用 |
+| `--truck-raw-threshold` | `0.1` | 检测器 raw 分数门槛（链内类别阈值另外把关） |
+| `--trailer-score-threshold` | `0.25` | Trailer 类别分数阈值（Truck 固定 0.2） |
+| `--trailer-dup-iom` / `--trailer-dup-iou` | `0.70` / `0.50` | 判"挂车是货车的重复框"的 IoM / IoU 门限 |
+| `--trailer-merge-iou` | `0.05` | 挂车与货车有交集判据（命中就并集成大长 Truck） |
+| `--trailer-policy` | `keep` | `keep`：纯挂车轨迹保留 Trailer；`to-truck`：一律并成 Truck |
+| `--no-trailer-rules` | 关 | 关掉类别合并（去重/并集/轨迹统一），回退到只有 Truck 的旧行为 |
 
-其余（范围 80/20/40、Truck 分数 0.4、短轨迹 4、yaw v2、Truck 后处理各开关）
+其余（范围 80/20/40、Truck 0.2 / Trailer 0.25、短轨迹 4、yaw v2、Truck 后处理各开关）
 是 `pipeline/hybrid_expD_truck.py::DEFAULTS` 的模块默认值，改那里即可。
 
 ### VRU 链参数（透出部分）
@@ -264,7 +347,7 @@ done
 | 阶段 | 耗时 |
 | --- | --- |
 | Car 链（main_chain：raw 推理 + Step2~Step5 + Step4.5） | 102.6 s |
-| Truck 链（raw 推理 + 后处理） | 23.5 s |
+| Truck 链（BEVFusion 纯雷达：检测 + 合并 + 跟踪/过滤/精修） | 30~38 s（C+L 模式 80~100 s） |
 | VRU 链（raw 推理 + 后处理） | 39.1 s |
 | 三链合并 + Car/Truck 覆盖规则 | 0.5 s |
 | 导出 `<clip>_pre`（约 600 MB copytree） | 0.6 s |
@@ -279,7 +362,7 @@ done
 
 - Car 链占约 6 成；CPU 后处理（跟踪关联、可见度、几何精修）是主要瓶颈，阈值越低越慢。
 - 框越多越慢：同批三条 clip 实测 150–167 s/clip。
-- 只改 Truck 时用 `scripts/remerge_truck_car.py` 约 **25 s/clip**（复用 Car/VRU 标签，只重跑 Truck 链）。
+- 只改 Truck 时用 `scripts/remerge_truck_car.py` 约 **35 s/clip**（复用 Car/VRU 标签，只重跑 Truck 链；默认同样是 BEVFusion 纯雷达）。
 
 ## 目录
 
@@ -288,6 +371,9 @@ hybrid_run.sh           入口（三链：Car -> Truck -> VRU）
 main_chain/             最新 OD-main-0909 快照（Waymo Car 链路 + Step4.5）
 pipeline/               各链主体：hybrid_expD_noncar / hybrid_expD_truck / hybrid_expD_vru
                         hybrid_main_car（Car 链调用）、hybrid_merge（标签合并）
+                        step1_bevfusion_truck.py（Truck 链 BEVFusion 检测入口）
+bevfusion/              Truck 链的 BEVFusion 工具箱（配置 + prep/infer/评测脚本，见其 README）
+geometry/truck_trailer_rules.py  货车/挂车类别合并（去重 / 并集 / 轨迹级类别统一）
 geometry/truck_postprocess.py   Truck 专用后处理（yaw 修正 / 静止平滑 / 可选并集与贴合）
 geometry_yaw_v2/        Truck 链用的新版 yaw（直线运动方向 / 静态方向 / 动态 yaw）
 classification/         类别归一化与 track 投票
@@ -346,74 +432,3 @@ Car/Truck/Bus 头，只训练 Pedestrian / Nonmotorized_vehicle 头。
 只删该帧的 Car（三链模式下换成"删整条 Car 轨迹"，见《合并规则》）。
 
 ---
-
-## Truck 链（2026-09-20：BEVFusion 检测器 + 货车/挂车类别合并）
-
-> 只动 Truck 链：Car（main_chain）与 VRU 链的代码路径、阈值、行为均未变
-> （`pipeline/hybrid_expD_noncar.py` 只多了两个默认保持旧行为的透传开关）。
-
-### 依赖与目录（都在本项目内）
-
-| 内容 | 路径 |
-|---|---|
-| 检测器代码/配置 | `bevfusion/{configs,scripts}/`（说明见 `bevfusion/README.md`） |
-| 权重（git-lfs） | `models/bevfusion_mmdet3d_lidaronly.pth`（纯雷达 46 MB，**默认**）、`models/bevfusion_mmdet3d_lidarcam.pth`（C+L 160 MB） |
-| Step1 入口 | `pipeline/step1_bevfusion_truck.py` |
-| 类别合并规则 | `geometry/truck_trailer_rules.py` |
-| 链本体 | `pipeline/hybrid_expD_truck.py` → `pipeline/hybrid_expD_noncar.py` |
-| 外部依赖 | conda 环境 `mmdet3d`（torch 2.1.2+cu121 / mmcv 2.1.0 / mmdet3d 1.4.0）；mmdetection3d 源码（`MMDET3D_ROOT`，默认 `~/MMDetection/mmdetection3d`）；首次需编两个 CUDA 算子：`python bevfusion/scripts/build_bev_pool.py` |
-
-### 全链路顺序
-
-```
-检测（BEVFusion）→ 范围/分数过滤（早期）→ 类别合并 → ID 跟踪
-     → 短轨迹/硬过滤 → 精修 → 轨迹级类别统一 → 导出 SUST label（base_link）
-```
-
-| # | 阶段 | 判据 / 阈值 | 产物 |
-|---|---|---|---|
-| 0 | 检测：mmdet3d 1.x BEVFusion（20 epoch 官方权重，10 类，**z 已统一成框中心**） | raw 阈值 0.1 | `<work>/step1_*/<clip>_raw.json` |
-| 1 | 早期过滤（链内原有，位置不变） | 类别范围（Truck/Trailer）+ ROI（前 80 / 后 20 / 侧 40）+ 分数（**Truck 0.2**、Trailer 0.25） | `truck_filtered_raw.json` |
-| 2 | **类别合并**（`geometry/truck_trailer_rules.merge_classes_pre`，跟踪前、lidar 系） | ①truck/bus→Truck、trailer→Trailer；②重复：挂车被货车罩住（IoM≥0.70 或 IoU≥0.50）→ 丢挂车、以 Truck 为准；③有交集：IoU≥0.05 → **并集成一个大长 Truck**（分数取最大） | `<clip>_raw_classmerge.json` |
-| 3 | ID 跟踪（`step2_identity` → `tracker_static_first` + `tracker_conservative`） | 静态 slot 优先（Truck 链 `disable_slot_binding=True`）+ 匈牙利关联；只加 `track_id`，不改几何 | `truck_step2.json` |
-| 4 | 短轨迹 / 硬过滤（跟踪之后） | 类别纠正 → 硬过滤第二遍（稀疏度 ≥10 点、可见性 ≥0.05、ROI/分数复核）→ **轨迹 <4 帧整条删**；「静止+yaw乱转→整条删」在 Truck 链**已关** | `truck_step2_5.json` |
-| 5 | 精修（`step3`） | 通用几何（轨迹级分位数尺寸统一、点云锚点 xy、地面 z）+ Truck 专用 `truck_postprocess`（yaw 偏差 ≥15° 修正、静止 yaw 平滑；IoU 并集合并与 xy 贴合**默认关**） | `truck_step3.json` → `truck.json` |
-| 6 | **轨迹级类别统一** | 同一 obj_id 里出现过 Truck → 整条 id 都算 Truck（`--trailer-policy keep` 时纯挂车轨迹保留 Trailer） | `truck.json` |
-| 7 | 导出 SUST | 已转 base_link（只转一次），obj_id = track_id + 1000 | `<clip>/label_truck/*.json`；整批合成后 `<clip>_pre/label/*.json` |
-
-### 检测器模式（默认纯雷达）
-
-| 模式 | 权重 | 单帧 | 单 clip 全链 | 预处理 | 说明 |
-|---|---|---|---|---|---|
-| `lidar`（默认） | `bevfusion_mmdet3d_lidaronly.pth` | 108 ms | 30~38 s | 只写 5 列 bin + infos（**不去畸变**） | 交警域 truck 指标与 C+L 基本持平（1340 vs 1330 框、>12 m 351 vs 357） |
-| `fusion` | `bevfusion_mmdet3d_lidarcam.pth` | 前向 191 ms + 读图 495 ms/帧 | 80~100 s | 4 路鱼眼去畸变 + bin + infos | 相机分支目前对 truck 没有可测收益 |
-
-### 运行
-
-```bash
-# 单条 clip（默认纯雷达；结果写 <clip>/label_truck/）
-python pipeline/hybrid_expD_truck.py --clip <clip> --out-json work/truck.json \
-    --detector bevfusion --detector-mode lidar --label-subdir label_truck
-
-# 整批（Car → Truck → VRU 合成 <clip>_pre/label）
-python scripts/run_hybrid_prelabel.py <input_root> <output_root> --chains car,truck,vru
-
-# 回退旧检测器 / 关掉类别合并
-... --truck-detector voxelnext        # 旧 VoxelNeXt truckB 权重
-... --no-trailer-rules                 # 只保留 Truck，不做挂车去重/并集/统一
-```
-
-环境变量（云端/换机时）：`BEVFUSION_ROOT`（默认 `<project>/bevfusion`）、`BEVFUSION_PYTHON`（mmdet3d 环境 python）、
-`BEVFUSION_TRUCK_CFG/CKPT`、`BEVFUSION_TRUCK_LIDAR_CFG/CKPT`、`MMDET3D_ROOT`。
-
-### 不随 git 上传 / 生成物
-
-- `bevfusion/data/`、`bevfusion/work/`（5 列 bin、去畸变图、infos 缓存）已在 `.gitignore`，跑 step1 会按需重建；
-- 权重走 **git-lfs**（`.gitattributes` 里 `models/bevfusion_mmdet3d_*.pth`）；
-- 若要复现实验数据集：`bevfusion/scripts/prep_data.py --data-root <clips 目录>` 重新生成。
-
-### 已知 / 待办
-
-1. **并集长框会被 4 帧生命周期门槛删掉**：挂车与货车只贴合 3 帧时（"路过贴一下"），并出的 17~18 m 长框自成短轨迹 → 被 `min_lifecycle=4` 删。真·铰接车（每帧都在）不受影响。想保留可选 `--short-track-max-frames 2` 或给 `merged_from≥2` 的框豁免。
-2. Truck 的尺寸除通用几何的轨迹级分位数统一外没有别的精修，长度基本来自检测器 + 并集增长。
-3. H800 / 云端尚未同步（云端没有 mmdet3d 环境，需要在云端建环境并编 `bev_pool_ext`/`voxel_layer`）。

@@ -20,6 +20,7 @@ import argparse
 import json
 import os
 import pickle
+import shutil
 import sys
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -153,14 +154,21 @@ def main():
 
         # --- 目录 & 软链 ---
         (root / "data" / "police" / clip / "lidar" / "lidar_top").mkdir(parents=True, exist_ok=True)
+        # 【修】复制标定/pose，不用软链：in-place 批跑会把源 clip 改名成 <clip>_pre，
+        #      软链会立刻悬空并让后续步骤读不到 calib.json。
         tdir = root / "data" / "police" / clip / "transforms"
-        if not (tdir.exists() or tdir.is_symlink()):
-            tdir.symlink_to(cdir / "transforms")
+        tdir.mkdir(parents=True, exist_ok=True)
+        for fname in ("calib.json", "pose_data.txt"):
+            src_file = cdir / "transforms" / fname
+            if src_file.is_file() and not (tdir / fname).exists():
+                shutil.copy2(src_file, tdir / fname)
         for cam in cams:
             p = root / "data" / "police" / clip / "image" / cam
             p.parent.mkdir(parents=True, exist_ok=True)
-            if not (p.exists() or p.is_symlink()):
-                p.symlink_to(root / "work" / "undist" / clip / cam)
+            target = (root / "work" / "undist" / clip / cam).resolve()
+            if not p.is_symlink() or p.resolve() != target:
+                p.unlink(missing_ok=True)
+                p.symlink_to(target)
             if args.no_images:
                 continue
             K = np.asarray(calib[cam]["K"], np.float64)
@@ -241,8 +249,11 @@ def main():
     out.parent.mkdir(parents=True, exist_ok=True)
     # INFO_PATH 是相对 dataset root（data/police）解析的
     link = root / "data" / "police" / "infos"
-    if not (link.exists() or link.is_symlink()):
-        link.symlink_to(root / "work" / "infos")
+    target = (root / "work" / "infos").resolve()
+    # 【修】必须写绝对路径：--out-root 给相对路径时，旧写法会生成解析不到的相对软链
+    if not link.is_symlink() or link.resolve() != target:
+        link.unlink(missing_ok=True)
+        link.symlink_to(target)
     with open(out, "wb") as f:
         pickle.dump(infos, f)
     print("\n".join(report))

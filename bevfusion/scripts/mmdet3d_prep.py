@@ -28,6 +28,8 @@ def main():
                     help="缓存/产物根（默认 = <project>/bevfusion）")
     ap.add_argument("--cams", default=",".join(CAMS_DEFAULT))
     ap.add_argument("--out-size", default="1920x1536")
+    ap.add_argument("--clips", default="",
+                    help="只处理这些 clip（逗号分隔），默认全部（缓存目录里遗留的也会被尝试）")
     args = ap.parse_args()
 
     root = Path(args.out_root)
@@ -36,12 +38,23 @@ def main():
     ow, oh = (int(x) for x in args.out_size.split("x"))
 
     clips = sorted(d.name for d in (root / "data" / "police").glob("scene_*") if d.is_dir())
+    if args.clips:
+        want = {c.strip() for c in args.clips.split(",") if c.strip()}
+        clips = [c for c in clips if c in want]
     infos = []
     idx = 0
     for clip in clips:
         cdir = data_root / clip
-        calib = json.loads((cdir / "transforms" / "calib.json").read_text())
         bins = sorted((root / "data" / "police" / clip / "lidar" / "lidar_top").glob("*.bin"))
+        # 【修】标定优先用 prep_data 复制到缓存里的那份（缓存自足：in-place 批跑会把源 clip 改名成
+        #      <clip>_pre，源路径随时可能不在）；缓存里没有才回源目录。都没有就跳过而不是崩。
+        calib_path = root / "data" / "police" / clip / "transforms" / "calib.json"
+        if not calib_path.is_file():
+            calib_path = cdir / "transforms" / "calib.json"
+        if not calib_path.is_file() or not bins:
+            print(f"[skip] {clip}: 标定或 bin 不完整（calib={calib_path.is_file()}, bin={len(bins)}）")
+            continue
+        calib = json.loads(calib_path.read_text())
         for bp in bins:
             ts = bp.stem
             images = {}
@@ -57,7 +70,11 @@ def main():
                 img_dir = root / "work" / "undist" / clip / cam
                 if not img_dir.is_dir():        # 纯雷达模式：没有去畸变图，用原图配对时间戳
                     img_dir = cdir / "image" / cam
-                it = min((p.stem for p in img_dir.glob("*.jpg")), key=lambda t: abs(int(t) - int(ts)))
+                stems = [p.stem for p in img_dir.glob("*.jpg")]
+                if stems:                       # 图也不在（如源被改名）-> 纯雷达模式下无妨，直接用雷达时间戳
+                    it = min(stems, key=lambda t: abs(int(t) - int(ts)))
+                else:
+                    it = ts
                 images[cam] = {
                     "img_path": f"{clip}/image/{cam}/{it}.jpg",
                     "cam2img": Kp.astype(np.float32),

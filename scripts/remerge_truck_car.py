@@ -62,7 +62,14 @@ def main() -> int:
                         default=Path.home() / "miniconda3/envs/openpcdet/bin/python")
     parser.add_argument("--truck-cfg", type=Path, default=rh.TRUCK_CFG)
     parser.add_argument("--truck-ckpt", type=Path, default=rh.TRUCK_CKPT)
-    parser.add_argument("--truck-raw-threshold", type=float, default=0.4)
+    parser.add_argument("--truck-raw-threshold", type=float, default=0.1)
+    # 【改动】Truck 检测器与模式（默认 BEVFusion 纯雷达，与整批链路一致）
+    parser.add_argument("--truck-detector", choices=["bevfusion", "voxelnext"],
+                        default="bevfusion")
+    parser.add_argument("--truck-detector-mode", choices=["lidar", "fusion"],
+                        default="lidar")
+    parser.add_argument("--trailer-score-threshold", type=float, default=0.25)
+    parser.add_argument("--no-trailer-rules", action="store_true")
     parser.add_argument("--car-truck-cover-threshold", type=float, default=0.5)
     parser.add_argument("--write", action="store_true",
                         help="真正写盘（默认只 dry-run 打印统计）")
@@ -81,15 +88,25 @@ def main() -> int:
             raise RuntimeError(f"{clip.name}: 没有可复用的 Car 标签（label/ 里没有 Car）")
         with tempfile.TemporaryDirectory(prefix=f"remerge_{clip.name}_") as temp:
             work = Path(temp)
-            raw = rh._run_raw(args.python, clip, args.truck_cfg.resolve(),
-                              args.truck_ckpt.resolve(), work / "truck_raw",
-                              "truck", args.truck_raw_threshold)
+            if args.truck_detector == "bevfusion":   # 【改动】与整批链路同一套检测器
+                raw = rh._run_raw_bevfusion(args.python, clip, work / "truck_raw",
+                                            args.truck_raw_threshold,
+                                            args.truck_detector_mode)
+            else:
+                raw = rh._run_raw(args.python, clip, args.truck_cfg.resolve(),
+                                  args.truck_ckpt.resolve(), work / "truck_raw",
+                                  "truck", args.truck_raw_threshold)
             out = work / "truck.json"
             diag_path = work / "truck_diagnostics.json"
-            result = run_truck(raw, clip, out, diag_path)
+            result = run_truck(raw, clip, out, diag_path,
+                               class_score_thresholds={"Truck": 0.2,
+                                                       "Trailer": args.trailer_score_threshold},
+                               trailer_rules=not args.no_trailer_rules)
             truck_frames = json.loads(out.read_text(encoding="utf-8"))
             truck = rh._frames_to_labels(truck_frames, rh.TRUCK_ID_OFFSET)
             truck_stats = {
+                "detector": str(args.truck_detector),
+                "detector_mode": str(args.truck_detector_mode),
                 "checkpoint": str(args.truck_ckpt),
                 "final_detections": (result or {}).get("final_detections"),
                 "merge": (json.loads(diag_path.read_text(encoding="utf-8"))
