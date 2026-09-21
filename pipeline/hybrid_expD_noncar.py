@@ -11,7 +11,7 @@ from collections import defaultdict
 
 import numpy as np
 from pathlib import Path
-from typing import Any, Dict, List, Mapping
+from typing import Any, Dict, List, Mapping, Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -148,7 +148,10 @@ def _hard_config(*, sparsity_max_points: int,
                  # 【改动】范围过滤口径：前 60 / 后 20 / 左右 40
                  range_front: float = 60.0,
                  range_rear: float = 20.0,
-                 range_side: float = 40.0) -> HardFilterConfig:
+                 range_side: float = 40.0,
+                 # 【改动】2026-09-21 白名单参数化：新 Car 链复用这套后处理时传 ("Car",)；
+                 # 不传时仍是原来的非车白名单（卡车/VRU 链行为完全不变）。
+                 keep_classes: Sequence[str] | None = None) -> HardFilterConfig:
     fallback = 0.3 if score_threshold is None else float(score_threshold)
     defaults = {
         "Truck": 0.4,
@@ -176,7 +179,7 @@ def _hard_config(*, sparsity_max_points: int,
         visibility_min_ratio=float(visibility_min_ratio),
         pedestrian_max_distance=float(pedestrian_max_distance),
         nonmotorized_max_distance=float(nonmotorized_max_distance),
-        keep_classes=NON_CAR_CLASSES,
+        keep_classes=tuple(keep_classes) if keep_classes else NON_CAR_CLASSES,
     )
 
 
@@ -445,6 +448,7 @@ def run(raw_json: Path, clip: Path, out_json: Path,
             "enabled": False, "skipped": "pre_tracking_filters=False (tracks first, filters after)"}
 
     hard_config = _hard_config(
+        keep_classes=tuple(keep_classes),     # 【改动】见 _hard_config 说明
         range_front=range_front, range_rear=range_rear, range_side=range_side,
         sparsity_max_points=sparsity_max_points,
         visibility_min_ratio=visibility_min_ratio,
@@ -548,7 +552,9 @@ def run(raw_json: Path, clip: Path, out_json: Path,
         for frame in output for det in frame.get("detections", [])
         if tracking.canonical_class_name(det.get("class_name", "")) == "Car"
     ]
-    if leaked:
+    if leaked and "Car" not in [str(c) for c in keep_classes]:
+        # 【改动】2026-09-21：keep_classes 含 Car 时（新的 Car 链复用了这套后处理），
+        # Car 是预期输出，不再当作泄漏。
         raise AssertionError("expD non-Car route leaked Car detections")
     diagnostics["step2"] = json.loads(step2_diag.read_text(encoding="utf-8"))
     diagnostics["step2_5"] = json.loads(step2_5_diag.read_text(encoding="utf-8"))
