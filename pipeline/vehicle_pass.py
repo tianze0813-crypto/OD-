@@ -65,6 +65,7 @@ TRUCK_ID_OFFSET = 1000
 
 DEFAULTS: Dict[str, Any] = dict(
     # ---- 车链共用（Car / Truck）----
+    # 标注侧没有 Trailer：类别合并（跟踪前）之后，剩余纯挂车框在下一阶段直接并成 Truck
     keep_classes=("Car", "Truck"),
     class_score_thresholds={"Car": 0.2, "Truck": 0.2, "Trailer": 0.25},
     range_front=80.0,
@@ -98,6 +99,34 @@ def _count(frames: Sequence[Mapping[str, Any]]) -> int:
 
 def _class_of(det: Mapping[str, Any]) -> str:
     return tracking.canonical_class_name(det.get("class_name")) or ""
+
+
+_TRUCK_RAW = ("truck", "trailer", "bus", "construction_vehicle",
+              "engineering_vehicle")
+
+
+def _is_truck_family(det: Mapping[str, Any]) -> bool:
+    """卡车族：共享那遍与原始检测的类别归一可能不一致（Trailer/Truck），匹配时放宽。"""
+    if _class_of(det) in ("Truck", "Trailer"):
+        return True
+    return str(det.get("class_name", "")).strip().casefold() in _TRUCK_RAW
+
+
+def _fold_trailer_to_truck(frames: Sequence[Mapping[str, Any]]) -> int:
+    """把剩下的纯挂车框并成 Truck（标注侧没有 Trailer 类别）。
+
+    时机：类别合并（跟踪前）之后、类别白名单之前。挂车与货车的去重 / 并集合并仍由
+    ``merge_classes_pre`` 完成，这里只处理"没被任何货车罩住 / 相交"的剩余挂车框 ——
+    不并成 Truck 的话它们会被随后的类别白名单直接丢掉。
+    """
+    folded = 0
+    for frame in frames:
+        for det in frame.get("detections", []):
+            if (str(det.get("class_name", "")).strip().casefold() == "trailer"
+                    or _class_of(det) == "Trailer"):
+                det["class_name"] = "Truck"
+                folded += 1
+    return folded
 
 
 def _filter_classes(frames: Sequence[Mapping[str, Any]],
@@ -158,7 +187,11 @@ def restore_geometry(out_json: Path, raw_json: Path,
                 continue
             best = None
             for index, raw_det in enumerate(candidates):
-                if index in used or _class_of(raw_det) != _class_of(det):
+                if index in used:
+                    continue
+                same = (_class_of(raw_det) == _class_of(det)
+                        or _is_truck_family(raw_det))
+                if not same:
                     continue
                 raw_box = raw_det.get("box_lidar")
                 if not isinstance(raw_box, list) or len(raw_box) < 7:
@@ -297,6 +330,12 @@ def run(raw_json: Path, clip: Path, work_root: Path,
     else:
         diagnostics["truck_trailer_class_merge"] = {"enabled": False}
 
+    # ---- 1b) 剩余纯挂车框 -> Truck（标注侧没有 Trailer；时机仍在跟踪之前）----
+    folded_trailer = _fold_trailer_to_truck(frames)
+    diagnostics["trailer_fold_to_truck"] = {
+        "boxes": folded_trailer,
+        "policy": "类别合并之后、跟踪之前：剩余纯挂车框并成 Truck（标注侧无 Trailer）"}
+
     # ---- 2) 类别白名单（Bus 折进 Truck）+ 早期范围 / 分数过滤 ----
     diagnostics["class_filter"] = _noncar_filter(
         frames, keep_classes=tuple(params["keep_classes"]))
@@ -315,7 +354,7 @@ def run(raw_json: Path, clip: Path, work_root: Path,
         range_front=float(params["range_front"]),
         range_rear=float(params["range_rear"]),
         range_side=float(params["range_side"]),
-        keep_classes=tuple(params["keep_classes"]) + ("Trailer",))
+        keep_classes=tuple(params["keep_classes"]))
     diagnostics["early_class_score_filter"] = apply_category_score_filter(
         frames, score_config)
     vehicle_raw = work_root / f"{base}_vehicle_raw.json"

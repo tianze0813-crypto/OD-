@@ -9,7 +9,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from pipeline.vehicle_pass import (_filter_classes, _select_class,
+from pipeline.vehicle_pass import (_filter_classes, _fold_trailer_to_truck,
+                                   _is_truck_family, _select_class,
                                    restore_geometry)
 
 
@@ -47,6 +48,37 @@ class VehiclePassTest(unittest.TestCase):
         self.assertEqual(truck_view[0]["num_points"], 3)   # 其它字段保留
         car_view = _select_class(frames, "Car")
         self.assertEqual([d["track_id"] for d in car_view[0]["detections"]], [1])
+
+    def test_trailer_folds_into_truck(self):
+        frames = [{"frame_id": "1", "detections": [
+            _det("car", 1, (0, 0, 0, 4.6, 1.9, 1.5, 0)),
+            _det("Trailer", 2, (20, 0, 0, 9, 2.5, 3.2, 0)),
+            _det("trailer", 3, (40, 0, 0, 9, 2.5, 3.2, 0)),
+            _det("truck", 4, (60, 0, 0, 9, 2.5, 3.2, 0)),
+        ]}]
+        self.assertEqual(_fold_trailer_to_truck(frames), 2)
+        self.assertEqual([d["class_name"] for d in frames[0]["detections"]],
+                         ["car", "Truck", "Truck", "truck"])
+        self.assertTrue(_is_truck_family({"class_name": "trailer"}))
+        self.assertFalse(_is_truck_family({"class_name": "car"}))
+
+    def test_restore_geometry_matches_across_trailer_naming(self):
+        """共享那遍把 Trailer 写成 Truck 时，几何还原仍要匹配上。"""
+        raw = [{"frame_id": "1", "detections": [
+            _det("trailer", None, (20.0, 0.0, 0.0, 9.0, 2.5, 3.2, 0.10)),
+        ]}]
+        tracked = [{"frame_id": "1", "detections": [
+            _det("Truck", 2, (20.4, 0.1, 0.0, 8.4, 2.4, 3.0, -0.20)),
+        ]}]
+        with tempfile.TemporaryDirectory() as tmp:
+            raw_json = Path(tmp) / "raw.json"
+            out_json = Path(tmp) / "tracked.json"
+            raw_json.write_text(json.dumps(raw), encoding="utf-8")
+            out_json.write_text(json.dumps(tracked), encoding="utf-8")
+            report = restore_geometry(out_json, raw_json)
+            result = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertEqual(report, {"restored": 1, "unmatched": 0})
+        self.assertAlmostEqual(result[0]["detections"][0]["box_lidar"][0], 20.0)
 
     def test_restore_geometry_only_touches_non_car(self):
         raw = [{"frame_id": "1", "detections": [
