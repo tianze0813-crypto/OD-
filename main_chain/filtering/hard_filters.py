@@ -21,6 +21,9 @@ class HardFilterConfig:
     range_rear: float = 20.0
     range_side: float = 40.0
     sparsity_max_points: int = 10
+    # 【改动】2026-09-21 按类别的稀疏度门槛（点数 <= 该值就删）：
+    # 车链 Car 5 / Truck 10，与两条单链各自的行为对齐；未登记类别用 sparsity_max_points。
+    class_sparsity_max_points: Tuple[Tuple[str, int], ...] = ()
     visibility_min_ratio: float = 0.05
     visibility_occlusion_tolerance: float = 0.3
     pedestrian_max_distance: float = 20.0
@@ -28,6 +31,14 @@ class HardFilterConfig:
         "Vehicle", "Car", "Truck", "Pedestrian", "Cyclist"
     )
     diagnostic_examples_per_reason: int = 30
+
+
+def _sparsity_threshold_for(config: "HardFilterConfig",
+                            class_name: Any) -> int:
+    """【改动】按（归一）类别取稀疏度门槛。"""
+    canonical = tracking.canonical_class_name(class_name)
+    table = {str(k): int(v) for k, v in config.class_sparsity_max_points}
+    return int(table.get(canonical or "", config.sparsity_max_points))
 
 
 def _load_lidar_xyz(clip: Path, frame_id: str) -> np.ndarray:
@@ -139,7 +150,10 @@ def apply_hard_filters(frames: List[Dict[str, Any]], clip: Path,
                         and math.hypot(float(box[0]), float(box[1]))
                         > config.pedestrian_max_distance):
                     reasons.append("distant_pedestrian")
-                if point_count_by_index[detection_index] <= config.sparsity_max_points:
+                if (point_count_by_index[detection_index]
+                        <= _sparsity_threshold_for(
+                            config,
+                            detections[detection_index].get("class_name"))):
                     reasons.append("sparse_points")
                 if (float(det.get("visibility", {}).get("ratio", 0.0))
                         <= config.visibility_min_ratio):
@@ -175,6 +189,7 @@ def apply_hard_filters(frames: List[Dict[str, Any]], clip: Path,
             "range_rear": config.range_rear,
             "range_side": config.range_side,
             "sparsity_drop_at_or_below": config.sparsity_max_points,
+            "sparsity_by_class": dict(config.class_sparsity_max_points),
             "visibility_drop_at_or_below": config.visibility_min_ratio,
             "pedestrian_max_distance": config.pedestrian_max_distance,
             "keep_classes": list(config.keep_classes),

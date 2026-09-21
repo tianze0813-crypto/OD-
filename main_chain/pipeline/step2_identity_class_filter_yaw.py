@@ -8,7 +8,7 @@ import copy
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -65,7 +65,9 @@ def run(
         hard_filter_config: HardFilterConfig = HardFilterConfig(),
         class_config: ClassRefinementConfig = ClassRefinementConfig(),
         min_lifecycle: int = 4,
-        same_center_gate: float = 0.35) -> Dict[str, Any]:
+        same_center_gate: float = 0.35,
+        # 【改动】2026-09-21 车链：按类别的短轨迹门槛（Car 3 / Truck 4）
+        class_min_lifecycle: Optional[Mapping[str, int]] = None) -> Dict[str, Any]:
     source = json.loads(Path(in_json).read_text(encoding="utf-8"))
     if not isinstance(source, list):
         raise ValueError(f"input must be a list of frames: {in_json}")
@@ -133,7 +135,8 @@ def run(
         tracked, static_track_ids=static_track_ids,
         center_gate=same_center_gate)
     diagnostics["short_track_filter"] = tracking.apply_post_filters(
-        tracked, min_lifecycle=min_lifecycle)
+        tracked, min_lifecycle=min_lifecycle,
+        class_min_lifecycle=class_min_lifecycle)      # 【改动】按类别
     pre_static_yaw = copy.deepcopy(tracked)
     diagnostics["static_yaw_stabilization"] = stabilize_static_yaw(
         tracked, coords, tracker.slots,

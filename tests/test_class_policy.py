@@ -5,6 +5,7 @@ import importlib.util
 import unittest
 from pathlib import Path
 
+from geometry.truck_trailer_rules import merge_classes_pre
 from pipeline.hybrid_expD_truck import DEFAULTS as TRUCK_DEFAULTS
 from tracking import tracker_conservative as tracking
 
@@ -37,6 +38,27 @@ class ClassPolicyTest(unittest.TestCase):
     def test_trailer_policy_defaults_to_to_truck(self):
         # 标注侧没有 Trailer 类别 -> 一律并成 Truck
         self.assertEqual(TRUCK_DEFAULTS["trailer_policy"], "to-truck")
+
+    def test_class_merge_can_keep_car(self):
+        frames = [{"frame_id": "1", "detections": [
+            {"class_name": "car", "score": 0.9,
+             "box_lidar": [0.0, 0.0, 0.0, 4.6, 1.9, 1.5, 0.0]},
+            {"class_name": "truck", "score": 0.9,
+             "box_lidar": [20.0, 0.0, 0.0, 9.0, 2.5, 3.2, 0.0]},
+            {"class_name": "construction_vehicle", "score": 0.9,
+             "box_lidar": [40.0, 0.0, 0.0, 7.0, 2.5, 3.0, 0.0]},
+            {"class_name": "traffic_cone", "score": 0.9,
+             "box_lidar": [5.0, 5.0, 0.0, 0.5, 0.5, 0.8, 0.0]},
+        ]}]
+        # 单链行为：只留 Truck/Trailer（工程车在这个入口就被丢掉）
+        kept, _ = merge_classes_pre(frames)
+        self.assertEqual(sorted(d["class_name"] for d in kept[0]["detections"]),
+                         ["Truck"])
+        # 车链：Car 保留，工程车归一成 Truck
+        kept, report = merge_classes_pre(frames, keep_other_classes=True)
+        names = sorted(d["class_name"] for d in kept[0]["detections"])
+        self.assertEqual(names, ["Car", "Truck", "Truck", "traffic_cone"])
+        self.assertTrue(report["keep_other_classes"])
 
     def test_car_covered_by_truck_is_not_dropped(self):
         car = _label(1, "Car", (0.0, 0.0, 0.0, 4.6, 1.9, 1.5, 0.0))

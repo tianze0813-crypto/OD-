@@ -912,27 +912,44 @@ class ConservativeTracker:
         return output, self.diagnostics
 
 
-def apply_post_filters(frames: List[Dict[str, Any]], min_lifecycle: int = 4) -> Dict[str, Any]:
+def apply_post_filters(
+        frames: List[Dict[str, Any]], min_lifecycle: int = 4,
+        class_min_lifecycle: Optional[Mapping[str, int]] = None,
+) -> Dict[str, Any]:
     """Apply only the agreed hard filter after association.
 
     ``<= min_lifecycle`` means number of distinct observed frames, not number
     of detections. No interpolation, box smoothing, or geometry filtering is
     performed here; those are intentionally separate future policies.
+
+    【改动】2026-09-21 ``class_min_lifecycle``：按轨迹（归一）类别取门槛，
+    车链 Car 3 / Truck 4 各自与单链行为对齐；未登记类别用 ``min_lifecycle``。
     """
     by_id: Dict[int, set] = {}
+    class_by_id: Dict[int, str] = {}
     for frame in frames:
         for det in frame.get("detections", []):
             tid = det.get("track_id")
             if tid is not None:
                 by_id.setdefault(int(tid), set()).add(int(frame["frame_id"]))
-    dropped = {tid for tid, ids in by_id.items() if len(ids) <= int(min_lifecycle)}
+                class_by_id.setdefault(
+                    int(tid), canonical_class_name(det.get("class_name")) or "")
+    table = {str(k): int(v) for k, v in dict(class_min_lifecycle or {}).items()}
+
+    def threshold_for(track_id: int) -> int:
+        return int(table.get(class_by_id.get(track_id, ""), min_lifecycle))
+
+    dropped = {tid for tid, ids in by_id.items()
+               if len(ids) <= threshold_for(tid)}
     removed = 0
     for frame in frames:
         old = frame.get("detections", [])
         frame["detections"] = [d for d in old if d.get("track_id") not in dropped]
         removed += len(old) - len(frame["detections"])
         frame["num_detections"] = len(frame["detections"])
-    return {"min_lifecycle": int(min_lifecycle), "tracks_before": len(by_id),
+    return {"min_lifecycle": int(min_lifecycle),
+            "min_lifecycle_by_class": dict(table),
+            "tracks_before": len(by_id),
             "tracks_dropped": len(dropped), "boxes_removed": removed,
             "dropped_track_ids": sorted(dropped)}
 

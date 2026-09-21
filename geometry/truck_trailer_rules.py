@@ -67,8 +67,14 @@ def merge_classes_pre(frames: Sequence[Mapping[str, Any]],
                       dup_iou: float = DEFAULTS["trailer_dup_iou"],
                       merge_iou: float = DEFAULTS["trailer_merge_iou"],
                       max_iter: int = DEFAULTS["trailer_merge_max_iter"],
+                      keep_other_classes: bool = False,
                       ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """跟踪之前的类别合并：类名归一 + 挂车去重 + 有交集并集成大长 Truck。"""
+    """跟踪之前的类别合并：类名归一 + 挂车去重 + 有交集并集成大长 Truck。
+
+    【改动】2026-09-21 车链（Car+Truck 合并后处理）用 ``keep_other_classes=True``：
+    非货车/挂车的检测（Car 等）原样保留，类名按 CLASS_MAP 归一
+    （construction_vehicle -> Truck 会一并参与挂车合并），不再被丢掉。
+    默认 False = 原 Truck 单链行为（其它类丢掉）。"""
     from geometry.truck_postprocess import _union_box
 
     output: List[Dict[str, Any]] = []
@@ -79,8 +85,13 @@ def merge_classes_pre(frames: Sequence[Mapping[str, Any]],
         for det in frame.get("detections", []):
             cls = normalize_class(det.get("class_name", ""))
             if cls is None:
-                stats["dropped_unrelated_class"] += 1
-                continue
+                if not keep_other_classes:
+                    stats["dropped_unrelated_class"] += 1
+                    continue
+                # 车链：其它类别（Car/工程车…）保留，类名归一后继续走后面的规则
+                canonical = tracking.canonical_class_name(det.get("class_name", ""))
+                cls = canonical or str(det.get("class_name", "")).strip()
+                stats["kept_other_class"] += 1
             item = dict(det)
             item["class_name"] = cls
             dets.append(item)
@@ -137,6 +148,7 @@ def merge_classes_pre(frames: Sequence[Mapping[str, Any]],
                    "(score = max)" % (dup_iom, dup_iou, merge_iou)),
         "thresholds": {"dup_iom": float(dup_iom), "dup_iou": float(dup_iou),
                        "merge_iou": float(merge_iou)},
+        "keep_other_classes": bool(keep_other_classes),
         "counts": dict(sorted(stats.items())),
         "merged_total": len(merges),
         "merged_examples": merges[:20],
