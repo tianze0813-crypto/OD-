@@ -87,6 +87,13 @@ DEFAULTS: Dict[str, Any] = dict(
     dynamic_occlusion_max_gap=3.0,
     lateral_jump_gate=True,
     static_anchor_min_hits=6,
+    # 【改动】2026-09-21 方案B（用户要求「照搬 Car 的跟踪逻辑」）：跟踪这一遍用
+    # main_chain 的 step2 + step4.5，插在本链 step2_5（类别修正）/ step3（卡车几何 +
+    # yaw v2）之前 —— main_chain 只负责 id，几何与 yaw 仍由本链精修定稿。
+    # 实测 5 clip：轨迹 118→56、多 id 物理对象 17→6（方案A 只有 116/17）。
+    step2_impl="car",
+    car_step2_keep_classes="Truck",
+    car_step2_score_threshold=0.2,
     # 【改动】跳过静态 yaw 稳定（不把静止段 yaw 锁到停车方向）
     static_yaw_enabled=False,
     # 【改动】yaw v2 开关：关静态方向投票；直线行驶的轨迹用运动方向作 yaw

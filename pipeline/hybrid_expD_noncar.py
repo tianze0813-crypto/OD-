@@ -387,6 +387,13 @@ def run(raw_json: Path, clip: Path, out_json: Path,
         dynamic_occlusion_max_gap: float = 0.0,
         lateral_jump_gate: bool = False,
         static_anchor_min_hits: int = 10 ** 9,
+        # 【改动】2026-09-21 方案B（用户要求）：跟踪这一遍直接照搬 Car 链 ——
+        # step2_impl="car" 时不再用本仓的 step2_identity，而是调 main_chain 的
+        # step2（类过滤+跟踪+静态 yaw）+ step4.5（动态区域重跟踪 / ID 继承 / 相位拼接），
+        # 再把结果当成后续 step2_5 / step3（卡车几何 + yaw v2）的输入。
+        step2_impl: str = "hybrid",
+        car_step2_keep_classes: str = "Truck",
+        car_step2_score_threshold: float = 0.2,
         static_yaw_enabled: bool = True,
         # 【改动】2026-09-20 透传 step2_5 的「静止旋转轨迹整条删除」开关。
         # 默认 True（Car/VRU 链行为完全不变）；只有 Truck 链传 False —— 见 hybrid_expD_truck.py。
@@ -459,15 +466,37 @@ def run(raw_json: Path, clip: Path, out_json: Path,
         encoding="utf-8")
     step2_json = work_root / (Path(out_json).stem + "_step2.json")
     step2_diag = work_root / (Path(out_json).stem + "_step2_diagnostics.json")
-    step2_identity.run(
-        filtered_input, Path(clip), step2_json,
-        diagnostics_path=step2_diag,
-        hard_filter_config=hard_config,
-        disable_slot_binding=bool(disable_slot_binding),   # 【改动】
-        dynamic_occlusion_max_gap=float(dynamic_occlusion_max_gap),   # 【改动】方案A
-        lateral_jump_gate=bool(lateral_jump_gate),                    # 【改动】方案A
-        static_anchor_min_hits=int(static_anchor_min_hits),           # 【改动】方案A
-    )
+    if str(step2_impl).lower() == "car":      # 【改动】方案B：照搬 Car 链跟踪栈
+        from pipeline import truck_car_tracking
+        import shutil as _shutil
+        import sys as _sys
+        step45_json = truck_car_tracking.run(
+            filtered_input, Path(clip), work_root / "car_tracking",
+            Path(_sys.executable),
+            keep_classes=str(car_step2_keep_classes),
+            score_threshold=float(car_step2_score_threshold),
+            min_lifecycle=int(short_track_max_frames))
+        _shutil.copy(step45_json, step2_json)
+        step45_diag = step45_json.with_name(
+            step45_json.name.replace("_step45.json", "_step45_diagnostics.json"))
+        if step45_diag.is_file():
+            _shutil.copy(step45_diag, step2_diag)
+        diagnostics["car_tracking_step2"] = {
+            "impl": "main_chain step2 + step4.5",
+            "step45_json": str(step45_json),
+            "keep_classes": str(car_step2_keep_classes),
+            "score_threshold": float(car_step2_score_threshold),
+        }
+    else:
+        step2_identity.run(
+            filtered_input, Path(clip), step2_json,
+            diagnostics_path=step2_diag,
+            hard_filter_config=hard_config,
+            disable_slot_binding=bool(disable_slot_binding),   # 【改动】
+            dynamic_occlusion_max_gap=float(dynamic_occlusion_max_gap),   # 【改动】方案A
+            lateral_jump_gate=bool(lateral_jump_gate),                    # 【改动】方案A
+            static_anchor_min_hits=int(static_anchor_min_hits),           # 【改动】方案A
+        )
 
     step2_5_json = work_root / (Path(out_json).stem + "_step2_5.json")
     step2_5_diag = work_root / (Path(out_json).stem + "_step2_5_diagnostics.json")
