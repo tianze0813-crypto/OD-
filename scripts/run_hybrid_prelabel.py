@@ -838,7 +838,9 @@ def main() -> int:
     parser.add_argument("--truck-raw-threshold", type=float, default=0.1)
     # 【改动】2026-09-20 Truck 链检测器（BEVFusion / 旧 VoxelNeXt）与货车/挂车规则
     parser.add_argument("--include-pre", action="store_true",
-                        help="允许把已经预标过的 <clip>_pre 也当输入（换检测器重跑用）")
+                        help="把已经预标过的 <clip>_pre 也收进来：配 --in-place 时**就地覆盖重跑**"
+                             "（不改名、不会生成 <clip>_pre_pre）；不加则跳过所有 *_pre。"
+                             "注意 X 与 X_pre 同时存在时只跑 X_pre")
     parser.add_argument("--car-pipeline", choices=["main_chain", "hybrid"], default="main_chain",
                         help="Car 走哪条链：main_chain（Waymo Car + Step4.5，默认）"
                              "或 hybrid（pipeline/hybrid_expD_car.py：只做通用后处理）")
