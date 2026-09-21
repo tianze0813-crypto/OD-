@@ -202,9 +202,11 @@ def main() -> None:
     parser.add_argument("--id-offset", type=int, default=ID_OFFSET)
     parser.add_argument("--no-export", action="store_true")
     # 【改动】2026-09-20 BEVFusion 检测器 + 货车/挂车规则参数
-    parser.add_argument("--detector", choices=["bevfusion", "voxelnext"], default="bevfusion",
+    parser.add_argument("--detector", choices=["bevfusion", "voxelnext", "raw"],
+                        default="bevfusion",
                         help="bevfusion: 先用 pipeline/step1_bevfusion_truck.py 出 raw json；"
-                             "voxelnext: 用外部传入的 --raw-json（旧流程）")
+                             "raw: 直接用外部传入的 --raw-json（检测器已由别处跑好）；"
+                             "voxelnext: 旧 VoxelNeXt truckB 权重（保留兼容）")
     parser.add_argument("--truck-cfg", type=Path, default=None,
                         help="BEVFusion 配置（默认取 BEVFUSION_TRUCK_CFG 或工程内置默认）")
     parser.add_argument("--truck-ckpt", type=Path, default=None)
@@ -249,7 +251,7 @@ def main() -> None:
         raw_json = bf.run_inference(Path(args.clip).resolve(), bf_args)
         print(">> BEVFusion raw json: %s" % raw_json)
     elif raw_json is None:
-        parser.error("--detector voxelnext 时必须给 --raw-json")
+        parser.error("--detector raw/voxelnext 时必须给 --raw-json")
 
     diag = run(raw_json, args.clip, args.out_json, args.diagnostics,
                class_score_thresholds={"Truck": float(args.truck_score_threshold),
