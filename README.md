@@ -5,12 +5,20 @@
 
 ## 常用命令（就这三条）
 
+> **默认都带 `--include-pre`**：已经是 `<clip>_pre` 的（即已标注过的）也会一起**就地覆盖重跑**，
+> 不会生成 `<clip>_pre_pre`。**想去掉就把 `--include-pre` 删掉** —— 那样会跳过所有 `*_pre`，
+> 只跑还没标注过的 clip（新 clip 第一次跑用这种）。
+
 ```bash
 # 1) 单条 clip：原地跑（原目录改名成 <clip>_pre，标签写在里面）
+#    传进来的目录本身带 _pre 时 = 就地覆盖重跑（要加 --overwrite）
 bash hybrid_run.sh /media/moga/police/scene_001_crossroad_my_record_20260914_141401_clip4 --in-place --overwrite
+bash hybrid_run.sh /media/moga/police/scene_001_crossroad_my_record_20260914_141401_clip4_pre --in-place --overwrite
 
-# 2) 一批 clip：父目录下直接是各个 clip（自动收集，跳过 *_pre 与 lost+found）
-bash hybrid_run.sh /media/moga/police --in-place --overwrite
+# 2) 一批 clip：父目录下直接是各个 clip（带 --include-pre：已标注的也重跑）
+bash hybrid_run.sh /media/moga/police --in-place --overwrite --include-pre
+#    只跑新 clip（跳过已标注的）= 把 --include-pre 去掉：
+#    bash hybrid_run.sh /media/moga/police --in-place --overwrite
 
 # 3) 分场景 / step2 的嵌套结构（<scene>/step2/<clip>）：逐层遍历
 DATA_ROOT=/media/moga/GEN2/0915
@@ -18,8 +26,9 @@ for scene in "$DATA_ROOT"/*/; do
   for clip in "${scene%/}"/step2/scene_*clip*/; do
     clip="${clip%/}"; name="$(basename "$clip")"
     [ -d "$clip/lidar/lidar_top" ] || continue     # 不是 clip 就跳过
-    [[ "$name" == *_pre ]] && continue             # 已标注的跳过
-    bash hybrid_run.sh "$clip" --in-place --overwrite
+    bash hybrid_run.sh "$clip" --in-place --overwrite --include-pre
+    # 只想跑新 clip：把上面一行的 --include-pre 去掉，并把下面这行注释解开
+    # [[ "$name" == *_pre ]] && continue
   done
 done
 ```
@@ -40,8 +49,10 @@ done
 三点注意：
 
 1. 权重是 git-lfs 指针，首次先 `git lfs pull`。
-2. `--in-place` 会把原目录改名成 `<clip>_pre`（原路径不再存在）；已标注的 `*_pre` 不会被重复处理，
-   要重跑就改回不带 `_pre` 的名字，或者加 `--include-pre`（会就地覆盖，不会生成 `*_pre_pre`）。
+2. `--in-place` 会把原目录改名成 `<clip>_pre`（原路径不再存在）。
+   `--include-pre`（**默认建议带**）会把已是 `*_pre` 的也收进来**就地覆盖重跑**；
+   **去掉它**就跳过所有 `*_pre`，只跑新 clip。另外，若 `X` 与 `X_pre` 同时存在，只跑 `X_pre`
+   （先跑 `X` 会把它改名并删掉已有的 `X_pre`）。
 3. **同一时间只跑一个批跑**：BEVFusion 的预处理缓存（`bevfusion/work/infos/`、`bevfusion/data/police/<clip>/`）
    是共享的，两个进程同时跑会互相抢。现在每个 clip 有独立的 `<clip>_infos.pkl`、且拿不到帧会**直接报错停下**
    （不会再像以前那样安静地输出 0 帧、最后得到一份「只有行人/非机动车」的半成品），但仍别并行跑。
@@ -114,6 +125,7 @@ done
 | 10 | 车链拿到空输入（0 帧 / 0 框）**直接报错停下** | `pipeline/vehicle_pass.py` + `main_chain/pipeline/step_vehicle_chain.py`，不会再产半成品 |
 | 11 | BEVFusion 的 infos 改成 **per-clip 文件 + 聚合文件按 clip 合并** | 以前是所有 clip 共用一个聚合文件、每次整体重写：两个进程（或交错跑不同 clip）互相覆盖就静默出 0 帧 |
 | 12 | 产出目录**不再写**过程数据 | `vehicle_pass_diagnostics.json` 要加 `--keep-vehicle-diagnostics` 才写（`label_car/label_truck/label_vru` 仍是 `--keep-chain-labels` 控制） |
+| 13 | `*_pre`（已标注）可以被**就地覆盖重跑** | `--include-pre` 收集 + 同名就地写（不再生成 `*_pre_pre`，也不会误删输入）；不加则照旧跳过 |
 
 
 ## 车链（Car + Truck 合并后处理）
@@ -221,8 +233,8 @@ face-visibility 拟合把可见点簇边缘当成了"面"）。需要时改 `Tru
 - 缓存**自足**：标定是复制（不是软链），所以即使源 clip 被改过名，也能从缓存重建 infos；
   但 `--clip` 指向的源路径本身仍要存在才能重新预处理。
 - **`--in-place` 会把源 clip 改名成 `<clip>_pre`**（标签写在里面），这是该模式的预期行为：
-  下次批跑收集时会跳过 `*_pre`，所以**已标注的 clip 不会被重复处理**；
-  若要重跑某条，把它改回不带 `_pre` 的名字即可（或直接对 `<clip>_pre` 用 `--chains truck` 重跑，
+  批跑默认会**跳过** `*_pre`（= 已标注的不会被重复处理）；加了 `--include-pre` 就会把它们
+  一并就地覆盖重跑（推荐再跑一遍时用这个）。想只重跑某一条，也可以直接对 `<clip>_pre` 单条跑（
   因为缓存还在，只需重新推理+后处理）。
 
 ### 依赖（BEVFusion 相关）
@@ -270,7 +282,8 @@ face-visibility 拟合把可见点簇边缘当成了"面"）。需要时改 `Tru
 ## 批量收集规则（对应顶部第 2、3 条命令）
 
 - **一个大目录下直接是 clip**：`hybrid_run.sh <父目录>` 会自动收集逐个处理；
-  跳过 `*_pre`（已标注）、`lost+found`、没有 `lidar/lidar_top/*.bin` 的目录。
+  默认跳过 `*_pre`（已标注）、`lost+found`、没有 `lidar/lidar_top/*.bin` 的目录；
+  加 `--include-pre` 就把 `*_pre` 也收进来（就地覆盖重跑）。
 - **分场景 / step2 的嵌套结构**（`<scene>/step2/<clip>/`）：需要 shell 逐层遍历，
   命令见顶部第 3 条。
 - `--in-place` 把每个 clip 就地改名成 `<clip>_pre`；想跳过 SUST 里已有输出的，可以在循环里加
@@ -538,7 +551,7 @@ cd main_chain && ~/miniconda3/envs/openpcdet/bin/python -m unittest discover -s 
 ```
 
 常见问题：权重只有 133 字节 → `git lfs pull`；`<clip>` 不见了 → `--in-place` 已改名成
-`<clip>_pre`；已标注的 `*_pre` 不会被重复处理（要重跑就改回不带 `_pre` 的名字）。
+`<clip>_pre`；想连已标注的一起重跑 → 加 `--include-pre`（不加则跳过 `*_pre`）。
 
 
 
