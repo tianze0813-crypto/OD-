@@ -367,8 +367,13 @@ def apply_yaw_vehicle_dynamic(
             tid = int(tid)
             target = static_targets.get(tid)
             mode = None
+            # 【修·2026-09-21】驶离停车位（超过 cutoff）之后不能再拿静止方向锁 yaw：
+            # 旧代码在这种情况下 target 仍非空、但 mode 保持 None -> 既把停车方向写进 yaw，
+            # 又让诊断 boxes_by_mode 出现 None 键（与字符串键混排时 sorted() 直接 TypeError）。
+            if (target is not None and timestamp >= cutoffs.get(tid, math.inf)):
+                target = None
             # 【改动】apply_static_direction_vote=False 时不把静止段 yaw 锁到停车方向
-            if (target is not None and timestamp < cutoffs.get(tid, math.inf)
+            if (target is not None
                     and getattr(config, "apply_static_direction_vote", True)):
                 mode = "static_direction_vote"
             elif target is None or not getattr(
@@ -404,7 +409,8 @@ def apply_yaw_vehicle_dynamic(
                 + ["keep_original"]                                  # 【改动】删掉静止点云主轴
             ),
         },
-        "boxes_by_mode": dict(sorted(counts.items())),
+        "boxes_by_mode": dict(sorted(counts.items(),
+                                    key=lambda kv: str(kv[0]))),
         "static": {"tracks": len(static_details), "details": static_details},
         "motion": {"tracks": len(motion_details), "details": motion_details},
         # 【改动】2026-09-20 规则已删除，这里保留一条显式记录便于排查（旧日志里
