@@ -29,11 +29,13 @@ if str(ROOT) not in sys.path:
 
 from filtering import camera_visibility  # noqa: E402
 
-_DEFAULT_BEVFUSION_ROOT = ROOT.parent / "OD--hybrid-main-car-expd-noncar" / "bevfusion"
-
-
 def _bevfusion_root() -> Path:
-    for cand in (os.environ.get("BEVFUSION_ROOT"), _DEFAULT_BEVFUSION_ROOT):
+    """工具箱位置：环境变量优先，其次按常见布局猜（本仓库旁边 / 上级目录 / 本级）。"""
+    candidates = [os.environ.get("BEVFUSION_ROOT"),
+                  ROOT.parent / "OD--hybrid-main-car-expd-noncar" / "bevfusion",
+                  ROOT.parent / "bevfusion",
+                  ROOT / "bevfusion"]
+    for cand in candidates:
         if cand and (Path(cand) / "scripts" / "infer_mmdet3d.py").is_file():
             return Path(cand)
     raise SystemExit("找不到 BEVFusion 工具箱：设 BEVFUSION_ROOT 指向含 scripts/infer_mmdet3d.py 的目录")
