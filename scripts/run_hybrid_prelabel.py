@@ -110,6 +110,16 @@ def _collect_clips(input_root: Path, include_pre: bool = False) -> List[Path]:
     if not clips:
         raise RuntimeError(
             f"no raw clips found under {input_root}; expected lidar/lidar_top/*.bin")
+    # 【改动】--include-pre 时如果同时存在 X 与 X_pre，只跑 X_pre（重复跑 X 会先把 X_pre 删掉）
+    if include_pre:
+        pre_names = {path.name for path in clips if path.name.endswith("_pre")}
+        dropped = [path for path in clips
+                   if not path.name.endswith("_pre")
+                   and f"{path.name}_pre" in pre_names]
+        if dropped:
+            _print("--include-pre：以下 clip 已有 *_pre 版本，跳过 "
+                   + ", ".join(path.name for path in dropped))
+            clips = [path for path in clips if path not in dropped]
     names = [path.name for path in clips]
     if len(names) != len(set(names)):
         raise RuntimeError("duplicate clip names in input batch")
@@ -448,7 +458,9 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
              car_truck_cover_threshold: float = 0.5,
              # 【改动】2026-09-21 Car+Truck 合并成一条后处理（共享动静态区域）；
              # --no-car-truck-merged 可回退到原来的两条链，方便 A/B。
-             car_truck_merged: bool = True) -> Dict[str, Any]:
+             car_truck_merged: bool = True,
+             # 【改动】车链过程诊断（槽位/动态区域/…）默认不落盘；调试时才写进输出目录
+             keep_vehicle_diagnostics: bool = False) -> Dict[str, Any]:
     base = clip.name
     tag = output_tag.strip("_-")
     if output_suffix:                       # 【改动】<clip名><后缀>，例如 ..._clip4_pre_bev
@@ -456,13 +468,21 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
     else:
         output_name = f"{base}_{tag}_pre" if tag else f"{base}_pre"
     destination: Path | None = None
+    # 【改动】重跑已标注的 clip（名字本身就是目标输出名，例如 *_pre）：就地覆盖，不改名、
+    # 更不能 rmtree 输入目录（否则把输入删了）。`--include-pre` 收进来的就是这种。
+    rerun_in_place = bool(in_place and output_name == base)
     if in_place:
-        destination = clip.parent / output_name
-        if destination.exists():
+        destination = clip if rerun_in_place else clip.parent / output_name
+        if not rerun_in_place and destination.exists():
             if not overwrite:
                 raise RuntimeError(
                     f"output exists, pass --overwrite: {destination}")
             shutil.rmtree(destination)
+        elif rerun_in_place and not overwrite:
+            raise RuntimeError(
+                f"重跑已标注的 clip 要带 --overwrite（会覆盖 {clip}/label）: {clip}")
+        if rerun_in_place:
+            _print(f"{base}: 就地重跑（已标注，覆盖 label/ 与分链标签）")
     elif export_sust:
         destination = output_root / output_name
         if destination.exists():
@@ -519,10 +539,10 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
             if bev_raw is None:
                 bev_raw = _run_raw_bevfusion(python, clip, work / "bev_raw",
                                              bev_raw_threshold, truck_detector_mode)
-            vehicle_diag = work / "vehicle_diagnostics.json"
             vehicle = run_vehicle_pass(
                 bev_raw, clip, work / "vehicle", python,
-                diagnostics_path=vehicle_diag,
+                diagnostics_path=(work / "vehicle_diagnostics.json"
+                                  if keep_vehicle_diagnostics else None),
                 trailer_rules=bool(trailer_rules),
                 trailer_dup_iom=float(trailer_dup_iom),
                 trailer_dup_iou=float(trailer_dup_iou),
@@ -710,6 +730,9 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
             if src.exists():
                 (destination / sub).symlink_to(src.resolve())
         labels = _write_labels(merged, destination)
+    elif in_place and rerun_in_place:
+        # 重跑已标注的 clip：目录名不变，只把 label/ 整个重写（_write_labels 会先 rmtree）
+        labels = _write_labels(merged, destination)
     elif in_place:
         # 端到端原地模式：把输入 clip 改名为 <clip>_pre，再把标签写进去，
         # 不额外保留一份 raw，也不往 SUST 拷贝。
@@ -740,8 +763,9 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
     _print(f"{base}: 计时 " + ", ".join(
         f"{key}={value}s" for key, value in timings.items()))
     # 【改动】车链诊断写到输出目录（临时 work 目录结束后会被删，批跑时就看不到了）
-    if vehicle_diag_data is not None and destination is not None \
-            and destination.exists():
+    # 【改动】过程数据默认不写进产出目录；--keep-vehicle-diagnostics 才留（调试用）
+    if (keep_vehicle_diagnostics and vehicle_diag_data is not None
+            and destination is not None and destination.exists()):
         (destination / "vehicle_pass_diagnostics.json").write_text(
             json.dumps(vehicle_diag_data, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8")
@@ -752,6 +776,8 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
             if not items:
                 continue
             target = destination / subdir
+            if target.exists():      # 【改动】重跑时先清掉上一轮的分链标签
+                shutil.rmtree(target)
             target.mkdir(parents=True, exist_ok=True)
             for frame_id, frame_labels in items.items():
                 (target / f"{frame_id}.json").write_text(
@@ -845,6 +871,9 @@ def main() -> int:
     parser.add_argument("--trailer-dup-iom", type=float, default=0.70)
     parser.add_argument("--trailer-dup-iou", type=float, default=0.50)
     parser.add_argument("--trailer-merge-iou", type=float, default=0.05)
+    parser.add_argument("--keep-vehicle-diagnostics", action="store_true",
+                        help="【改动】把车链过程诊断 vehicle_pass_diagnostics.json 写进输出 clip"
+                             "（默认不写，只调试用）")
     parser.add_argument("--no-car-truck-merged", dest="car_truck_merged",
                         action="store_false",
                         help="【改动】回退到原来的 Car / Truck 两条独立链（A/B 对比用）；"
@@ -1029,6 +1058,7 @@ def main() -> int:
             trailer_merge_iou=args.trailer_merge_iou,
             trailer_policy=args.trailer_policy,
             car_truck_merged=bool(args.car_truck_merged),
+            keep_vehicle_diagnostics=bool(args.keep_vehicle_diagnostics),
             vru_cfg=vru_cfg,
             vru_ckpt=vru_ckpt,
             vru_raw_threshold=args.vru_raw_threshold,

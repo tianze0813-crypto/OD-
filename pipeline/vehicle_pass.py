@@ -350,6 +350,17 @@ def run(raw_json: Path, clip: Path, work_root: Path,
     source = json.loads(raw_json.read_text(encoding="utf-8"))
     if not isinstance(source, list):
         raise ValueError(f"raw json 必须是帧列表：{raw_json}")
+    # 【改动】空输入硬失败：BEVFusion 那边一旦返回 0 帧（例如 infos 被并发覆盖，
+    # 见 bevfusion/scripts/infer_mmdet3d.py 里的检查），车链在这里立刻停，
+    # 绝不会再往下产出一份「只有 VRU 标签」的半成品。
+    if not source:
+        raise RuntimeError(
+            f"BEVFusion 原始检测是空的（0 帧）：{raw_json} —— 检查该 clip 的 BEV 推理日志，"
+            f"串行重跑这个 clip（infos 可能被另一个并发进程覆盖过）")
+    if _count(source) == 0:
+        raise RuntimeError(
+            f"BEVFusion 原始检测里没有任何框（{len(source)} 帧 / 0 框）：{raw_json} —— "
+            f"raw 阈值 0.1 下这通常意味着推理没真正跑到该 clip，串行重跑确认")
     diagnostics: Dict[str, Any] = {
         "pipeline": "vehicle_pass",
         "clip": str(clip.resolve()),
@@ -464,10 +475,13 @@ def run(raw_json: Path, clip: Path, work_root: Path,
     diagnostics["params"] = {key: (list(value) if isinstance(value, tuple) else value)
                              for key, value in params.items()}
 
-    target = Path(diagnostics_path or work_root / "vehicle_pass_diagnostics.json")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(diagnostics, ensure_ascii=False, indent=2) + "\n",
-                      encoding="utf-8")
+    # 【改动】过程数据默认不落盘（最终产出目录里不要 vehicle_pass_diagnostics.json）；
+    # 调试时显式传 --diagnostics/ diagnostics_path 才写。
+    if diagnostics_path is not None:
+        target = Path(diagnostics_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(diagnostics, ensure_ascii=False, indent=2) + "\n",
+                          encoding="utf-8")
     return {"car_frames": car_frames, "truck_frames": truck_frames,
             "diagnostics": diagnostics,
             "car_json": str(car_json),
@@ -506,7 +520,9 @@ def main() -> None:
     parser.add_argument("--clip", type=Path, required=True)
     parser.add_argument("--work-root", type=Path, required=True)
     parser.add_argument("--python", type=Path, default=None)
-    parser.add_argument("--diagnostics", type=Path, default=None)
+    parser.add_argument("--diagnostics", type=Path, default=None,
+                        help="【改动】过程诊断写到哪（默认不写；批跑里由 "
+                             "--keep-vehicle-diagnostics 控制）")
     parser.add_argument("--export", action="store_true",
                         help="把 Car/Truck 分别写到 <clip>/label_car、label_truck")
     parser.add_argument("--trailer-policy", choices=["keep", "to-truck"],

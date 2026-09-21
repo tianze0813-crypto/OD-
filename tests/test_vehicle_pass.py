@@ -11,7 +11,7 @@ from pathlib import Path
 
 from pipeline.vehicle_pass import (_filter_classes, _fold_trailer_to_truck,
                                    _is_truck_family, _select_class,
-                                   restore_geometry)
+                                   restore_geometry, run)
 
 
 def _det(cls, tid, box, score=0.9):
@@ -105,6 +105,27 @@ class VehiclePassTest(unittest.TestCase):
         self.assertAlmostEqual(truck_box[0], 20.0)       # Truck 还原成原值
         self.assertAlmostEqual(truck_box[6], 0.10)
         self.assertEqual(result[0]["detections"][1]["track_id"], 2)   # id 保留
+
+
+class EmptyInputTest(unittest.TestCase):
+    """空输入必须硬失败：不能再产出「只有 VRU 标签」的半成品。"""
+
+    def test_empty_frames_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = Path(tmp) / "raw.json"
+            raw.write_text("[]", encoding="utf-8")
+            with self.assertRaises(RuntimeError) as ctx:
+                run(raw, Path("/tmp/whatever_clip"), Path(tmp) / "work")
+            self.assertIn("0 帧", str(ctx.exception))
+
+    def test_frames_without_boxes_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = Path(tmp) / "raw.json"
+            raw.write_text(json.dumps([{"frame_id": "1", "detections": []}]),
+                           encoding="utf-8")
+            with self.assertRaises(RuntimeError) as ctx:
+                run(raw, Path("/tmp/whatever_clip"), Path(tmp) / "work")
+            self.assertIn("没有任何框", str(ctx.exception))
 
 
 if __name__ == "__main__":

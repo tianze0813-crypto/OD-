@@ -33,11 +33,18 @@ done
          weights=voxelnext_vru_1head2cls_epoch20.pth
 ```
 
-输出：`<clip>_pre/label/*.json`（base_link，SUST 直接能开），
-另有 `<clip>_pre/vehicle_pass_diagnostics.json`（车链过程数据：槽位、动态区域、挂车折叠、几何还原）。
+输出：**只有** `<clip>_pre/label/*.json`（base_link，SUST 直接能开），不再往产出目录写过程数据
+（想看车链过程数据——槽位/动态区域/挂车折叠/几何还原——加 `--keep-vehicle-diagnostics`，
+它会写 `<clip>_pre/vehicle_pass_diagnostics.json`，只调试用）。
 
-两点注意：① 权重是 git-lfs 指针，首次先 `git lfs pull`；② `--in-place` 会把原目录改名成
-`<clip>_pre`（原路径不再存在），已标注的 `*_pre` 不会被重复处理（要重跑就改回不带 `_pre` 的名字）。
+三点注意：
+
+1. 权重是 git-lfs 指针，首次先 `git lfs pull`。
+2. `--in-place` 会把原目录改名成 `<clip>_pre`（原路径不再存在）；已标注的 `*_pre` 不会被重复处理，
+   要重跑就改回不带 `_pre` 的名字，或者加 `--include-pre`（会就地覆盖，不会生成 `*_pre_pre`）。
+3. **同一时间只跑一个批跑**：BEVFusion 的预处理缓存（`bevfusion/work/infos/`、`bevfusion/data/police/<clip>/`）
+   是共享的，两个进程同时跑会互相抢。现在每个 clip 有独立的 `<clip>_infos.pkl`、且拿不到帧会**直接报错停下**
+   （不会再像以前那样安静地输出 0 帧、最后得到一份「只有行人/非机动车」的半成品），但仍别并行跑。
 
 > 想先看效果不动输入、要导出到别的目录、单链调试、回退跑法 —— 都在文末《附录》。
 
@@ -103,6 +110,10 @@ done
 | 6 | 检测范围扩到 **前 80.4 / 后 20.4 / 侧 ±54 m** | 原来是 ±54 对称，前方只能看 54 m；BEV 网格 `[1440, 1344, 41]` |
 | 7 | 按类别的过滤门槛 | 稀疏度 Car 5 / Truck 10；短轨迹 Car 3 / Truck 4（原来是一条链一个值） |
 | 8 | VRU 链**完全不动** | VoxelNeXt 单头两类推理 + 原后处理、原参数 |
+| 9 | BEVFusion 拿不到该 clip 的帧时**直接报错停下** | 以前会安静地输出 0 帧 raw json，下游只在最后看到一份「只有行人/非机动车」的半成品（`bevfusion/scripts/infer_mmdet3d.py`） |
+| 10 | 车链拿到空输入（0 帧 / 0 框）**直接报错停下** | `pipeline/vehicle_pass.py` + `main_chain/pipeline/step_vehicle_chain.py`，不会再产半成品 |
+| 11 | BEVFusion 的 infos 改成 **per-clip 文件 + 聚合文件按 clip 合并** | 以前是所有 clip 共用一个聚合文件、每次整体重写：两个进程（或交错跑不同 clip）互相覆盖就静默出 0 帧 |
+| 12 | 产出目录**不再写**过程数据 | `vehicle_pass_diagnostics.json` 要加 `--keep-vehicle-diagnostics` 才写（`label_car/label_truck/label_vru` 仍是 `--keep-chain-labels` 控制） |
 
 
 ## 车链（Car + Truck 合并后处理）
@@ -132,7 +143,8 @@ done
 | 停车场 clip2（Car 2758 / Truck 8） | 114.6 s | 旧的 Car 链 102.6 s + Truck 链 30~38 s |
 | 十字路口 clip4（Car 831 / Truck 359） | **45.8 s** | 含共享 step4.5；整链（含 BEV 预处理+推理 25 s）71 s |
 
-调参顺序建议：先看 `vehicle_pass_diagnostics.json` 里的
+调参顺序建议（需要 `--keep-vehicle-diagnostics` 才会有下面这个文件）：
+先看 `vehicle_pass_diagnostics.json` 里的
 `truck_trailer_class_merge` / `class_filter` / `early_class_score_filter` /
 `car_step5` / `truck_geometry_restore` / `truck_branch`，再去看
 `vehicle_chain/<clip>_step2_diagnostics.json`（槽位、按类别短轨迹、混类轨迹统一）
@@ -362,7 +374,8 @@ face-visibility 拟合把可见点簇边缘当成了"面"）。需要时改 `Tru
 ```
 
 （`car` 与 `vehicle` 是同一个数：车链一次跑完同时产出 Car 与 Truck，`truck=0`。
-车链内部 `step_vehicle_chain` 的诊断会写在输出目录的 `vehicle_pass_diagnostics.json`。）
+车链内部 `step_vehicle_chain` 的中间 JSON 写在临时工作目录，跑完自动删；要看就得加
+`--keep-vehicle-diagnostics`。）
 
 
 ## VRU 链（`pipeline/hybrid_expD_vru.py`）
@@ -486,7 +499,7 @@ bash hybrid_run.sh <input_root> <output_root> --bev-raw-dir <存放 <clip名>_ra
 
 ```bash
 # 车链（Car+Truck 一次后处理）—— --export 只把两支写进 clip 的 label_car/ label_truck/，
-# 合成后的 label/ 由整批入口（hybrid_run.sh）负责；诊断在 <work-root>/vehicle_pass_diagnostics.json
+# 合成后的 label/ 由整批入口（hybrid_run.sh）负责；过程诊断要加 --diagnostics <路径> 才写
 python pipeline/vehicle_pass.py --raw-json <bev_raw.json> --clip <clip> \
     --work-root /tmp/vehicle --diagnostics /tmp/vehicle/diag.json --export
 
@@ -520,9 +533,6 @@ cd main_chain && ~/miniconda3/envs/openpcdet/bin/python -m unittest discover -s 
 <clip>_pre/
 ├── label/                        ← 合并后的标签（Car 1+ / Truck +1000 / PedNMV +2000）
 ├── label_car / label_truck / label_vru   ← 分链标签（--keep-chain-labels）
-├── vehicle_pass_diagnostics.json ← 车链过程数据：shared_region（槽位数/类别、动态区域面积、
-│                                   候选轨迹、可重跟踪检测数、static_freeze）、挂车折叠数、
-│                                   Truck 几何还原数、Car step5 统计
 ├── lidar / image / transforms
 └── （每次运行入口也会打印一行计时：vehicle / vru / merge / export / total）
 ```

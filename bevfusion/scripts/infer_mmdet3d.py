@@ -72,6 +72,16 @@ def main():
     print(f"[model] {sum(p.numel() for p in model.parameters())/1e6:.1f}M 参数, ckpt={args.ckpt}")
 
     ds_cfg = cfg.val_dataloader.dataset
+    want = {c.strip() for c in args.clips.split(',') if c.strip()}
+    # 【改动】单个 clip 时优先用 mmdet3d_prep.py 写的 per-clip infos：
+    # 聚合文件是所有 clip 共用的一份，两个进程/交错跑不同 clip 时会互相覆盖，
+    # 覆盖后这里按 scene_token 过滤就一帧都匹配不到（静默输出 0 帧）。
+    if len(want) == 1:
+        clip_name = next(iter(want))
+        per_clip = Path(cfg.data_root) / "infos" / f"{clip_name}_infos.pkl"
+        if per_clip.is_file():
+            ds_cfg['ann_file'] = f"infos/{clip_name}_infos.pkl"
+            print(f"[infos] 用 per-clip infos: {per_clip.name}")
     dataset = DATASETS.build(ds_cfg)
     # mmengine 的 serialize_data 会把 dataset.data_list 清空，原始 info 直接读 ann 文件
     ann = Path(cfg.data_root) / ds_cfg['ann_file']
@@ -80,11 +90,20 @@ def main():
     print(f"[dataset] {len(dataset)} 帧 (ann={ann.name})")
 
     idx = list(range(len(dataset)))
-    if args.clips:
-        want = {c.strip() for c in args.clips.split(',') if c.strip()}
+    if want:
         idx = [i for i in idx if raw_infos[i]['scene_token'] in want]
     if args.max_frames > 0:
         idx = idx[:args.max_frames]
+    # 【改动】匹配不到帧就硬失败：以前会安静地输出一个 0 帧 raw json，
+    # 下游车链拿到空输入后产出一份「只有 VRU 标签」的半成品，很难发现。
+    if not idx:
+        scenes = sorted({str(x.get("scene_token")) for x in raw_infos})
+        raise SystemExit(
+            f"[infer] 中止：infos 里没有 clip(s) {sorted(want)} 的帧。"
+            f"ann={ann.name} 共 {len(raw_infos)} 帧，里面的 clip 是 {scenes}。\n"
+            f"        最常见原因：另一个 BEVFusion 进程（或交错跑别的 clip）重写了 infos。\n"
+            f"        处理：串行重跑该 clip（会重新生成 per-clip infos），"
+            f"必要时删掉 {Path(cfg.data_root) / 'infos'} 下的聚合文件重来。")
     print(f"[infer] {len(idx)} 帧, clips={sorted({raw_infos[i]['scene_token'] for i in idx})}")
 
     class_names = list(cfg.metainfo['classes'])

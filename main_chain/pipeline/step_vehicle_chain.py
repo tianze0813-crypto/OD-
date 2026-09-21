@@ -130,6 +130,14 @@ def run(raw_json: Path, clip: Path, work_root: Path, *,
     work_root.mkdir(parents=True, exist_ok=True)
     base = clip.name
 
+    # 【改动】空输入硬失败（上游 BEVFusion 空输出的话，别产半成品）
+    _probe = json.loads(raw_json.read_text(encoding="utf-8"))
+    if not isinstance(_probe, list) or not _probe:
+        raise SystemExit(f"[vehicle-chain] 输入 raw json 是空的（0 帧）：{raw_json}")
+    if _count(_probe) == 0:
+        raise SystemExit(
+            f"[vehicle-chain] 输入 raw json 里没有任何框（{len(_probe)} 帧）：{raw_json}")
+
     # ---- step2：共享身份跟踪（Car/Truck 并集，类别优先级仲裁，Car 优先）----
     step2_json = work_root / f"{base}_step2.json"
     step2_diag = work_root / f"{base}_step2_diagnostics.json"

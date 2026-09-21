@@ -20,6 +20,50 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from prep_data import CAMS_DEFAULT, cam2lidar, scale_K  # noqa: E402
 
 
+def write_infos(out_dir, infos):
+    """写 infos：每个 clip 一份 <clip>_infos.pkl + 聚合文件按 clip 合并。
+
+    【改动】之前只写一个聚合文件、每次整体重写：两个进程（或交错跑不同 clip）会互相覆盖，
+    推理端按 scene_token 过滤时匹配不到就静默输出 0 帧（车链于是产出「只有 VRU 标签」的半成品）。
+    现在：
+      * per-clip 文件只由处理该 clip 的进程写 -> 并发跑不同 clip 互不影响；
+      * 聚合文件按 clip 合并（只替换本次处理的 clip，别的 clip 条目保留）；
+      * infer_mmdet3d.py 单 clip 时优先读 per-clip 文件。
+    """
+    import pickle
+    from pathlib import Path as _Path
+    out_dir = _Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    per_clip = {}
+    for info in infos:
+        per_clip.setdefault(info["scene_token"], []).append(info)
+    for clip_name, items in sorted(per_clip.items()):
+        (out_dir / f"{clip_name}_infos.pkl").write_bytes(pickle.dumps(
+            metainfo_of(items), protocol=pickle.HIGHEST_PROTOCOL))
+    out = out_dir / "police_mmdet3d_infos.pkl"
+    merged = []
+    if out.is_file():                      # 保留其它 clip 的旧条目
+        try:
+            with open(out, "rb") as f:
+                old = pickle.load(f).get("data_list", [])
+            processed = set(per_clip)
+            merged = [x for x in old if x.get("scene_token") not in processed]
+        except Exception as exc:           # 旧文件坏了就当没有
+            print(f"[warn] 旧聚合 infos 读不了（{exc}），只写本次处理的 clip")
+    merged.extend(infos)
+    with open(out, "wb") as f:             # mmengine 要求 ann 文件是 dict（取 data_list）
+        pickle.dump({"metainfo": {"dataset": "police_bevfusion",
+                                  "version": "police-0914"},
+                     "data_list": merged}, f)
+    return {"per_clip": len(per_clip), "aggregate_frames": len(merged)}
+
+
+def metainfo_of(items):
+    """per-clip infos 用的 metainfo（与聚合文件保持一致）。"""
+    return {"metainfo": {"dataset": "police_bevfusion", "version": "police-0914"},
+            "data_list": items}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-root", required=True,
@@ -104,13 +148,11 @@ def main():
             })
             idx += 1
 
-    out = root / "work" / "infos" / "police_mmdet3d_infos.pkl"
-    # mmengine 要求 ann 文件是 dict（取 data_list）
-    with open(out, "wb") as f:
-        pickle.dump({"metainfo": {"dataset": "police_bevfusion",
-                                  "version": "police-0914"},
-                     "data_list": infos}, f)
-    print(f"[mmdet3d infos] {len(infos)} 帧 / {len(clips)} clip -> {out}")
+    out_dir = root / "work" / "infos"
+    stats = write_infos(out_dir, infos)
+    out = out_dir / "police_mmdet3d_infos.pkl"
+    print(f"[mmdet3d infos] 本次 {len(infos)} 帧 / {len(clips)} clip；"
+          f"per-clip {stats['per_clip']} 份；聚合 {stats['aggregate_frames']} 帧 -> {out}")
     if infos:
         print("  cameras:", list(infos[0]["images"].keys()))
         print("  lidar  :", infos[0]["lidar_points"]["lidar_path"])
