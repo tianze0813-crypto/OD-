@@ -1570,6 +1570,8 @@ class StaticFirstTracker:
         self.diagnostics["slot_details"] = [{
             "slot_id": s.slot_id,
             "track_id": s.track_id,
+            # 【改动】2026-09-21 车链要能看出槽位是哪个类别（混类时按 Car 优先定）
+            "class_name": s.class_name,
             "center": [round(float(x), 4) for x in s.center],
             "yaw": round(float(s.yaw), 5),
             "size": [round(float(x), 4) for x in s.size],
