@@ -3,114 +3,43 @@
 输入：SUSTechPOINTS 原始 clip（含 `lidar/lidar_top/*.bin` 与 `transforms/`）。
 输出：每帧写在 `<clip>_pre/label/<frame_id>.json`，可直接用 SUSTechPOINTS 打开。
 
-## 常用命令（先看这里）
-
-> 详细原理、阈值、阶段表都在下面《详细说明》里；这里只放平时要敲的命令。
-
-### 0. 环境（一次性）
+## 常用命令（就这三条）
 
 ```bash
-git lfs pull                     # models/*.pth 是 LFS 指针（133 字节），不拉会跑不了
-bash hybrid_run.sh --help        # 入口会自动探测 openpcdet 环境，不用手动 activate
-# 指定 python：PYTHON=/home/moga/miniconda3/envs/openpcdet/bin/python bash hybrid_run.sh ...
-```
-
-BEVFusion 需要额外的 `mmdet3d` 环境与 CUDA 算子，见《详细说明 → 依赖（BEVFusion 相关）》。
-
-### 1. 整批 / 单条 clip：原地端到端（最常用）
-
-结果写在**原 clip 同级的 `<clip>_pre/label/*.json`**（base_link，SUST 直接能开）。
-
-```bash
-# 单条 clip
+# 1) 单条 clip：原地跑（原目录改名成 <clip>_pre，标签写在里面）
 bash hybrid_run.sh /media/moga/police/scene_001_crossroad_my_record_20260914_141401_clip4 --in-place --overwrite
 
-# 一整个目录下的所有 clip（自动收集，跳过 *_pre 与 lost+found）
-# 注意：--in-place 会把这些 clip 全部就地改名成 *_pre，想先看效果就用第 2 种 + --link-only
+# 2) 一批 clip：父目录下直接是各个 clip（自动收集，跳过 *_pre 与 lost+found）
 bash hybrid_run.sh /media/moga/police --in-place --overwrite
 
-# 分场景 / step2 的嵌套结构（police/0903）：用 shell 逐层遍历，见《详细说明 → 批量运行》
+# 3) 分场景 / step2 的嵌套结构（<scene>/step2/<clip>）：逐层遍历
+DATA_ROOT=/media/moga/GEN2/0915
+for scene in "$DATA_ROOT"/*/; do
+  for clip in "${scene%/}"/step2/scene_*clip*/; do
+    clip="${clip%/}"; name="$(basename "$clip")"
+    [ -d "$clip/lidar/lidar_top" ] || continue     # 不是 clip 就跳过
+    [[ "$name" == *_pre ]] && continue             # 已标注的跳过
+    bash hybrid_run.sh "$clip" --in-place --overwrite
+  done
+done
 ```
 
-注意：`--in-place` 会把原目录改名成 `<clip>_pre`（标签写在里面），原路径不再存在。
-
-### 2. 不改输入：导出到别的目录
-
-```bash
-bash hybrid_run.sh <input_root> <output_root> --overwrite
-bash hybrid_run.sh <input_root> <output_root> --overwrite --link-only        # 只软链 image/lidar/transforms，快
-bash hybrid_run.sh <input_root> <output_root> --output-suffix _vehicle ...   # 输出名 <clip>_vehicle（不套 _pre）
-```
-
-### 3. 选链
-
-```bash
---chains car,truck,vru   # 默认：车链（Car+Truck 合并后处理）+ VRU
---chains car,truck       # 只车链
---chains vru             # 只行人/非机动车
-```
-
-### 4. 只跑链路、不落盘（调试，只打印统计）
-
-```bash
-bash hybrid_run.sh <clip> /tmp/unused --no-export-sust --overwrite
-```
-
-### 5. 复用已经跑好的 BEVFusion 原始检测（不重新推理）
-
-```bash
-bash hybrid_run.sh <input_root> <output_root> --bev-raw-dir <存放 <clip名>_raw.json 的目录> ...
-```
-
-### 6. 单条链单独跑（排查用）
-
-```bash
-# 车链（Car+Truck 一次后处理）—— --export 只把两支写进 clip 的 label_car/ label_truck/，
-# 合成后的 label/ 由整批入口（hybrid_run.sh）负责；诊断在 <work-root>/vehicle_pass_diagnostics.json
-python pipeline/vehicle_pass.py --raw-json <bev_raw.json> --clip <clip> \
-    --work-root /tmp/vehicle --diagnostics /tmp/vehicle/diag.json --export
-
-# 只跑 BEVFusion 推理，拿 raw json（纯雷达）
-python pipeline/step1_bevfusion_truck.py --clip <clip> --work-root work/step1 --mode lidar --score-thresh 0.1
-
-# VRU 单链（先用 models/voxelnext_vru_infer.yaml + voxelnext_vru_1head2cls_epoch20.pth 出 raw）
-python pipeline/hybrid_expD_vru.py --raw-json <vru_raw.json> --clip <clip> --out-json work/vru.json --label-subdir label_vru
-```
-
-### 7. 回退 / 单链调试
-
-```bash
---trailer-policy keep     # 纯挂车轨迹保留 Trailer 类（默认 to-truck：一律并成 Truck）
---vru-detector bevfusion  # VRU 改用 BEVFusion 的 ped/bicycle 头（默认 voxelnext = 现状）
-```
-
-回退跑法（`--no-car-truck-merged`、`--chains car,noncar`、单链调试入口、旧参数表）
-统一在文末《附录 A》，免得混在常用命令里。
-
-### 8. 跑测试
-
-```bash
-~/miniconda3/envs/openpcdet/bin/python -m unittest discover -s tests -t .            # 混合链路侧
-cd main_chain && ~/miniconda3/envs/openpcdet/bin/python -m unittest discover -s tests -t .
-```
-
-### 9. 跑完先看哪里
+跑的是什么：**BEVFusion 推理一次**（Car 与 Truck 共用这一份检测，动静态区域只算一次）
++ **VoxelNeXt 推理一次**（行人 / 非机动车）。每次运行入口会打印一行确认：
 
 ```text
-<clip>_pre/
-├── label/                        ← 合并后的标签（Car 1+ / Truck +1000 / PedNMV +2000）
-├── label_car / label_truck / label_vru   ← 分链标签（--keep-chain-labels）
-├── vehicle_pass_diagnostics.json ← 车链过程数据：shared_region（槽位数/类别、动态区域面积、
-│                                   候选轨迹、可重跟踪检测数、static_freeze）、挂车折叠数、
-│                                   Truck 几何还原数、Car step5 统计
-├── lidar / image / transforms
-└── （每次运行入口也会打印一行计时：vehicle / vru / merge / export / total）
+[hybrid] chains=('car', 'truck', 'vru') | 车链 Car+Truck: detector=BEVFusion mode=lidar
+         weights=models/bevfusion_mmdet3d_lidaronly.pth ... | VRU: detector=voxelnext
+         weights=voxelnext_vru_1head2cls_epoch20.pth
 ```
 
-常见问题：权重只有 133 字节 → `git lfs pull`；`<clip>` 不见了 → `--in-place` 已改名成
-`<clip>_pre`；已标注的 `*_pre` 不会被重复处理（要重跑就改回不带 `_pre` 的名字）。
+输出：`<clip>_pre/label/*.json`（base_link，SUST 直接能开），
+另有 `<clip>_pre/vehicle_pass_diagnostics.json`（车链过程数据：槽位、动态区域、挂车折叠、几何还原）。
 
----
+两点注意：① 权重是 git-lfs 指针，首次先 `git lfs pull`；② `--in-place` 会把原目录改名成
+`<clip>_pre`（原路径不再存在），已标注的 `*_pre` 不会被重复处理（要重跑就改回不带 `_pre` 的名字）。
+
+> 想先看效果不动输入、要导出到别的目录、单链调试、回退跑法 —— 都在文末《附录》。
 
 # 详细说明
 
@@ -326,108 +255,15 @@ face-visibility 拟合把可见点簇边缘当成了"面"）。需要时改 `Tru
    恢复调用即可回退到旧行为。
 
 
-## 两种运行模式
+## 批量收集规则（对应顶部第 2、3 条命令）
 
-### 模式一：原地端到端（**默认推荐**）
-
-输入 clip 在**原位置**改名成 `<clip>_pre`，并把合并后的 `label/` 写进去；
-不额外保留一份 raw，也不往 SUSTechPOINTS/data 拷贝（SUST 现在能直接打开别的目录）。
-
-```bash
-bash hybrid_run.sh <clip> --in-place --overwrite
-```
-
-输出：
-
-```text
-<clip>_pre/
-├── lidar/
-├── image/
-├── transforms/
-└── label/<frame_id>.json
-```
-
-注意：运行成功后原路径 `<clip>` 会消失，变成 `<clip>_pre`；已有同名
-`<clip>_pre` 时会被 `--overwrite` 先删再生成。
-
-### 模式二：导出到指定目录（原始 clip 保留不动）
-
-结果写到 `<output_root>/<clip>_pre`；`<output_root>` 省略时默认 `~/SUSTechPOINTS/data`。
-
-```bash
-bash hybrid_run.sh <clip> <output_root> --overwrite
-```
-
-例如：
-
-```bash
-bash hybrid_run.sh \
-  /media/moga/police/0903/nonmotor_lane_my_record_20260903_100541/step2/scene_nonmotor_lane_my_record_20260903_100541_clip43 \
-  /home/moga/桌面/SUSTechPOINTS/data --overwrite
-```
-
-输出：
-
-```text
-<output_root>/
-└── <clip>_pre/
-    ├── 原始 clip 数据（lidar / image / transforms）
-    └── label/<frame_id>.json
-```
-
-- `--output-tag truckb_e15`：输出名变成 `<clip>_truckb_e15_pre`，方便保留多组对比。
-- `--output-suffix _vehicle`：输出名变成 `<clip>_vehicle`（不套 `_pre`），适合测试输出。
-- `--link-only`：输出目录里 image/lidar/transforms 只放软链，不复制数据（快）。
-- `--keep-chain-labels`：额外写 `label_car/`、`label_truck/`、`label_vru/` 便于按链排查。
-
-### 仅调试：只跑链路、不落盘
-
-```bash
-bash hybrid_run.sh <clip> /tmp/unused --no-export-sust --overwrite
-```
-
-只打印统计信息，临时 JSON 跑完自动删除，不产生 `<clip>_pre`，也不改输入。
-
-
-## 批量运行（两种目录结构）
-
-批量按目录结构分两种，两种输出模式（原地 / 导出 SUST）都适用。
-
-### 批量 A：一个大目录下直接就是一批 clip
-
-`<clip_parent>/` 下面直接是各个 clip 目录，每个 clip 含 `lidar/lidar_top/*.bin`。
-`hybrid_run.sh` 会自动扫描并逐个处理。
-
-```bash
-bash hybrid_run.sh /path/to/clips --in-place --overwrite
-bash hybrid_run.sh /home/moga/桌面/预标测效/ /home/moga/桌面/SUSTechPOINTS/data --overwrite
-```
-
-### 批量 B：分场景 / step2 的嵌套结构（police/0903）
-
-`/media/moga/police/0903` 是 `<scene>/step2/<clip>/` 结构，需要用 shell 逐层遍历：
-
-```bash
-DATA_ROOT=/media/moga/GEN2/0915/
-SUST=/home/moga/桌面/SUSTechPOINTS/data
-
-for scene in "$DATA_ROOT"/*/; do
-  for clip in "${scene%/}"/step2/scene_*clip*/; do
-    clip="${clip%/}"
-    name="$(basename "$clip")"
-
-    [ -d "$clip/lidar/lidar_top" ] || continue      # 不是有效 clip
-    [[ "$name" == *_pre ]] && continue              # 已经是输出，跳过
-    [ -d "$SUST/${name}_pre" ] && continue          # SUST 已有输出，跳过
-
-    echo "== 处理 $clip =="
-    bash hybrid_run.sh "$clip" --in-place --overwrite
-    # 导出 SUST 模式：把上面一行换成
-    # bash hybrid_run.sh "$clip" "$SUST" --overwrite
-  done
-done
-```
-
+- **一个大目录下直接是 clip**：`hybrid_run.sh <父目录>` 会自动收集逐个处理；
+  跳过 `*_pre`（已标注）、`lost+found`、没有 `lidar/lidar_top/*.bin` 的目录。
+- **分场景 / step2 的嵌套结构**（`<scene>/step2/<clip>/`）：需要 shell 逐层遍历，
+  命令见顶部第 3 条。
+- `--in-place` 把每个 clip 就地改名成 `<clip>_pre`；想跳过 SUST 里已有输出的，可以在循环里加
+  `[ -d "$SUST/${name}_pre" ] && continue`。
+- 不想动输入 clip（导出到别的目录 / 只看效果）：见《附录 A》。
 
 ## 参数与默认值
 
@@ -589,13 +425,119 @@ cd main_chain && ~/miniconda3/envs/openpcdet/bin/python -m unittest discover -s 
 `tests/test_vehicle_pass.py`（类别视图切分、Truck 几何还原）、
 `main_chain/tests/test_class_priority.py`（Car 优先的四处落点）。
 
-## 附录 A：回退路径与单链调试（**本分支不推荐**）
+## 附录 A：导出到别的目录 / 其他运行模式
 
-本分支（`feat/car-truck-shared-bev-pass`）的正式路径是「一次 BEVFusion 推理 + 一条车链后处理」。
-下面这些旧跑法代码里都还在，只用于对比 / 排查；要正式跑旧链路，建议切到对应分支
-（例如 `hybrid-main-car-expd-noncar`），别混着当生产用。
+### A.1 导出到指定目录（原始 clip 保留不动）
 
-### A.1 回退跑法
+结果写到 `<output_root>/<clip>_pre`；`<output_root>` 省略时默认 `~/SUSTechPOINTS/data`。
+
+```bash
+bash hybrid_run.sh <clip> <output_root> --overwrite
+```
+
+例如：
+
+```bash
+bash hybrid_run.sh \
+  /media/moga/police/0903/nonmotor_lane_my_record_20260903_100541/step2/scene_nonmotor_lane_my_record_20260903_100541_clip43 \
+  /home/moga/桌面/SUSTechPOINTS/data --overwrite
+```
+
+输出：
+
+```text
+<output_root>/
+└── <clip>_pre/
+    ├── 原始 clip 数据（lidar / image / transforms）
+    └── label/<frame_id>.json
+```
+
+- `--output-tag truckb_e15`：输出名变成 `<clip>_truckb_e15_pre`，方便保留多组对比。
+- `--output-suffix _vehicle`：输出名变成 `<clip>_vehicle`（不套 `_pre`），适合测试输出。
+- `--link-only`：输出目录里 image/lidar/transforms 只放软链，不复制数据（快）。
+- `--keep-chain-labels`：额外写 `label_car/`、`label_truck/`、`label_vru/` 便于按链排查。
+
+### A.2 仅调试：只跑链路、不落盘
+
+```bash
+bash hybrid_run.sh <clip> /tmp/unused --no-export-sust --overwrite
+```
+
+只打印统计信息，临时 JSON 跑完自动删除，不产生 `<clip>_pre`，也不改输入。
+
+### A.3 选链
+
+```bash
+--chains car,truck,vru   # 默认：车链（Car+Truck 合并后处理）+ VRU
+--chains car,truck       # 只车链
+--chains vru             # 只行人/非机动车
+```
+
+### A.4 复用已经跑好的 BEVFusion 原始检测（不重新推理）
+
+```bash
+bash hybrid_run.sh <input_root> <output_root> --bev-raw-dir <存放 <clip名>_raw.json 的目录> ...
+```
+
+
+## 附录 B：调试
+
+### B.1 单条链单独跑（排查用）
+
+```bash
+# 车链（Car+Truck 一次后处理）—— --export 只把两支写进 clip 的 label_car/ label_truck/，
+# 合成后的 label/ 由整批入口（hybrid_run.sh）负责；诊断在 <work-root>/vehicle_pass_diagnostics.json
+python pipeline/vehicle_pass.py --raw-json <bev_raw.json> --clip <clip> \
+    --work-root /tmp/vehicle --diagnostics /tmp/vehicle/diag.json --export
+
+# 只跑 BEVFusion 推理，拿 raw json（纯雷达）
+python pipeline/step1_bevfusion_truck.py --clip <clip> --work-root work/step1 --mode lidar --score-thresh 0.1
+
+# VRU 单链（先用 models/voxelnext_vru_infer.yaml + voxelnext_vru_1head2cls_epoch20.pth 出 raw）
+python pipeline/hybrid_expD_vru.py --raw-json <vru_raw.json> --clip <clip> --out-json work/vru.json --label-subdir label_vru
+```
+
+### B.2 main_chain 与本项目自己的检测入口
+
+```bash
+# main_chain 自己的 Car 链（Waymo 权重 + Car 专属精修 Step3/Step4/Step4.5/Step5）
+cd main_chain && python run_end_to_end.py --clip <clip> --export-sust
+
+# 只跑 BEVFusion 推理拿 raw json（车链/单链都用得上）
+python pipeline/step1_bevfusion_truck.py --clip <clip> --work-root work/step1 --mode lidar --score-thresh 0.1
+```
+
+### B.3 跑测试
+
+```bash
+~/miniconda3/envs/openpcdet/bin/python -m unittest discover -s tests -t .            # 混合链路侧
+cd main_chain && ~/miniconda3/envs/openpcdet/bin/python -m unittest discover -s tests -t .
+```
+
+### B.4 跑完先看哪里
+
+```text
+<clip>_pre/
+├── label/                        ← 合并后的标签（Car 1+ / Truck +1000 / PedNMV +2000）
+├── label_car / label_truck / label_vru   ← 分链标签（--keep-chain-labels）
+├── vehicle_pass_diagnostics.json ← 车链过程数据：shared_region（槽位数/类别、动态区域面积、
+│                                   候选轨迹、可重跟踪检测数、static_freeze）、挂车折叠数、
+│                                   Truck 几何还原数、Car step5 统计
+├── lidar / image / transforms
+└── （每次运行入口也会打印一行计时：vehicle / vru / merge / export / total）
+```
+
+常见问题：权重只有 133 字节 → `git lfs pull`；`<clip>` 不见了 → `--in-place` 已改名成
+`<clip>_pre`；已标注的 `*_pre` 不会被重复处理（要重跑就改回不带 `_pre` 的名字）。
+
+
+
+## 附录 C：回退路径与单链调试（**本分支不推荐**）
+
+本分支的正式路径就是上面那条车链；下面这些旧跑法代码里都还在，只用于对比 / 排查。
+要正式跑旧链路，建议切到对应分支（例如 `hybrid-main-car-expd-noncar`），别混着当生产用。
+
+### C.1 回退跑法
 
 ```bash
 bash hybrid_run.sh <input_root> <output_root> --no-car-truck-merged --overwrite
@@ -610,17 +552,7 @@ bash hybrid_run.sh <input_root> <output_root> --chains car,noncar --overwrite
 --car-truck-cover-threshold 0.5  # 已停用：Car 被 Truck 覆盖就删整条 Car 轨迹（函数体保留）
 ```
 
-### A.2 单链调试入口
-
-```bash
-# main_chain 自己的 Car 链（Waymo 权重 + Car 专属精修 Step3/Step4/Step4.5/Step5）
-cd main_chain && python run_end_to_end.py --clip <clip> --export-sust
-
-# 只跑 BEVFusion 推理拿 raw json（车链/单链都用得上）
-python pipeline/step1_bevfusion_truck.py --clip <clip> --work-root work/step1 --mode lidar --score-thresh 0.1
-```
-
-### A.3 Truck 单链的运行命令
+### C.2 Truck 单链的运行命令
 
 ```bash
 # 单条 clip（默认纯雷达；结果写 <clip>/label_truck/）
@@ -637,7 +569,7 @@ python scripts/run_hybrid_prelabel.py <input_root> <output_root> --chains truck
 ... --truck-detector-mode fusion    # 改用 C+L 权重
 ```
 
-### A.4 只改了 Truck 时：复用 Car/VRU 标签重跑
+### C.3 只改了 Truck 时：复用 Car/VRU 标签重跑
 
 > 仅回退路径适用：默认路径下 Truck 的 id 来自与 Car 共享的那一遍跟踪与动态区域，
 > 单独重跑 Truck 链对不上号（要么整条车链重跑，要么 `--no-car-truck-merged`）。
@@ -654,7 +586,7 @@ python scripts/remerge_truck_car.py --output-root <含 <clip>_pre 的目录> [--
 再按上面的合并规则重写 `label/` 和 `label_truck/`。改 Truck 参数或合并规则时用它，
 可以省掉最慢的 Car 链。
 
-### A.5 旧的 Car 单链说明（`pipeline/hybrid_expD_car.py`）
+### C.4 旧的 Car 单链说明（`pipeline/hybrid_expD_car.py`）
 
 2026-09-21 起 Car 有两个可选实现、检测器也有两档，**后处理语义都产出 SUST 可读的 base_link 标签**：
 
@@ -701,7 +633,7 @@ main_chain 的硬过滤用**原始类别字符串**比对白名单、且分数/�
 
 > 测试用的一键脚本：`scripts/run_bevfusion_test_chains.py`（原始检测 → Car(hybrid)+Truck+VRU 合成一份标签）。
 
-### A.6 回退路径的参数表
+### C.5 回退路径的参数表
 
 #### Car 链参数（`--car-pipeline hybrid`）
 
@@ -725,8 +657,7 @@ main_chain 的硬过滤用**原始类别字符串**比对白名单、且分数/�
 | Step4.5 相位拼接 | `--phase-merge-max-gap-sec` | `30.0` |
 | Step4.5 右转 yielding | `--yielding-max-gap-sec` | `6.0` |
 
-
-## 附录 B：旧五类非车链（`--chains car,noncar`，回退）
+## 附录 D：旧五类非车链（`--chains car,noncar`，回退）
 
 `--chains car,noncar` 时回到旧的"main Car + VOD 五类非车"两链模式，合并走
 `pipeline/hybrid_merge.py::merge_label_frames`（含 Car/非车 互斥吸收）。

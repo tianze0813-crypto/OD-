@@ -943,14 +943,30 @@ def main() -> int:
         _validate_weight(vru_ckpt)
         if not vru_cfg.is_file():
             raise RuntimeError(f"config not found: {vru_cfg}")
-    _print(f"chains={chains}  truck={truck_ckpt.name}  vru={vru_ckpt.name}")
-    # 【改动】把 Truck 链真正用的检测器/模式/阈值打出来（避免只看 ckpt 名字误解）
-    if "truck" in chains:
-        weights = (truck_ckpt.name if args.truck_detector == "voxelnext"
+    # 【改动】把「实际跑的是哪两个检测器」一次说清楚：只看 ckpt 名字容易误解
+    # （车链下 car/truck 都用 BEVFusion，truck_ckpt 只在 --no-car-truck-merged 时才用）
+    chains_set = set(str(c).strip() for c in chains) if not isinstance(chains, str) \
+        else set(str(c).strip() for c in chains.split(",") if c.strip())
+    vehicle_chain = ({"car", "truck"} <= chains_set
+                     and str(args.truck_detector) == "bevfusion"
+                     and str(args.car_detector) in ("auto", "bevfusion")
+                     and bool(args.car_truck_merged))
+    if vehicle_chain:
+        weights = ("models/bevfusion_mmdet3d_lidarcam.pth"
+                   if args.truck_detector_mode == "fusion"
                    else "models/bevfusion_mmdet3d_lidaronly.pth")
-        _print(f"truck chain: detector={args.truck_detector} mode={args.truck_detector_mode} "
-               f"thresholds={{'Truck': 0.2, 'Trailer': {args.trailer_score_threshold}}} "
-               f"trailer_rules={not args.no_trailer_rules} weights={weights}")
+        _print(f"chains={chains} | 车链 Car+Truck: detector=BEVFusion "
+               f"mode={args.truck_detector_mode} weights={weights} "
+               f"(trailer_rules={not args.no_trailer_rules}, policy={args.trailer_policy}) "
+               f"| VRU: detector={args.vru_detector} weights={vru_ckpt.name}")
+    else:
+        _print(f"chains={chains}  truck={truck_ckpt.name}  vru={vru_ckpt.name}")
+        if "truck" in chains_set:
+            weights = (truck_ckpt.name if args.truck_detector == "voxelnext"
+                       else "models/bevfusion_mmdet3d_lidaronly.pth")
+            _print(f"truck chain(回退): detector={args.truck_detector} mode={args.truck_detector_mode} "
+                   f"thresholds={{'Truck': 0.2, 'Trailer': {args.trailer_score_threshold}}} "
+                   f"trailer_rules={not args.no_trailer_rules} weights={weights}")
     if "noncar" in chains:
         _validate_weight(noncar_ckpt)
         if not noncar_cfg.is_file():
