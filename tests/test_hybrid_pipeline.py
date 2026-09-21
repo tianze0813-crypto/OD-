@@ -237,7 +237,10 @@ class HybridPipelineTest(unittest.TestCase):
                 result = hybrid_launcher.run_clip(
                     Path("python"), source, output_root, overwrite=False,
                     drop_vis_below=0.05, score_threshold=None,
-                    short_track_max_frames=4)
+                    short_track_max_frames=4,
+                    # 只跑 car+noncar 两条假链：不让默认 truck_detector=bevfusion
+                    # 触发真实 BEVFusion 推理（否则测试会去跑子进程）。
+                    chains=("car", "noncar"), truck_detector="voxelnext")
 
             self.assertEqual(events, ["main", "expd_inference", "expd_postprocess"])
             labels = json.loads(
@@ -280,7 +283,8 @@ class HybridPipelineTest(unittest.TestCase):
                 result = hybrid_launcher.run_clip(
                     Path("python"), source, output_root, overwrite=False,
                     export_sust=False, drop_vis_below=0.05,
-                    score_threshold=None, short_track_max_frames=4)
+                    score_threshold=None, short_track_max_frames=4,
+                    chains=("car", "noncar"), truck_detector="voxelnext")
 
             self.assertIsNone(result["final_clip"])
             self.assertFalse((output_root / "scene_pre").exists())
@@ -319,7 +323,8 @@ class HybridPipelineTest(unittest.TestCase):
                 result = hybrid_launcher.run_clip(
                     Path("python"), source, output_root, overwrite=False,
                     in_place=True, drop_vis_below=0.05,
-                    score_threshold=None, short_track_max_frames=4)
+                    score_threshold=None, short_track_max_frames=4,
+                    chains=("car", "noncar"), truck_detector="voxelnext")
 
             destination = root / "scene_pre"
             self.assertFalse(source.exists())

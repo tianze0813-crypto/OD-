@@ -66,7 +66,9 @@ class PipelineStageContractTest(unittest.TestCase):
         class FakeTracker:
             slots = []
 
-            def __init__(self, _coords):
+            # **_kwargs: step2 会透传 disable_slot_binding 等跟踪参数，
+            # 桩不需要关心具体值，但不能因为多了参数就崩掉。
+            def __init__(self, _coords, **_kwargs):
                 pass
 
             def process(self, frames):
