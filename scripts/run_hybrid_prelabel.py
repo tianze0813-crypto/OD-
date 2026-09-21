@@ -377,14 +377,19 @@ def _merge_chain_labels(chain_labels: Dict[str, Dict[str, List[Dict[str, Any]]]]
             kept.append(item)
             counts[str(item.get("obj_type"))] += 1
         output.append({"frame_id": frame_id, "labels": kept})
-    overlapping, overlap_stats = _drop_cars_covered_by_trucks(
-        output, car_truck_cover_threshold)
-    if overlap_stats.get("enabled"):
-        counts = Counter()
-        for frame in overlapping:
-            for item in frame.get("labels", []):
-                counts[str(item.get("obj_type"))] += 1
-        output = overlapping
+    # 【改动】2026-09-21 用户决定：Car/Truck 冲突一律按 Car 算。车链合并成一条后处理
+    # 之后，冲突在链内就用类别优先级仲裁掉了，所以旧的「Car 被 Truck 覆盖 >= 阈值
+    # 就删掉整条 Car 轨迹」规则停用（函数体保留在下面，需要时把下面两行恢复即可）。
+    # overlapping, overlap_stats = _drop_cars_covered_by_trucks(
+    #     output, car_truck_cover_threshold)
+    # if overlap_stats.get("enabled"):
+    #     counts = Counter()
+    #     for frame in overlapping:
+    #         for item in frame.get("labels", []):
+    #             counts[str(item.get("obj_type"))] += 1
+    #     output = overlapping
+    overlap_stats = {"enabled": False,
+                     "reason": "disabled_2026-09-21_car_priority"}
     missing = {name: sorted(set(frame_ids) - set(chain_labels.get(name, {})))
                for name in order}
     return output, {"frames": len(output), "labels": dict(counts),
@@ -432,12 +437,13 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
              trailer_dup_iom: float = 0.70,
              trailer_dup_iou: float = 0.50,
              trailer_merge_iou: float = 0.05,
-             trailer_policy: str = "keep",
+             # 【改动】2026-09-21：标注侧没有 Trailer 类别 -> 默认并成 Truck
+             trailer_policy: str = "to-truck",
              vru_cfg: Path = VRU_CFG,
              vru_ckpt: Path = VRU_CKPT,
              vru_raw_threshold: float = 0.3,
              keep_chain_labels: bool = False,
-             car_truck_cover_threshold: float = 0.5) -> Dict[str, Any]:
+             car_truck_cover_threshold: float = 0.5) -> Dict[str, Any]:   # 已停用，见 _merge_chain_labels
     base = clip.name
     tag = output_tag.strip("_-")
     if output_suffix:                       # 【改动】<clip名><后缀>，例如 ..._clip4_pre_bev
@@ -765,7 +771,9 @@ def main() -> int:
     parser.add_argument("--trailer-dup-iom", type=float, default=0.70)
     parser.add_argument("--trailer-dup-iou", type=float, default=0.50)
     parser.add_argument("--trailer-merge-iou", type=float, default=0.05)
-    parser.add_argument("--trailer-policy", choices=["keep", "to-truck"], default="keep")
+    parser.add_argument("--trailer-policy", choices=["keep", "to-truck"],
+                        default="to-truck",
+                        help="keep: 纯挂车轨迹保留 Trailer；to-truck（默认）: 一律并成 Truck")
     parser.add_argument("--vru-cfg", type=Path, default=VRU_CFG)
     parser.add_argument("--vru-ckpt", type=Path, default=VRU_CKPT)
     parser.add_argument("--vru-raw-threshold", type=float, default=0.3)

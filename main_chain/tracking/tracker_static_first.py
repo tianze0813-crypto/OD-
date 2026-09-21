@@ -43,6 +43,18 @@ def circular_median_pi(values: Sequence[float]) -> float:
         tracking.angle_distance(v, x, modulo_pi=True) for v in values))
 
 
+def _representative_slot_class(names: Sequence[str]) -> str:
+    """槽位（停车位）类别：混类时按类别优先级取（Car 最高），否则多数投票。"""
+    if not names:
+        return ""
+    priorities = {name: tracking.class_priority(name) for name in set(names)}
+    best = min(priorities.values())
+    candidates = [name for name, value in priorities.items() if value == best]
+    if len(candidates) == 1:
+        return candidates[0]
+    return max(candidates, key=lambda name: sum(1 for item in names if item == name))
+
+
 def size_compatible(a: np.ndarray, b: np.ndarray, max_delta: float = 0.65) -> bool:
     return (float(np.linalg.norm(a - b))
             / max(float(np.linalg.norm(a)), float(np.linalg.norm(b)), 1.0)
@@ -363,11 +375,10 @@ class StaticFirstTracker:
                 center=center,
                 yaw=circular_median_pi([o.yaw for o in member_obs]),
                 size=np.median(np.asarray([o.size for o in member_obs]), axis=0),
-                class_name=max(
-                    (o.detection.get("class_name", "") for o in member_obs),
-                    key=lambda name: sum(o.detection.get("class_name", "") == name
-                                         for o in member_obs),
-                ),
+                # 【改动】2026-09-21：混类槽位按类别优先级定类（Car 最高），
+                # 没有 Car 才按观测数多数投票。
+                class_name=_representative_slot_class(
+                    [o.detection.get("class_name", "") for o in member_obs]),
                 member_ids=set(member_ids),
                 evidence_frames={o.frame_index for o in member_obs},
                 hits=len(member_ids),
@@ -1223,7 +1234,11 @@ class StaticFirstTracker:
         # claimed once (no two vehicles share a slot).
         stop_bound_slots: set[int] = set()
         stop_binds = []
-        for tid, items in sorted(dynamic.items()):
+        # 【改动】2026-09-21：按类别优先级排序（Car 先占槽位）
+        for tid, items in sorted(
+                dynamic.items(),
+                key=lambda kv: (tracking.class_priority(
+                    kv[1][-1].detection.get("class_name", "")), kv[0])):
             stopped, dwell_center, dwell_start, dwell_end = self._explicit_stop(
                 items, self.stop_frames, self.stop_step_gate)
             if not stopped or dwell_center is None:
@@ -1277,7 +1292,11 @@ class StaticFirstTracker:
         # the parked dwell (which is a separate static slot fragment).
         arrival_bound_slots: set[int] = set()
         arrival_binds = []
-        for tid, items in sorted(dynamic.items()):
+        # 【改动】2026-09-21：按类别优先级排序（Car 先占槽位）
+        for tid, items in sorted(
+                dynamic.items(),
+                key=lambda kv: (tracking.class_priority(
+                    kv[1][-1].detection.get("class_name", "")), kv[0])):
             end = items[-1]
             # Parking is the reverse of departure: require a sustained inward
             # approach so a passing track cannot claim a parked slot.

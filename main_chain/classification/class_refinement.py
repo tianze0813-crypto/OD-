@@ -57,7 +57,19 @@ def _robust_dimensions(items: Sequence[_Item]) -> Tuple[float, float, float]:
 
 
 def _mixed_target(items: Sequence[_Item], config: ClassRefinementConfig) -> str:
-    """Mixed chains start as Car, then size evidence applies agreed renames."""
+    """混合类别轨迹定类。
+
+    【改动】2026-09-21：车与车之间（Car/Truck/Vehicle）的混合一律按类别优先级取
+    （Car 最高）—— 同一台车被 car 头与 truck 头重复框住时统一算 Car。
+    只有混进了 VRU 类别时才退回按尺寸判据。
+    """
+    # 原始类别可能是模型的小写名（car/truck/...），先归一再看是不是纯车类混合
+    classes = {tracking.canonical_class_name(item.original_class)
+               or str(item.original_class) for item in items}
+    if classes and classes <= VEHICLE_FAMILY:
+        # 优先级相同（Car 与 Vehicle）时用类名兜底，保证结果确定
+        return min(classes, key=lambda name: (tracking.class_priority(name),
+                                              str(name)))
     length, width, _height = _robust_dimensions(items)
     if length >= config.truck_length_min:
         return "Truck"

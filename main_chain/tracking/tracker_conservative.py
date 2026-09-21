@@ -37,14 +37,46 @@ from scipy.optimize import linear_sum_assignment
 
 STATIC_CLASSES = {"Vehicle", "Car", "Truck"}
 VEHICLE_CLASSES = STATIC_CLASSES | {"Bus", "Other Vehicle"}
+# 【改动】2026-09-21 车链（Car+Truck 合并后处理）用：
+#   挂车（trailer）——标注侧没有这个类别，统一并成 Truck；
+#   工程车（construction_vehicle）——保留检测，并进 Truck；
+# 两者都在类别归一这一步落地，后面的过滤/跟踪/精修都只看到 Car / Truck。
 CLASS_MAP = {
     "car": "Car", "truck": "Truck", "bus": "Bus",
-    "construction_vehicle": "Engineering_vehicle",
+    "construction_vehicle": "Truck", "Engineering_vehicle": "Truck",
+    "trailer": "Truck", "Trailer": "Truck",
     "pedestrian": "Pedestrian", "bicycle": "Nonmotorized_vehicle",
     "motorcycle": "Nonmotorized_vehicle", "Cyclist": "Nonmotorized_vehicle",
     "Car": "Car", "Truck": "Truck", "Vehicle": "Car",
     "Pedestrian": "Pedestrian", "Cyclist": "Nonmotorized_vehicle",
+    "Nonmotorized_vehicle": "Nonmotorized_vehicle",
+    "nonmotorized_vehicle": "Nonmotorized_vehicle",
 }
+
+# 目标类别（车链只用 Car / Truck；VRU 由另一条链负责）
+TARGET_CLASSES = ("Car", "Truck", "Bus", "Pedestrian", "Nonmotorized_vehicle")
+
+# 【改动】2026-09-21 用户决定：车与车之间冲突（同一槽位/同一物理目标被 car 与 truck
+# 重复表示）一律按 Car 算 —— 预标注产物，类别人工好修。数字越小越优先。
+CLASS_PRIORITY = {"Car": 0, "Vehicle": 0, "Truck": 1, "Bus": 2, "Other Vehicle": 3}
+
+
+def canonical_class_name(value) -> "str | None":
+    """模型别名 -> 归一类别名（含 trailer/construction_vehicle -> Truck）。"""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    direct = CLASS_MAP.get(text)
+    if direct in TARGET_CLASSES:
+        return direct
+    folded = CLASS_MAP.get(text.casefold())
+    return folded if folded in TARGET_CLASSES else None
+
+
+def class_priority(value) -> int:
+    """类别优先级：Car 最高；未登记的类别排在最后。"""
+    canonical = canonical_class_name(value) or str(value or "").strip()
+    return CLASS_PRIORITY.get(canonical, len(CLASS_PRIORITY) + 1)
 
 
 def wrap_angle(a: float) -> float:

@@ -43,7 +43,8 @@ TARGET_CLASSES = ("Car", "Truck", "Bus", "Pedestrian", "Nonmotorized_vehicle")
 VEHICLE_CLASSES = STATIC_CLASSES | {"Other Vehicle"}
 CLASS_MAP = {
     "car": "Car", "truck": "Truck", "bus": "Bus",
-    "construction_vehicle": "Engineering_vehicle",
+    # 【改动】2026-09-21：工程车保留检测、并进 Truck（用户决定）
+    "construction_vehicle": "Truck", "Engineering_vehicle": "Truck",
     "pedestrian": "Pedestrian", "bicycle": "Nonmotorized_vehicle",
     "motorcycle": "Nonmotorized_vehicle", "Cyclist": "Nonmotorized_vehicle",
     "Car": "Car", "Truck": "Truck", "Vehicle": "Car",

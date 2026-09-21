@@ -12,7 +12,6 @@ import numpy as np
 
 from filtering import camera_visibility
 from tracking import tracker_conservative as tracking      # 【改动】类别别名归一
-from tracking import tracker_conservative as tracking
 
 
 @dataclass(frozen=True)
@@ -254,10 +253,12 @@ def deduplicate_same_center(
             if len(indices) <= 1:
                 continue
 
-            def rank(index: int) -> Tuple[int, int, float, float]:
+            def rank(index: int) -> Tuple[int, int, int, float, float]:
                 det = detections[index]
                 tid = int(det.get("track_id", -1))
-                return (lifecycle[tid], int(tid in static_track_ids),
+                # 【改动】2026-09-21：先按类别优先级（Car 最高），同类内保持原判据
+                return (-tracking.class_priority(det.get("class_name")),
+                        lifecycle[tid], int(tid in static_track_ids),
                         median_score.get(tid, 0.0), float(det.get("score", 0.0)))
 
             keep_index = max(indices, key=rank)

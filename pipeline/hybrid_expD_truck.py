@@ -108,7 +108,8 @@ DEFAULTS: Dict[str, Any] = dict(
     trailer_dup_iom=0.70,        # 挂车被货车罩住 >= 70% -> 判重复，丢挂车
     trailer_dup_iou=0.50,        # 或 BEV IoU >= 0.5 -> 判重复
     trailer_merge_iou=0.05,      # 有交集 -> 并集合并成一个大长 Truck
-    trailer_policy="keep",       # keep=纯挂车轨迹保留 Trailer | to-truck=一律并成 Truck
+    # 【改动】2026-09-21：标注侧没有 Trailer 类别 -> 默认一律并成 Truck
+    trailer_policy="to-truck",   # keep=纯挂车轨迹保留 Trailer | to-truck=一律并成 Truck
 )
 
 
@@ -225,7 +226,8 @@ def main() -> None:
     parser.add_argument("--trailer-merge-iou", type=float, default=DEFAULTS["trailer_merge_iou"])
     parser.add_argument("--trailer-policy", choices=["keep", "to-truck"],
                         default=DEFAULTS["trailer_policy"],
-                        help="keep: 纯挂车轨迹保留 Trailer；to-truck: 所有挂车也并成 Truck")
+                        help="keep: 纯挂车轨迹保留 Trailer；to-truck（默认）: 所有挂车也并成 Truck，"
+                             "因为标注侧没有 Trailer 类别")
     parser.add_argument("--range-front", type=float, default=DEFAULTS["range_front"])
     parser.add_argument("--range-rear", type=float, default=DEFAULTS["range_rear"])
     parser.add_argument("--range-side", type=float, default=DEFAULTS["range_side"])
