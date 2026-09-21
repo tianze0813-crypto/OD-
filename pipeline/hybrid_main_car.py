@@ -55,8 +55,14 @@ def _read_main_labels(final_clip: Path) -> Dict[str, List[Dict[str, Any]]]:
 
 def run(
         python: Path, clip: Path, work_root: Path, *, overwrite: bool = True,
+        raw_json: Path | None = None,
 ) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, Any]]:
-    """Run ``main`` on an isolated copy of one clip and keep only its labels."""
+    """Run ``main`` on an isolated copy of one clip and keep only its labels.
+
+    【改动】raw_json 可选：给定后跳过 main_chain 自带的 Waymo step1，直接把这份
+    raw json（lidar 系，schema 与本工程一致）喂给 main_chain 的 step2~step5，
+    用于「换检测器重跑」的实验（main_chain 的 run_end_to_end.py 本来就支持 --raw-json）。
+    """
     main_source = _main_source()
     main_input = work_root / "main_input" / clip.name
     shutil.copytree(clip, main_input)
@@ -68,11 +74,14 @@ def run(
     ]
     if overwrite:
         command.append("--overwrite")
+    if raw_json is not None:      # 【改动】外部检测结果（跳过 Waymo step1）
+        command += ["--raw-json", str(Path(raw_json).resolve())]
     _run(command)
     final_clip = main_input.with_name(clip.name + "_pre")
     labels = _read_main_labels(final_clip)
     return labels, {
         "pipeline": "main",
+        "detector_raw_json": (str(Path(raw_json).resolve()) if raw_json is not None else None),
         "source_ref": "main",
         "source_clip_copy": str(main_input),
         "frames": len(labels),

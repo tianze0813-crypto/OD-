@@ -72,15 +72,16 @@ _SKIP_DIR_NAMES = {"lost+found", ".Trash-1000", ".Trash", "$RECYCLE.BIN",
                    "System Volume Information"}
 
 
-def _skip_entry(path: Path) -> bool:
+def _skip_entry(path: Path, include_pre: bool = False) -> bool:
     name = path.name
-    return (name in _SKIP_DIR_NAMES or name.startswith(".")
-            or name.endswith("_pre"))
+    if name in _SKIP_DIR_NAMES or name.startswith("."):
+        return True
+    return name.endswith("_pre") and not include_pre      # 【改动】include_pre 时也收 _pre
 
 
-def _is_clip(path: Path) -> bool:
+def _is_clip(path: Path, include_pre: bool = False) -> bool:
     try:
-        if _skip_entry(path) or not path.is_dir():
+        if _skip_entry(path, include_pre) or not path.is_dir():
             return False
         lidar = path / "lidar" / "lidar_top"
         return lidar.is_dir() and any(lidar.glob("*.bin"))
@@ -88,16 +89,16 @@ def _is_clip(path: Path) -> bool:
         return False
 
 
-def _collect_clips(input_root: Path) -> List[Path]:
+def _collect_clips(input_root: Path, include_pre: bool = False) -> List[Path]:
     if not input_root.is_dir():
         raise RuntimeError(f"input directory does not exist: {input_root}")
     # Accept a single clip directory directly, or a parent holding many clips.
-    if _is_clip(input_root):
+    if _is_clip(input_root, include_pre):
         return [input_root.resolve()]
     clips = []
     for path in sorted(input_root.iterdir()):
         try:
-            if _skip_entry(path) or not _is_clip(path):
+            if _skip_entry(path, include_pre) or not _is_clip(path, include_pre):
                 continue
             clips.append(path.resolve())
         except OSError:      # 【改动】权限不足的条目直接跳过
@@ -412,6 +413,12 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
              # 【改动】2026-09-20 Truck 链检测器与货车/挂车规则
              truck_detector: str = "bevfusion",
              truck_detector_mode: str = "lidar",     # 【改动】fusion | lidar
+             # 【改动】Car / VRU 链也可换成 BEVFusion 检测（复用同一份 raw json，只推理一次）
+             car_detector: str = "waymo",            # waymo | bevfusion
+             vru_detector: str = "voxelnext",        # voxelnext | bevfusion
+             bev_raw_threshold: float = 0.1,         # 共享 BEVFusion raw json 的分数门槛
+             output_suffix: str = "",                # 非空则输出名 = <clip名><后缀>（不套 _pre）
+             link_only: bool = False,                # 输出目录只放软链 + label（不 copytree）
              trailer_rules: bool = True,
              trailer_score_threshold: float = 0.25,
              trailer_dup_iom: float = 0.70,
@@ -425,7 +432,10 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
              car_truck_cover_threshold: float = 0.5) -> Dict[str, Any]:
     base = clip.name
     tag = output_tag.strip("_-")
-    output_name = f"{base}_{tag}_pre" if tag else f"{base}_pre"
+    if output_suffix:                       # 【改动】<clip名><后缀>，例如 ..._clip4_pre_bev
+        output_name = f"{base}{output_suffix}"
+    else:
+        output_name = f"{base}_{tag}_pre" if tag else f"{base}_pre"
     destination: Path | None = None
     if in_place:
         destination = clip.parent / output_name
@@ -455,17 +465,29 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
         work = Path(temp)
         total = len(selected)
         step = 0
+        bev_raw: Path | None = None
+        if "bevfusion" in (str(car_detector), str(truck_detector), str(vru_detector)):
+            # 【改动】三条链共用一份 BEVFusion 原始检测（只推理一次）
+            bev_raw = _run_raw_bevfusion(python, clip, work / "bev_raw",
+                                         bev_raw_threshold, truck_detector_mode)
+            _print(f"{base}: BEVFusion raw json（三链共用）-> {bev_raw.name}")
         if "car" in selected:
             step += 1
-            _print(f"{base}: {step}/{total} Car 链（main_chain: Waymo Car + Step4.5）")
+            car_src = ("BEVFusion car 头 + Step4.5" if car_detector == "bevfusion"
+                       else "Waymo Car + Step4.5")
+            _print(f"{base}: {step}/{total} Car 链（main_chain: {car_src}）")
             _t = time.monotonic()
             main_labels, main_result = run_main_car(
-                python, clip, work / "main", overwrite=True)
+                python, clip, work / "main", overwrite=True,
+                raw_json=(bev_raw if car_detector == "bevfusion" else None))
             timings["car"] = round(time.monotonic() - _t, 1)
             chain_labels["car"] = {str(key): list(value)
                                    for key, value in main_labels.items()}
             chain_stats["car"] = {
-                "checkpoint": "main_chain/models/vn_waymo_v2_4gpu_full_epoch10.pth",
+                "detector": str(car_detector),
+                "checkpoint": ("BEVFusion " + str(truck_detector_mode)
+                               if car_detector == "bevfusion"
+                               else "main_chain/models/vn_waymo_v2_4gpu_full_epoch10.pth"),
                 "final_detections": main_result.get("final_detections"),
                 "frames": len(chain_labels["car"])}
         if "truck" in selected:
@@ -474,8 +496,8 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
                 _print(f"{base}: {step}/{total} Truck 链（BEVFusion "
                        f"{'纯雷达' if truck_detector_mode == 'lidar' else 'C+L'} 官方20ep + 货车/挂车规则）")
                 _t = time.monotonic()
-                raw = _run_raw_bevfusion(python, clip, work / "truck_raw", truck_raw_threshold,
-                                         truck_detector_mode)
+                raw = bev_raw if bev_raw is not None else _run_raw_bevfusion(
+                    python, clip, work / "truck_raw", truck_raw_threshold, truck_detector_mode)
             else:
                 _print(f"{base}: {step}/{total} Truck 链（{truck_ckpt.name}）")
                 _t = time.monotonic()
@@ -506,10 +528,12 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
                 "frames": len(chain_labels["truck"])}
         if "vru" in selected:
             step += 1
-            _print(f"{base}: {step}/{total} VRU 链（{vru_ckpt.name}: Pedestrian + Nonmotorized_vehicle）")
+            vru_src = ("BEVFusion ped/bicycle/motorcycle 头" if vru_detector == "bevfusion"
+                       else vru_ckpt.name)
+            _print(f"{base}: {step}/{total} VRU 链（{vru_src}: Pedestrian + Nonmotorized_vehicle）")
             _t = time.monotonic()
-            raw = _run_raw(python, clip, vru_cfg, vru_ckpt,
-                           work / "vru_raw", "vru", vru_raw_threshold)
+            raw = bev_raw if vru_detector == "bevfusion" else _run_raw(
+                python, clip, vru_cfg, vru_ckpt, work / "vru_raw", "vru", vru_raw_threshold)
             out = work / "vru.json"
             diag_path = work / "vru_diagnostics.json"
             result = run_expd_vru(raw, clip, out, diag_path)
@@ -517,6 +541,7 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
             timings["vru"] = round(time.monotonic() - _t, 1)
             chain_labels["vru"] = _frames_to_labels(frames, VRU_ID_OFFSET)
             chain_stats["vru"] = {
+                "detector": str(vru_detector),
                 "checkpoint": str(vru_ckpt), "config": str(vru_cfg),
                 "raw_score_threshold": float(vru_raw_threshold),
                 "final_detections": (result or {}).get("final_detections"),
@@ -562,7 +587,20 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
         merge_diag["chain_stats"] = chain_stats
 
     _t = time.monotonic()
-    if in_place:
+    if link_only and destination is not None:
+        # 【改动】输出目录只放软链 + label：输入 clip（可能已经是 <clip>_pre）保持不动，
+        # 也不复制 image/lidar（SUST 能直接识别该目录）。
+        if destination.exists():
+            if not overwrite:
+                raise RuntimeError(f"output exists, pass --overwrite: {destination}")
+            shutil.rmtree(destination)
+        destination.mkdir(parents=True)
+        for sub in ("image", "lidar", "transforms", "readme.json"):
+            src = clip / sub
+            if src.exists():
+                (destination / sub).symlink_to(src.resolve())
+        labels = _write_labels(merged, destination)
+    elif in_place:
         # 端到端原地模式：把输入 clip 改名为 <clip>_pre，再把标签写进去，
         # 不额外保留一份 raw，也不往 SUST 拷贝。
         try:
@@ -655,6 +693,18 @@ def main() -> int:
     parser.add_argument("--truck-ckpt", type=Path, default=TRUCK_CKPT)
     parser.add_argument("--truck-raw-threshold", type=float, default=0.1)
     # 【改动】2026-09-20 Truck 链检测器（BEVFusion / 旧 VoxelNeXt）与货车/挂车规则
+    parser.add_argument("--include-pre", action="store_true",
+                        help="允许把已经预标过的 <clip>_pre 也当输入（换检测器重跑用）")
+    parser.add_argument("--car-detector", choices=["waymo", "bevfusion"], default="waymo",
+                        help="Car 链检测器：waymo（默认）或 bevfusion（用 BEVFusion 的 car 头）")
+    parser.add_argument("--vru-detector", choices=["voxelnext", "bevfusion"], default="voxelnext",
+                        help="VRU 链检测器：voxelnext（默认）或 bevfusion（ped/bicycle/motorcycle 头）")
+    parser.add_argument("--bev-raw-threshold", type=float, default=0.1,
+                        help="三链共享的 BEVFusion raw json 分数门槛（链内阈值另外把关）")
+    parser.add_argument("--output-suffix", type=str, default="",
+                        help="输出名 = <输入clip名><后缀>（如 _bev）；默认仍按 <clip>_pre / <clip>_<tag>_pre")
+    parser.add_argument("--link-only", action="store_true",
+                        help="输出目录只放 image/lidar/transforms 软链 + label（不复制数据、不改名输入）")
     parser.add_argument("--truck-detector-mode", choices=["lidar", "fusion"], default="lidar",
                         help="lidar=纯雷达 BEVFusion（默认，快）；fusion=C+L（读相机图）")
     parser.add_argument("--truck-detector", choices=["bevfusion", "voxelnext"],
@@ -788,7 +838,7 @@ def main() -> int:
 
     if export_sust:
         output_root.mkdir(parents=True, exist_ok=True)
-    clips = _collect_clips(input_root)
+    clips = _collect_clips(input_root, include_pre=bool(args.include_pre))
     summaries = []
     for index, clip in enumerate(clips, 1):
         _print(f"clip [{index}/{len(clips)}]: {clip.name}")
@@ -814,6 +864,11 @@ def main() -> int:
             truck_raw_threshold=args.truck_raw_threshold,
             truck_detector=args.truck_detector,
             truck_detector_mode=args.truck_detector_mode,
+            car_detector=args.car_detector,
+            vru_detector=args.vru_detector,
+            bev_raw_threshold=args.bev_raw_threshold,
+            output_suffix=args.output_suffix,
+            link_only=args.link_only,
             trailer_rules=not args.no_trailer_rules,
             trailer_score_threshold=args.trailer_score_threshold,
             trailer_dup_iom=args.trailer_dup_iom,
