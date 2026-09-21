@@ -64,7 +64,13 @@ def run(
     用于「换检测器重跑」的实验（main_chain 的 run_end_to_end.py 本来就支持 --raw-json）。
     """
     main_source = _main_source()
-    main_input = work_root / "main_input" / clip.name
+    # 【改动】输入 clip 可能已经是 <clip>_pre（--include-pre 重跑）：复制时先去掉
+    # 尾部的 _pre，否则 main_chain 的 run_end_to_end 会在内部再套一层，得到
+    # <clip>_pre_pre（临时目录里也一样容易混淆）。标签按 frame_id 取，名字无所谓。
+    inner_name = clip.name
+    if inner_name.endswith("_pre"):
+        inner_name = inner_name[: -len("_pre")] or clip.name
+    main_input = work_root / "main_input" / inner_name
     shutil.copytree(clip, main_input)
     command = [
         python, main_source / "run_end_to_end.py",
@@ -77,7 +83,7 @@ def run(
     if raw_json is not None:      # 【改动】外部检测结果（跳过 Waymo step1）
         command += ["--raw-json", str(Path(raw_json).resolve())]
     _run(command)
-    final_clip = main_input.with_name(clip.name + "_pre")
+    final_clip = main_input.with_name(inner_name + "_pre")
     labels = _read_main_labels(final_clip)
     return labels, {
         "pipeline": "main",

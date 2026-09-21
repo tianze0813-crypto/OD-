@@ -5,10 +5,11 @@
 
 ## 常用命令（就这三条）
 
-> `--include-pre` 是**命令行开关，默认关**（不加它 = 跳过所有 `*_pre`，只跑没标注过的）。
+> `--include-pre` 是**命令行开关，默认关**（不加它 = 批量遍历父目录时跳过所有 `*_pre`，只跑没标注过的）。
 > 下面第 2、3 条命令我按**带 `--include-pre`** 的写法给 —— 因为平时最常见的场景是「连已标注过的
-> 一起重跑一遍」；带上它时，`<clip>_pre` 会被**就地覆盖重跑**（不改名，也不会生成 `<clip>_pre_pre`）。
-> 新 clip 第一次跑就把 `--include-pre` 删掉。
+> 一起重跑一遍」；带上它时，`<clip>_pre` 会被**就地覆盖重跑**（目录名不变、**只重写 `label/`**，
+> 不会生成 `<clip>_pre_pre`）。第 1 条命令是**直接点名**单个 clip：传进来的目录本身带 `_pre` 时不用加
+> `--include-pre`，一样就地覆盖重跑。新 clip 第一次跑就把 `--include-pre` 删掉。
 
 ```bash
 # 1) 单条 clip：原地跑（原目录改名成 <clip>_pre，标签写在里面）
@@ -126,7 +127,7 @@ done
 | 10 | 车链拿到空输入（0 帧 / 0 框）**直接报错停下** | `pipeline/vehicle_pass.py` + `main_chain/pipeline/step_vehicle_chain.py`，不会再产半成品 |
 | 11 | BEVFusion 的 infos 改成 **per-clip 文件 + 聚合文件按 clip 合并** | 以前是所有 clip 共用一个聚合文件、每次整体重写：两个进程（或交错跑不同 clip）互相覆盖就静默出 0 帧 |
 | 12 | 产出目录**不再写**过程数据 | `vehicle_pass_diagnostics.json` 要加 `--keep-vehicle-diagnostics` 才写（`label_car/label_truck/label_vru` 仍是 `--keep-chain-labels` 控制） |
-| 13 | `*_pre`（已标注）可以被**就地覆盖重跑** | 加 `--include-pre`（默认关）才收集它们，配 `--in-place` 就地覆盖写（不再生成 `*_pre_pre`，也不会误删输入）；不加则照旧跳过 |
+| 13 | `*_pre`（已标注）可以被**就地覆盖重跑** | 批量时加 `--include-pre`（默认关）才收集它们，配 `--in-place` 就地覆盖写：**输入名已带 `_pre` 时输出就是它自己，只重写 `label/`**（不再生成 `*_pre_pre`，也不会误删输入）；直接点名 `<clip>_pre` 时不用开关也收；不加则照旧跳过 |
 
 
 ## 车链（Car + Truck 合并后处理）
@@ -237,6 +238,10 @@ face-visibility 拟合把可见点簇边缘当成了"面"）。需要时改 `Tru
   批跑默认会**跳过** `*_pre`（= 已标注的不会被重复处理）；加了 `--include-pre` 就会把它们
   一并就地覆盖重跑（推荐再跑一遍时用这个）。想只重跑某一条，也可以直接对 `<clip>_pre` 单条跑（
   因为缓存还在，只需重新推理+后处理）。
+- **重跑已标注的 clip 不会变成 `<clip>_pre_pre`**：输入名本身就以 `_pre` 结尾时，输出名就是它自己，
+  只把 `label/`（以及 `--keep-chain-labels` 的分链标签）整个重写，**不改名、不删除输入目录**；
+  需要 `--overwrite` 明确确认。同样的规则也用在 `run_end_to_end.py`
+  （`main_chain/run_end_to_end.py` 与本项目根目录）上。
 
 ### 依赖（BEVFusion 相关）
 
@@ -285,6 +290,7 @@ face-visibility 拟合把可见点簇边缘当成了"面"）。需要时改 `Tru
 - **一个大目录下直接是 clip**：`hybrid_run.sh <父目录>` 会自动收集逐个处理；
   默认跳过 `*_pre`（已标注）、`lost+found`、没有 `lidar/lidar_top/*.bin` 的目录；
   加 `--include-pre` 就把 `*_pre` 也收进来（就地覆盖重跑）。
+  但**直接点名一个 `<clip>_pre` 目录时**（`hybrid_run.sh <...>_pre ...`）不看这个开关，照收并就地重跑。
 - **分场景 / step2 的嵌套结构**（`<scene>/step2/<clip>/`）：需要 shell 逐层遍历，
   命令见顶部第 3 条。
 - `--in-place` 把每个 clip 就地改名成 `<clip>_pre`；想跳过 SUST 里已有输出的，可以在循环里加

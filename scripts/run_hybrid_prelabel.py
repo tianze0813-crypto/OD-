@@ -76,11 +76,30 @@ _SKIP_DIR_NAMES = {"lost+found", ".Trash-1000", ".Trash", "$RECYCLE.BIN",
                    "System Volume Information"}
 
 
+PRE_SUFFIX = "_pre"
+
+
+def _pre_clip_name(base: str, tag: str = "",
+                   output_suffix: str = "") -> str:
+    """目标输出目录名：绝不叠加第二个 ``_pre``。
+
+    - ``<clip>``              -> ``<clip>_pre``（有 tag 时 ``<clip>_<tag>_pre``）
+    - ``<clip>_pre``          -> 原样返回：重跑就地覆盖 ``label/``，不生成
+      ``<clip>_pre_pre``（输入本身就是预标产物，只重写标签）
+    - 显式 ``output_suffix``  -> ``<clip><后缀>``，按调用方给的名字来
+    """
+    if output_suffix:                        # 【改动】<clip名><后缀>，如 ..._clip4_pre_bev
+        return f"{base}{output_suffix}"
+    if base.endswith(PRE_SUFFIX):            # 【改动】已是 *_pre：重跑就地覆盖，不再套一层
+        return base
+    return f"{base}_{tag}_pre" if tag else f"{base}_pre"
+
+
 def _skip_entry(path: Path, include_pre: bool = False) -> bool:
     name = path.name
     if name in _SKIP_DIR_NAMES or name.startswith("."):
         return True
-    return name.endswith("_pre") and not include_pre      # 【改动】include_pre 时也收 _pre
+    return name.endswith(PRE_SUFFIX) and not include_pre  # 【改动】include_pre 时也收 _pre
 
 
 def _is_clip(path: Path, include_pre: bool = False) -> bool:
@@ -97,7 +116,9 @@ def _collect_clips(input_root: Path, include_pre: bool = False) -> List[Path]:
     if not input_root.is_dir():
         raise RuntimeError(f"input directory does not exist: {input_root}")
     # Accept a single clip directory directly, or a parent holding many clips.
-    if _is_clip(input_root, include_pre):
+    # 【改动】直接点名的那一个目录就算是 *_pre 也照收（用户明确指定 = 想在它上面
+    # 就地重跑 label/）；include_pre=False 的过滤只用于自动遍历父目录时跳过已标注的。
+    if _is_clip(input_root, include_pre=True):
         return [input_root.resolve()]
     clips = []
     for path in sorted(input_root.iterdir()):
@@ -112,10 +133,11 @@ def _collect_clips(input_root: Path, include_pre: bool = False) -> List[Path]:
             f"no raw clips found under {input_root}; expected lidar/lidar_top/*.bin")
     # 【改动】--include-pre 时如果同时存在 X 与 X_pre，只跑 X_pre（重复跑 X 会先把 X_pre 删掉）
     if include_pre:
-        pre_names = {path.name for path in clips if path.name.endswith("_pre")}
+        pre_names = {path.name for path in clips
+                     if path.name.endswith(PRE_SUFFIX)}
         dropped = [path for path in clips
-                   if not path.name.endswith("_pre")
-                   and f"{path.name}_pre" in pre_names]
+                   if not path.name.endswith(PRE_SUFFIX)
+                   and f"{path.name}{PRE_SUFFIX}" in pre_names]
         if dropped:
             _print("--include-pre：以下 clip 已有 *_pre 版本，跳过 "
                    + ", ".join(path.name for path in dropped))
@@ -463,10 +485,9 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
              keep_vehicle_diagnostics: bool = False) -> Dict[str, Any]:
     base = clip.name
     tag = output_tag.strip("_-")
-    if output_suffix:                       # 【改动】<clip名><后缀>，例如 ..._clip4_pre_bev
-        output_name = f"{base}{output_suffix}"
-    else:
-        output_name = f"{base}_{tag}_pre" if tag else f"{base}_pre"
+    # 【改动】已经是 <clip>_pre 的输入 -> output_name == base：重跑就地覆盖，
+    # 不改名、不生成 <clip>_pre_pre（见 _pre_clip_name）。
+    output_name = _pre_clip_name(base, tag, output_suffix)
     destination: Path | None = None
     # 【改动】重跑已标注的 clip（名字本身就是目标输出名，例如 *_pre）：就地覆盖，不改名、
     # 更不能 rmtree 输入目录（否则把输入删了）。`--include-pre` 收进来的就是这种。
@@ -838,8 +859,9 @@ def main() -> int:
     parser.add_argument("--truck-raw-threshold", type=float, default=0.1)
     # 【改动】2026-09-20 Truck 链检测器（BEVFusion / 旧 VoxelNeXt）与货车/挂车规则
     parser.add_argument("--include-pre", action="store_true",
-                        help="把已经预标过的 <clip>_pre 也收进来：配 --in-place 时**就地覆盖重跑**"
-                             "（不改名、不会生成 <clip>_pre_pre）；不加则跳过所有 *_pre。"
+                        help="批量遍历父目录时把已经预标过的 <clip>_pre 也收进来：配 --in-place 时"
+                             "**就地覆盖重跑**（目录名不变、只重写 label/，不会生成 <clip>_pre_pre）；"
+                             "不加则跳过所有 *_pre。直接点名一个 <clip>_pre 目录时不用这个开关也收。"
                              "注意 X 与 X_pre 同时存在时只跑 X_pre")
     parser.add_argument("--car-pipeline", choices=["main_chain", "hybrid"], default="main_chain",
                         help="Car 走哪条链：main_chain（Waymo Car + Step4.5，默认）"
@@ -907,7 +929,9 @@ def main() -> int:
         "--in-place", dest="export_mode", action="store_const",
         const="in_place",
         help="rename each input clip to <clip>_pre in place; "
-             "no SUST copy and no extra raw copy")
+             "no SUST copy and no extra raw copy. An input already named "
+             "<clip>_pre stays as-is and only label/ is rewritten "
+             "(never <clip>_pre_pre)")
     parser.set_defaults(export_mode="sust")
     args = parser.parse_args()
     input_root = args.input_root.expanduser().resolve()

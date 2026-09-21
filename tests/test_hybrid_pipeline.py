@@ -331,6 +331,74 @@ class HybridPipelineTest(unittest.TestCase):
             self.assertEqual(result["final_clip"], str(destination))
             self.assertFalse((output_root / "scene_pre").exists())
 
+    def test_pre_clip_name_never_stacks_pre(self):
+        name = hybrid_launcher._pre_clip_name
+        self.assertEqual(name("scene"), "scene_pre")
+        self.assertEqual(name("scene", "vod"), "scene_vod_pre")
+        # 已经是 *_pre：原样返回 -> 重跑就地覆盖 label/，不生成 *_pre_pre
+        self.assertEqual(name("scene_pre"), "scene_pre")
+        self.assertEqual(name("scene_pre", "vod"), "scene_pre")
+        # 显式 output_suffix 仍按调用方给的名字
+        self.assertEqual(name("scene_pre", output_suffix="_bev"),
+                         "scene_pre_bev")
+
+    def test_runner_reruns_existing_pre_clip_in_place(self):
+        """带 _pre 的输入重跑：目录名不变，只重写 label/（不生成 _pre_pre）。"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "scene_pre"
+            (source / "lidar" / "lidar_top").mkdir(parents=True)
+            (source / "lidar" / "lidar_top" / "1.bin").write_bytes(b"")
+            (source / "label").mkdir()
+            (source / "label" / "stale.json").write_text("[]", encoding="utf-8")
+            output_root = root / "out"
+
+            def fake_main(_python, _clip, _work_root, **_kwargs):
+                return ({"1": [{
+                    "obj_id": "1", "obj_type": "Car", "score": 0.9,
+                }]}, {"final_detections": 1})
+
+            with patch.object(hybrid_launcher, "run_main_car", fake_main):
+                result = hybrid_launcher.run_clip(
+                    Path("python"), source, output_root, overwrite=True,
+                    in_place=True, drop_vis_below=0.05,
+                    score_threshold=None, short_track_max_frames=4,
+                    chains=("car",), truck_detector="voxelnext")
+
+            self.assertTrue(source.is_dir())
+            self.assertFalse((root / "scene_pre_pre").exists())
+            self.assertFalse((source / "label" / "stale.json").exists())
+            labels = json.loads((source / "label" / "1.json").read_text())
+            self.assertEqual([label["obj_type"] for label in labels], ["Car"])
+            self.assertEqual(result["final_clip"], str(source))
+
+    def test_collect_clips_accepts_directly_named_pre_clip(self):
+        """直接点名的 <clip>_pre 目录照收（就地重跑），不要求 --include-pre。"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            clip = root / "scene_pre"
+            (clip / "lidar" / "lidar_top").mkdir(parents=True)
+            (clip / "lidar" / "lidar_top" / "1.bin").write_bytes(b"")
+            self.assertEqual(
+                [path.name for path in hybrid_launcher._collect_clips(clip)],
+                ["scene_pre"])
+
+    def test_collect_clips_batch_skips_pre_siblings_by_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("scene", "scene_pre"):
+                lidar = root / name / "lidar" / "lidar_top"
+                lidar.mkdir(parents=True)
+                (lidar / "1.bin").write_bytes(b"")
+            self.assertEqual(
+                [path.name for path in hybrid_launcher._collect_clips(root)],
+                ["scene"])
+            # --include-pre：X 与 X_pre 并存时只收 X_pre（避免先跑 X 把 X_pre 删掉）
+            self.assertEqual(
+                [path.name
+                 for path in hybrid_launcher._collect_clips(root, True)],
+                ["scene_pre"])
+
 
 class ShortMotionNonmotorizedTest(unittest.TestCase):
     def test_static_nmv_track_is_dropped(self):

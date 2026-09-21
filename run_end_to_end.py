@@ -107,6 +107,17 @@ def materialize_final_clip(source: Path, destination: Path,
         source.rename(destination)
 
 
+def final_clip_name(base: str, suffix: str) -> str:
+    """目标 clip 名：绝不叠加第二个后缀（例如 ``*_pre_pre``）。
+
+    ``<clip>`` + ``_pre`` -> ``<clip>_pre``；
+    ``<clip>_pre`` + ``_pre`` -> 原样返回：重跑就地重写 ``label/``。
+    """
+    if suffix and base.endswith(suffix):
+        return base
+    return base + suffix
+
+
 def write_labels_only(frames, clip_dir: Path) -> int:
     """Write per-frame label JSON into an existing clip directory."""
     label_dir = clip_dir / "label"
@@ -151,7 +162,8 @@ def main():
         "--final-root", type=Path,
         help="把最终 clip 写入此目录（默认写到输入 clip 的同级目录）")
     parser.add_argument("--overwrite", action="store_true",
-                        help="如果 <clip>_pre 已存在，先删除再生成")
+                        help="如果 <clip>_pre 已存在，先删除再生成；"
+                             "输入本身就是 <clip>_pre 时 = 只重写 label/")
     parser.add_argument(
         "--preserve-input", action="store_true",
         help="保留原始 clip；复制一份生成 <clip>_pre（适合批处理）")
@@ -219,12 +231,22 @@ def main():
         for index, clip in enumerate(clips, 1):
             base = clip.name
             input_clip_path = str(clip)
-            final_clip = ((args.final_root / (base + args.final_suffix))
+            final_name = final_clip_name(base, args.final_suffix)
+            final_clip = ((args.final_root / final_name)
                           if args.final_root is not None
-                          else clip.with_name(base + args.final_suffix))
+                          else clip.with_name(final_name))
+            # 输入本身已是 <clip>_pre：就地重跑，只重写 label/，
+            # 既不改名也不 rmtree 输入目录（否则会把原始数据删掉）。
+            rerun_in_place = final_clip == clip
             print(f"\n===== [{index}/{len(clips)}] {base} =====", flush=True)
 
-            if final_clip.exists():
+            if rerun_in_place:
+                if not args.overwrite:
+                    raise SystemExit(
+                        f"重跑已标注的 clip 要带 --overwrite（只覆盖 {clip}/label）："
+                        f"{clip}")
+                print(f"{base}: 就地重跑（已标注，只重写 label/）", flush=True)
+            elif final_clip.exists():
                 if args.overwrite:
                     shutil.rmtree(final_clip)
                 else:
@@ -315,18 +337,25 @@ def main():
             # No intermediate clip is stored.  By default the historical
             # behavior renames the input clip.  The one-click deployment
             # wrapper uses --preserve-input so source data remains reusable.
-            materialize_final_clip(
-                clip, final_clip, preserve_input=args.preserve_input)
-            try:
+            # When the input already carries the suffix it stays in place and
+            # only label/ is rewritten (never renamed to <clip>_pre_pre).
+            if rerun_in_place:
                 labels = write_labels_only(
                     json.loads(final_json.read_text(encoding="utf-8")),
-                    final_clip)
-            except Exception:
-                if args.preserve_input:
-                    shutil.rmtree(final_clip, ignore_errors=True)
-                else:
-                    final_clip.rename(clip)
-                raise
+                    clip)
+            else:
+                materialize_final_clip(
+                    clip, final_clip, preserve_input=args.preserve_input)
+                try:
+                    labels = write_labels_only(
+                        json.loads(final_json.read_text(encoding="utf-8")),
+                        final_clip)
+                except Exception:
+                    if args.preserve_input:
+                        shutil.rmtree(final_clip, ignore_errors=True)
+                    else:
+                        final_clip.rename(clip)
+                    raise
 
             sust_dest = None
             if args.export_sust:

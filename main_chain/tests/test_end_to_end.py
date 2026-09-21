@@ -31,5 +31,14 @@ class EndToEndLabelWriterTest(unittest.TestCase):
             self.assertEqual(payload[0]["obj_id"], "7")
 
 
+class FinalClipNameTest(unittest.TestCase):
+    def test_never_stacks_pre_suffix(self):
+        name = run_end_to_end.final_clip_name
+        self.assertEqual(name("scene", "_pre"), "scene_pre")
+        # 已经是 <clip>_pre：重跑就地重写 label/，不再套一层
+        self.assertEqual(name("scene_pre", "_pre"), "scene_pre")
+        self.assertEqual(name("scene_pre_bev", "_pre"), "scene_pre_bev_pre")
+        self.assertEqual(name("scene", ""), "scene")
+
 if __name__ == "__main__":
     unittest.main()

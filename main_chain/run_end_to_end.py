@@ -95,6 +95,17 @@ def write_labels_only(frames, clip_dir: Path) -> int:
     return count
 
 
+def final_clip_name(base: str, suffix: str) -> str:
+    """目标 clip 名：绝不叠加第二个后缀（例如 ``*_pre_pre``）。
+
+    ``<clip>`` + ``_pre`` -> ``<clip>_pre``；
+    ``<clip>_pre`` + ``_pre`` -> 原样返回：重跑就地重写 ``label/``。
+    """
+    if suffix and base.endswith(suffix):
+        return base
+    return base + suffix
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--clip", action="append", default=[])
@@ -110,7 +121,8 @@ def main():
     parser.add_argument("--sust-root", type=Path, default=DEFAULT_SUST_ROOT)
     parser.add_argument("--final-suffix", type=str, default="_pre")
     parser.add_argument("--overwrite", action="store_true",
-                        help="如果 <clip>_pre 已存在，先删除再生成")
+                        help="如果 <clip>_pre 已存在，先删除再生成；"
+                             "输入本身就是 <clip>_pre 时 = 只重写 label/")
     parser.add_argument("--sparsity-max-points", type=int, default=5,
                         help="step5: remove boxes containing this many points or fewer")
     parser.add_argument("--short-track-max-frames", type=int, default=3,
@@ -163,10 +175,20 @@ def main():
                          step45_root, step5_root):
                 path.mkdir(parents=True, exist_ok=True)
 
-            final_clip = clip.with_name(base + args.final_suffix)
+            final_clip = clip.with_name(
+                final_clip_name(base, args.final_suffix))
+            # 输入本身已是 <clip>_pre：就地重跑，只重写 label/，
+            # 既不改名也不 rmtree 输入目录（否则会把原始数据删掉）。
+            rerun_in_place = final_clip == clip
             print(f"\n===== [{index}/{len(clips)}] {base} =====", flush=True)
 
-            if final_clip.exists():
+            if rerun_in_place:
+                if not args.overwrite:
+                    raise SystemExit(
+                        f"重跑已标注的 clip 要带 --overwrite（只覆盖 {clip}/label）："
+                        f"{clip}")
+                print(f"{base}: 就地重跑（已标注，只重写 label/）", flush=True)
+            elif final_clip.exists():
                 if args.overwrite:
                     shutil.rmtree(final_clip)
                 else:
@@ -250,15 +272,22 @@ def main():
             final_json = step5_json
 
             # No intermediate clip is stored.  The input clip itself is
-            # renamed to <clip>_pre and only label/ is added.
-            clip.rename(final_clip)
-            try:
+            # renamed to <clip>_pre and only label/ is added.  When the input
+            # already carries the suffix it stays in place and only label/ is
+            # rewritten (never renamed to <clip>_pre_pre).
+            if rerun_in_place:
                 labels = write_labels_only(
                     json.loads(final_json.read_text(encoding="utf-8")),
-                    final_clip)
-            except Exception:
-                final_clip.rename(clip)
-                raise
+                    clip)
+            else:
+                clip.rename(final_clip)
+                try:
+                    labels = write_labels_only(
+                        json.loads(final_json.read_text(encoding="utf-8")),
+                        final_clip)
+                except Exception:
+                    final_clip.rename(clip)
+                    raise
 
             sust_dest = None
             if args.export_sust:
