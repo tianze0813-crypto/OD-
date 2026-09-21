@@ -5,9 +5,10 @@
 
 ## 常用命令（就这三条）
 
-> **默认都带 `--include-pre`**：已经是 `<clip>_pre` 的（即已标注过的）也会一起**就地覆盖重跑**，
-> 不会生成 `<clip>_pre_pre`。**想去掉就把 `--include-pre` 删掉** —— 那样会跳过所有 `*_pre`，
-> 只跑还没标注过的 clip（新 clip 第一次跑用这种）。
+> `--include-pre` 是**命令行开关，默认关**（不加它 = 跳过所有 `*_pre`，只跑没标注过的）。
+> 下面第 2、3 条命令我按**带 `--include-pre`** 的写法给 —— 因为平时最常见的场景是「连已标注过的
+> 一起重跑一遍」；带上它时，`<clip>_pre` 会被**就地覆盖重跑**（不改名，也不会生成 `<clip>_pre_pre`）。
+> 新 clip 第一次跑就把 `--include-pre` 删掉。
 
 ```bash
 # 1) 单条 clip：原地跑（原目录改名成 <clip>_pre，标签写在里面）
@@ -15,7 +16,7 @@
 bash hybrid_run.sh /media/moga/police/scene_001_crossroad_my_record_20260914_141401_clip4 --in-place --overwrite
 bash hybrid_run.sh /media/moga/police/scene_001_crossroad_my_record_20260914_141401_clip4_pre --in-place --overwrite
 
-# 2) 一批 clip：父目录下直接是各个 clip（带 --include-pre：已标注的也重跑）
+# 2) 一批 clip：父目录下直接是各个 clip（这里带 --include-pre：已标注的也一起重跑）
 bash hybrid_run.sh /media/moga/police --in-place --overwrite --include-pre
 #    只跑新 clip（跳过已标注的）= 把 --include-pre 去掉：
 #    bash hybrid_run.sh /media/moga/police --in-place --overwrite
@@ -50,8 +51,8 @@ done
 
 1. 权重是 git-lfs 指针，首次先 `git lfs pull`。
 2. `--in-place` 会把原目录改名成 `<clip>_pre`（原路径不再存在）。
-   `--include-pre`（**默认建议带**）会把已是 `*_pre` 的也收进来**就地覆盖重跑**；
-   **去掉它**就跳过所有 `*_pre`，只跑新 clip。另外，若 `X` 与 `X_pre` 同时存在，只跑 `X_pre`
+   `--include-pre` 默认**关**：不加就跳过所有 `*_pre`（只跑新 clip）；加上就把已是 `*_pre` 的
+   也收进来**就地覆盖重跑**。另外若 `X` 与 `X_pre` 同时存在，只跑 `X_pre`
    （先跑 `X` 会把它改名并删掉已有的 `X_pre`）。
 3. **同一时间只跑一个批跑**：BEVFusion 的预处理缓存（`bevfusion/work/infos/`、`bevfusion/data/police/<clip>/`）
    是共享的，两个进程同时跑会互相抢。现在每个 clip 有独立的 `<clip>_infos.pkl`、且拿不到帧会**直接报错停下**
@@ -125,7 +126,7 @@ done
 | 10 | 车链拿到空输入（0 帧 / 0 框）**直接报错停下** | `pipeline/vehicle_pass.py` + `main_chain/pipeline/step_vehicle_chain.py`，不会再产半成品 |
 | 11 | BEVFusion 的 infos 改成 **per-clip 文件 + 聚合文件按 clip 合并** | 以前是所有 clip 共用一个聚合文件、每次整体重写：两个进程（或交错跑不同 clip）互相覆盖就静默出 0 帧 |
 | 12 | 产出目录**不再写**过程数据 | `vehicle_pass_diagnostics.json` 要加 `--keep-vehicle-diagnostics` 才写（`label_car/label_truck/label_vru` 仍是 `--keep-chain-labels` 控制） |
-| 13 | `*_pre`（已标注）可以被**就地覆盖重跑** | `--include-pre` 收集 + 同名就地写（不再生成 `*_pre_pre`，也不会误删输入）；不加则照旧跳过 |
+| 13 | `*_pre`（已标注）可以被**就地覆盖重跑** | 加 `--include-pre`（默认关）才收集它们，配 `--in-place` 就地覆盖写（不再生成 `*_pre_pre`，也不会误删输入）；不加则照旧跳过 |
 
 
 ## 车链（Car + Truck 合并后处理）
