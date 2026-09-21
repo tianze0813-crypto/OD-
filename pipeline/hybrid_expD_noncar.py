@@ -163,11 +163,16 @@ def _hard_config(*, sparsity_max_points: int,
         str(name): float(value)
         for name, value in (class_score_thresholds or {}).items()
     }
+    # 【修·2026-09-21】per_class 之前只遍历 defaults 的键 -> 调用方传进来的其它类别
+    # （例如新的 Car 链传 {"Car": 0.2}）会被丢掉、退化成 fallback(0.3)。
+    # 现在把 overrides 里多出来的类别也纳入；不传的链行为完全不变。
+    names = list(defaults) + [k for k in overrides if k not in defaults]
     per_class = tuple(
         (name,
          overrides.get(name,
-                       fallback if score_threshold is not None else default))
-        for name, default in defaults.items()
+                       fallback if score_threshold is not None
+                       else defaults.get(name, fallback)))
+        for name in names
     )
     return HardFilterConfig(
         range_front=float(range_front),   # 【改动】
