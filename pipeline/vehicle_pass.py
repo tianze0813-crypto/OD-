@@ -34,6 +34,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from collections import Counter
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -213,6 +214,49 @@ def restore_geometry(out_json: Path, raw_json: Path,
     return {"restored": restored, "unmatched": missing}
 
 
+def _summarize_shared_stage(step2_diag: Path, step45_diag: Path) -> Dict[str, Any]:
+    """把共享 step2 / step4.5 的诊断摘成小块，方便直接看「动静态区域只算了一次」。"""
+    summary: Dict[str, Any] = {}
+    if Path(step2_diag).is_file():
+        d2 = json.loads(Path(step2_diag).read_text(encoding="utf-8"))
+        tracking_diag = d2.get("tracking", {})
+        slots = tracking_diag.get("slot_details", [])
+        summary.update({
+            "step2_detections": d2.get("final_detections"),
+            "tracks_total": tracking_diag.get("tracks_total"),
+            "slots": len(slots),
+            "slot_classes": dict(Counter(str(s.get("class_name")) for s in slots)),
+            "slot_bound_tracks": sum(1 for s in slots if s.get("track_id") is not None),
+            "hard_filter_removed": (d2.get("hard_filters", {})
+                                    .get("detections_removed")),
+            "short_tracks_dropped": (d2.get("short_track_filter", {})
+                                     .get("tracks_dropped")),
+            "min_lifecycle_by_class": (d2.get("short_track_filter", {})
+                                       .get("min_lifecycle_by_class")),
+            "mixed_tracks_unified": (d2.get("class_finalization", {})
+                                     .get("mixed_tracks_unified")),
+            "same_center_removed": (d2.get("same_center_deduplication", {})
+                                    .get("boxes_removed")),
+        })
+    if Path(step45_diag).is_file():
+        d45 = json.loads(Path(step45_diag).read_text(encoding="utf-8"))
+        summary.update({
+            "dynamic_region_area_m2": (d45.get("dynamic_region_mask", {})
+                                       .get("dynamic_area_m2")),
+            "dynamic_candidate_tracks": d45.get("candidate_tracks"),
+            "retrackable_detections": (d45.get("selection", {})
+                                       .get("retrackable_detections")),
+            "static_freeze_passed": d45.get("static_freeze", {}).get("passed"),
+            "retracking": {key: d45.get("retracking", {}).get(key)
+                           for key in ("matches", "births", "static_locks",
+                                       "occlusion_recoveries",
+                                       "lateral_jump_triggered")},
+            "queue_merges": (d45.get("queue_stitching", {}).get("merges")),
+            "phase_merges": len(d45.get("phase_stitching", {}).get("applied", [])),
+        })
+    return summary
+
+
 def _run_truck_branch(tracked_json: Path, clip: Path, work_root: Path,
                       params: Mapping[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Truck 几何/类别定稿：step2_5 -> step3_refinement -> truck_postprocess -> 类别统一。"""
@@ -385,6 +429,10 @@ def run(raw_json: Path, clip: Path, work_root: Path,
         if key in ("before_detections", "after_detections",
                    "point_filter_removed", "short_track_removed",
                    "car_only_removed")}
+
+    # ---- 3b) 共享阶段的关键指标（槽位 / 动态区域只算一次，落进诊断便于核对）----
+    diagnostics["shared_region"] = _summarize_shared_stage(
+        tracked_diagnostics, steps_root / f"{base}_step45_diagnostics.json")
 
     # ---- 4) Truck 几何还原（共享那遍只借 id）----
     restore = restore_geometry(step45_json, vehicle_raw)
