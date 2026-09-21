@@ -35,6 +35,7 @@ from pipeline.hybrid_expD_truck import run as run_expd_truck
 from pipeline.hybrid_expD_car import run as run_expd_car            # noqa: E402
 from pipeline.hybrid_expD_vru import run as run_expd_vru
 from pipeline.hybrid_main_car import run as run_main_car
+from pipeline.vehicle_pass import run as run_vehicle_pass        # 【改动】车链合并后处理
 from pipeline.hybrid_merge import merge_label_frames
 
 
@@ -443,7 +444,11 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
              vru_ckpt: Path = VRU_CKPT,
              vru_raw_threshold: float = 0.3,
              keep_chain_labels: bool = False,
-             car_truck_cover_threshold: float = 0.5) -> Dict[str, Any]:   # 已停用，见 _merge_chain_labels
+             # 已停用（见 _merge_chain_labels：Car 优先接管 Car/Truck 冲突）
+             car_truck_cover_threshold: float = 0.5,
+             # 【改动】2026-09-21 Car+Truck 合并成一条后处理（共享动静态区域）；
+             # --no-car-truck-merged 可回退到原来的两条链，方便 A/B。
+             car_truck_merged: bool = True) -> Dict[str, Any]:
     base = clip.name
     tag = output_tag.strip("_-")
     if output_suffix:                       # 【改动】<clip名><后缀>，例如 ..._clip4_pre_bev
@@ -474,6 +479,8 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
     merged: List[Dict[str, Any]] | None = None
     merge_diag: Dict[str, Any] | None = None
     timings: Dict[str, float] = {}
+    # 车链诊断（在 work 临时目录里，跑完要落到输出目录；直接留 dict）
+    vehicle_diag_data: Dict[str, Any] | None = None
     clip_start = time.monotonic()
     with tempfile.TemporaryDirectory(prefix=f"hybrid_{base}_") as temp:
         work = Path(temp)
@@ -492,7 +499,55 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
                 bev_raw = _run_raw_bevfusion(python, clip, work / "bev_raw",
                                              bev_raw_threshold, truck_detector_mode)
                 _print(f"{base}: BEVFusion raw json（三链共用）-> {bev_raw.name}")
-        if "car" in selected:
+        merged_vehicle = bool(
+            car_truck_merged and "car" in selected and "truck" in selected
+            and str(car_detector) == "bevfusion" and str(truck_detector) == "bevfusion")
+        if merged_vehicle:
+            # 【改动】2026-09-21 车链：Car 与 Truck 共用一份 BEVFusion 检测 + 一次后处理
+            # （静态槽位 / 动态区域 / 重跟踪 / ID 继承只算一次，类别冲突按 Car 优先）
+            step += 1
+            _print(f"{base}: {step}/{total} 车链（Car+Truck 合并后处理：一次跟踪 + 一次动态区域）")
+            _t = time.monotonic()
+            if bev_raw is None:
+                bev_raw = _run_raw_bevfusion(python, clip, work / "bev_raw",
+                                             bev_raw_threshold, truck_detector_mode)
+            vehicle_diag = work / "vehicle_diagnostics.json"
+            vehicle = run_vehicle_pass(
+                bev_raw, clip, work / "vehicle", python,
+                diagnostics_path=vehicle_diag,
+                trailer_rules=bool(trailer_rules),
+                trailer_dup_iom=float(trailer_dup_iom),
+                trailer_dup_iou=float(trailer_dup_iou),
+                trailer_merge_iou=float(trailer_merge_iou),
+                trailer_policy=str(trailer_policy),
+                class_score_thresholds={
+                    "Car": float(car_score_threshold),
+                    "Truck": 0.2,
+                    "Trailer": float(trailer_score_threshold)},
+                truck_short_track_max_frames=int(short_track_max_frames) or 4,
+            )
+            elapsed = round(time.monotonic() - _t, 1)
+            timings["vehicle"] = elapsed
+            timings["car"] = elapsed
+            timings["truck"] = 0.0
+            chain_labels["car"] = _frames_to_labels(vehicle["car_frames"], 0)
+            chain_labels["truck"] = _frames_to_labels(vehicle["truck_frames"],
+                                                      TRUCK_ID_OFFSET)
+            vd = vehicle["diagnostics"]
+            vehicle_diag_data = vd
+            chain_stats["car"] = {
+                "pipeline": "vehicle_pass(car)",
+                "detector": str(car_detector),
+                "final_detections": vd.get("car_detections"),
+                "frames": len(chain_labels["car"]),
+                "shared_region": "一次（Car+Truck 并集）"}
+            chain_stats["truck"] = {
+                "pipeline": "vehicle_pass(truck)",
+                "detector": str(truck_detector),
+                "trailer_policy": str(trailer_policy),
+                "final_detections": vd.get("truck_detections"),
+                "frames": len(chain_labels["truck"])}
+        elif "car" in selected:
             step += 1
             if car_pipeline == "hybrid":     # 【改动】项目内的测试适配 Car 链
                 car_det = ("BEVFusion car 头" if car_detector == "bevfusion"
@@ -537,7 +592,7 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
                                    else "main_chain/models/vn_waymo_v2_4gpu_full_epoch10.pth"),
                     "final_detections": main_result.get("final_detections"),
                     "frames": len(chain_labels["car"])}
-        if "truck" in selected:
+        if "truck" in selected and not merged_vehicle:
             step += 1
             if truck_detector == "bevfusion":
                 _print(f"{base}: {step}/{total} Truck 链（BEVFusion "
@@ -676,8 +731,15 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
     timings["total"] = round(time.monotonic() - clip_start, 1)
     _print(f"{base}: 计时 " + ", ".join(
         f"{key}={value}s" for key, value in timings.items()))
+    # 【改动】车链诊断写到输出目录（临时 work 目录结束后会被删，批跑时就看不到了）
+    if vehicle_diag_data is not None and destination is not None \
+            and destination.exists():
+        (destination / "vehicle_pass_diagnostics.json").write_text(
+            json.dumps(vehicle_diag_data, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8")
     if keep_chain_labels and destination is not None and destination.exists():
-        for name, subdir in (("truck", "label_truck"), ("vru", "label_vru")):
+        for name, subdir in (("car", "label_car"), ("truck", "label_truck"),
+                             ("vru", "label_vru")):      # 【改动】车链也留 Car 单支
             items = chain_labels.get(name) or {}
             if not items:
                 continue
@@ -771,6 +833,10 @@ def main() -> int:
     parser.add_argument("--trailer-dup-iom", type=float, default=0.70)
     parser.add_argument("--trailer-dup-iou", type=float, default=0.50)
     parser.add_argument("--trailer-merge-iou", type=float, default=0.05)
+    parser.add_argument("--no-car-truck-merged", dest="car_truck_merged",
+                        action="store_false",
+                        help="【改动】回退到原来的 Car / Truck 两条独立链（A/B 对比用）；"
+                             "默认是 Car+Truck 合并成一条后处理（共享动静态区域）")
     parser.add_argument("--trailer-policy", choices=["keep", "to-truck"],
                         default="to-truck",
                         help="keep: 纯挂车轨迹保留 Trailer；to-truck（默认）: 一律并成 Truck")
@@ -934,6 +1000,7 @@ def main() -> int:
             trailer_dup_iou=args.trailer_dup_iou,
             trailer_merge_iou=args.trailer_merge_iou,
             trailer_policy=args.trailer_policy,
+            car_truck_merged=bool(args.car_truck_merged),
             vru_cfg=vru_cfg,
             vru_ckpt=vru_ckpt,
             vru_raw_threshold=args.vru_raw_threshold,

@@ -3,50 +3,107 @@
 输入：SUSTechPOINTS 原始 clip（含 `lidar/lidar_top/*.bin` 与 `transforms/`）。
 输出：每帧写在 `<clip>_pre/label/<frame_id>.json`，可直接用 SUSTechPOINTS 打开。
 
-## 接入链路：三条独立链，按 Car -> Truck -> VRU 顺序执行
+## 接入链路：两次推理、两条后处理（Car+Truck 合并）
 
 ```text
-1. Car    main_chain/（Waymo Car + Step4.5，或 --detector bevfusion
-          换成 BEVFusion car 头）                              -> Car                      obj_id 从 1
-2. Truck  pipeline/hybrid_expD_truck.py（BEVFusion 检测器 + 货车/挂车类别合并
-          + 跟踪/过滤/精修 + Truck 专用后处理）                 -> Truck / Trailer          obj_id +1000
-3. VRU    pipeline/hybrid_expD_vru.py                          -> Pedestrian / NMV          obj_id +2000
-                                    ↓
-                     按 frame_id 合并成一份 label/
+推理 #1  BEVFusion（纯雷达，10 类，一次前向）
+             ↓
+        车链 pipeline/vehicle_pass.py（一次后处理）
+             ↓ 类别合并（truck/bus/trailer/工程车 -> Truck，挂车默认并成 Truck）
+             ↓ main_chain/pipeline/step_vehicle_chain.py
+                  step2 共享身份跟踪（静态 slot / 动态区域证据按类别优先级仲裁，Car 优先）
+                  → Car 视图 step3/step4（轿车精修）
+                  → step4.5 共享动态区域 + 重跟踪 + ID 继承 + 相位拼接（只算一次）
+                  → Car 视图 step5 终检 + base_link
+             ↓ Truck 几何还原（只借共享那遍的 id）+ Truck 分支
+                  step2_5 → step3_refinement（Truck 几何 + yaw v2）→ truck_postprocess
+                  → 轨迹级 Truck/Trailer 统一 → base_link
+             ↓ 按 frame_id 合成                                      -> Car               obj_id 从 0
+                                                                     -> Truck             obj_id +1000
+推理 #2  VoxelNeXt VRU（单头两类）pipeline/hybrid_expD_vru.py（原样不动）
+                                                                     -> Pedestrian / NMV  obj_id +2000
 ```
 
-三条链各自独立推理、独立后处理、独立调参（范围 / 阈值 / yaw 策略互不干扰），
-最后才合并。顺序固定为 **Car -> Truck -> 最后 Pedestrian/Nonmotorized_vehicle**。
+要点（用户 2026-09-21 决定）：
 
-> Truck 链 2026-09-20 起改用 BEVFusion（默认纯雷达权重）+ 货车/挂车类别合并，详见下文《Truck 链》一节。
-> Car 链 2026-09-21 起也能用 BEVFusion：main_chain 加 `--detector bevfusion`；
-> 另有只做通用后处理的 `pipeline/hybrid_expD_car.py`（`--car-pipeline hybrid`），详见《Car 链》一节。
+1. **Car 与 Truck 共用同一份 BEVFusion 原始检测**（只推理一次），
+   **动静态区域合起来只算一次**：静态 slot（停车位）与动态区域（高速证据 + swept box）
+   的输入是 Car/Truck 的并集 —— 之前两条链各算一遍，而且各自只看得到自己那条链的类别。
+2. **Car 与 Truck 冲突一律按 Car 算**（同一槽位 / 同一物理目标被 car 头与 truck 头重复表示）：
+   做成类别优先级表 `tracking.CLASS_PRIORITY`，落在混合轨迹定类、同中心去重排序、
+   槽位类别投票、槽位绑定顺序四处。标注侧类别人工好修，所以不做更细的仲裁。
+3. 旧的「Car 被 Truck 覆盖 >= 阈值就删整条 Car 轨迹」规则**已停用**（车链内部按 Car 优先
+   裁决冲突），代码保留在 `_drop_cars_covered_by_trucks`，需要时恢复。
+4. **行人 / 非机动车完全不动**：VoxelNeXt 单头两类推理 + 原来的 VRU 后处理。
+5. 想要旧的「Car / Truck 两条独立链」做 A/B：加 `--no-car-truck-merged`。
 
-> 旧的两链模式（main Car + VOD 五类非车，Bus 在非车链开头折叠成 Truck）仍保留：
-> 加 `--chains car,noncar`，参数见《附录：旧五类非车链》。
+> 探测范围（2026-09-21 起）对齐标注 ROI：`point_cloud_range = [-54.0, -80.4, -5.0, 54.0, 20.4, 3.0]`、
+> `BEV_GRID = [1440, 1344, 41]`。数据 `lidar_top` 系里 **前进 = -y、侧向 = ±x**，原来是 ±54 对称，
+> 所以前方只能看到 54 m；现在前 80.4 / 后 20.4 / 侧 ±54。单一真源在两个
+> `bevfusion/configs/police_bevfusion_mmdet3d*.py`，`tests/test_bevfusion_range.py` 守一致性。
+
+> 单链调试入口仍保留：`pipeline/hybrid_expD_car.py`（Car 只做通用后处理）、
+> `pipeline/hybrid_expD_truck.py`（Truck 单链），以及 main_chain 自己的
+> `run_end_to_end.py`（Waymo 检测器 + Car 专属精修）。
+> 旧的两链模式（main Car + VOD 五类非车）也还在：`--chains car,noncar`。
 
 入口是 `hybrid_run.sh`，会自动探测本机 OpenPCDet 环境（默认
 `~/miniconda3/envs/openpcdet`），不需要手动激活 conda。
 
-## 三条链的权重
+## 两条后处理的权重
 
 | 链 | 权重 | 推理配置 | raw 分数门槛 |
 | --- | --- | --- | --- |
-| Car | 默认 `main_chain/models/vn_waymo_v2_4gpu_full_epoch10.pth`（Waymo）；可换 `models/bevfusion_mmdet3d_lidaronly.pth`（BEVFusion，纯雷达） | `main_chain/models/voxelnext_v2_waymo_infer.yaml`；BEVFusion 用 `bevfusion/configs/police_bevfusion_mmdet3d_lidaronly.py` | `--score-thresh`（Waymo，内部默认 0.3）/ `--bevfusion-score-thresh`（默认 0.2） |
-| Truck | `models/bevfusion_mmdet3d_lidaronly.pth`（默认，纯雷达）<br>可选 `models/bevfusion_mmdet3d_lidarcam.pth`（C+L） | `bevfusion/configs/police_bevfusion_mmdet3d_lidaronly.py`<br>可选 `..._mmdet3d.py` | `--truck-raw-threshold`（默认 `0.1`） |
+| 车链（Car + Truck）<br>**一次推理** | `models/bevfusion_mmdet3d_lidaronly.pth`（默认，纯雷达，46 MB）<br>可选 `models/bevfusion_mmdet3d_lidarcam.pth`（C+L，慢约 2.5 倍） | `bevfusion/configs/police_bevfusion_mmdet3d_lidaronly.py`<br>可选 `..._mmdet3d.py` | `--bev-raw-threshold`（默认 `0.1`）；链内 per-class：Car 0.2 / Truck 0.2 / Trailer 0.25 |
+| 车链（旧单链） | Car：`main_chain/models/vn_waymo_v2_4gpu_full_epoch10.pth`（Waymo）<br>Truck：可选 `models/voxelnext_truckB_epoch15.pth` | `main_chain/models/voxelnext_v2_waymo_infer.yaml`<br>`models/voxelnext_truck_infer.yaml` | `--score-thresh` / `--truck-raw-threshold` |
 | VRU | `models/voxelnext_vru_1head2cls_epoch20.pth` | `models/voxelnext_vru_infer.yaml` | `--vru-raw-threshold`（默认 `0.3`） |
 
 `models/*.pth` 只有 133 字节 = Git LFS 指针，先 `git lfs pull` 再跑。
 
 ## 合并规则
 
-1. 三条链的框按 `frame_id` 拼到一起；同帧 `obj_id` 冲突时自动分配一个空闲 id。
-2. **Car 被 Truck 覆盖的面积 / Car 面积 ≥ 阈值 -> 删掉该 Car 轨迹的全部帧**
-   （`--car-truck-cover-threshold`，默认 `0.5`，给 `0` 关闭）。
-   - 判据是"交面积 / Car 面积"，**不是 IoU** —— Truck 比 Car 大得多，IoU 天然偏小；
-   - 同一 Car id 只要有任意一帧命中，**整条轨迹（所有帧）都删**，不是只删重叠那一帧。
+1. 车链一次输出 Car（obj_id 0+）与 Truck（+1000），VRU 链输出 Ped/NMV（+2000），
+   按 `frame_id` 拼到一起；同帧 `obj_id` 冲突时自动分配一个空闲 id。
+2. **旧的「Car 被 Truck 覆盖 ≥ 阈值就删整条 Car 轨迹」规则已停用**（2026-09-21）。
+   现在 Car/Truck 归属冲突在车链内部就按 **Car 优先**裁决（同一槽位、同一目标被两类
+   重复表示时都算 Car），所以合并阶段不再需要互相删除。
+   `_drop_cars_covered_by_trucks` 函数体与 `--car-truck-cover-threshold` 参数都保留着，
+   恢复调用即可回退到旧行为。
 
-## Car 链（两条可选 + 两种检测器）
+## 车链（Car + Truck 合并后处理）
+
+入口：`pipeline/vehicle_pass.py`（编排）+ `main_chain/pipeline/step_vehicle_chain.py`（共享阶段驱动）。
+默认开启；`--no-car-truck-merged` 回退到原来的 Car / Truck 两条独立链。
+
+| # | 阶段 | 在哪 | 共享 / 分叉 |
+| --- | --- | --- | --- |
+| 0 | 类别合并（跟踪前，时机不变） | `geometry/truck_trailer_rules.merge_classes_pre(keep_other_classes=True)` | 共享；`truck/bus/trailer/construction_vehicle -> Truck`（挂车默认并成 Truck，因为标注侧没有 Trailer） |
+| 1 | 类别白名单 + 早期范围/分数过滤 | `hybrid_expD_noncar._noncar_filter/_early_range_filter` + `apply_category_score_filter` | 共享；per-class：Car 0.2 / Truck 0.2 / Trailer 0.25 |
+| 2 | **身份跟踪**（类过滤 + 槽位发现 + StaticFirstTracker + 硬过滤 + 同中心去重 + 短轨迹 + 静态/整合 yaw + 轨迹级类别统一） | `main_chain` step2 | **共享（并集）**；per-class 稀疏度 Car 5 / Truck 10、短轨迹 Car 3 / Truck 4；冲突按 Car 优先 |
+| 3 | 轿车框拟合 + 尺寸闸门 | `main_chain` step3/step4 | Car 只在 Car 视图上跑（Truck 几何不动）；step4 的「大 Car 改写成 Truck」默认关 |
+| 4 | **动态区域 + 重跟踪 + ID 继承 + 队列/相位拼接** | `main_chain` step4.5 | **共享（并集，只算一次）** |
+| 5 | Truck 几何还原 | `vehicle_pass.restore_geometry` | 只把 Truck/Trailer 的 `box_lidar` 还原成 BEVFusion 原值，保留共享那遍的 `track_id` |
+| 6 | Truck 定稿：`step2_5` → `step3_refinement`（Truck 几何 + yaw v2）→ `truck_postprocess` → 轨迹级 Truck 统一 | `pipeline/hybrid_expD_truck.py` 的原阶段 | 分叉（Truck 专用参数：`static_yaw_enabled=False`、`static_rotation_enabled=False`、`yaw_impl="v2"`、`truck_merge_enabled=False`） |
+| 7 | Car 终检 + base_link | `main_chain` step5 | 分叉（点 / 短轨 + Car-only + base_link） |
+
+参数默认值在 `pipeline/vehicle_pass.py::DEFAULTS`（车链共用 + Truck 分支）与
+`main_chain/pipeline/step_vehicle_chain.py::DEFAULTS`（共享阶段的 Car/Truck per-class 门槛）。
+`--trailer-policy` 默认 `to-truck`（纯挂车轨迹也并成 Truck）。
+
+实测（RTX A4000，80 帧 clip，BEVFusion 纯雷达已在缓存）：
+
+| 场景 | 车链耗时 | 说明 |
+| --- | --- | --- |
+| 停车场 clip2（Car 2758 / Truck 8） | 114.6 s | 旧的 Car 链 102.6 s + Truck 链 30~38 s |
+| 十字路口 clip4（Car 831 / Truck 359） | **45.8 s** | 含共享 step4.5；整链（含 BEV 预处理+推理 25 s）71 s |
+
+调参顺序建议：先看 `vehicle_pass_diagnostics.json` 里的
+`truck_trailer_class_merge` / `class_filter` / `early_class_score_filter` /
+`car_step5` / `truck_geometry_restore` / `truck_branch`，再去看
+`vehicle_chain/<clip>_step2_diagnostics.json`（槽位、按类别短轨迹、混类轨迹统一）
+与 `<clip>_step45_diagnostics.json`（动态区域、候选轨迹、static_freeze）。
+
+## Car 单链（**调试/回退**：`--no-car-truck-merged` 时才走）
 
 2026-09-21 起 Car 有两个可选实现、检测器也有两档，**后处理语义都产出 SUST 可读的 base_link 标签**：
 
@@ -93,7 +150,7 @@ main_chain 的硬过滤用**原始类别字符串**比对白名单、且分数/�
 
 > 测试用的一键脚本：`scripts/run_bevfusion_test_chains.py`（原始检测 → Car(hybrid)+Truck+VRU 合成一份标签）。
 
-## Truck 链（`pipeline/hybrid_expD_truck.py` + `bevfusion/`）
+## Truck 单链（**调试/回退**）
 
 2026-09-20 起检测器换成 **BEVFusion**（mmdet3d 1.x 官方 20 epoch 权重），并引入 **Trailer（挂车）** 与「货车/挂车类别合并」。
 只动这条链：Car（main_chain）与 VRU 链的代码路径、阈值、行为都没变
@@ -333,7 +390,8 @@ done
 | `<input_root>` | 必填 | 单个 clip 目录，或包含多个 clip 的父目录 |
 | `<output_root>` | `~/SUSTechPOINTS/data` | 导出 SUST 时的输出根目录；`--in-place` 时忽略 |
 | `--chains` | `car,truck,vru` | 要跑的链，逗号分隔，按 car -> truck -> vru 顺序执行；可选 `car` / `truck` / `vru` / `noncar`（旧五类单链） |
-| `--car-truck-cover-threshold` | `0.5` | Car 被 Truck 覆盖的面积 / Car 面积达到该值就删掉整条 Car 轨迹；`0` 关闭 |
+| `--no-car-truck-merged` | 关（即默认合并） | 回退到 Car / Truck 两条独立链，A/B 用 |
+| `--car-truck-cover-threshold` | `0.5` | **已停用**：Car/Truck 冲突改由车链内部的 Car 优先裁决（函数体保留） |
 | `--keep-chain-labels` | 关 | 额外把 `label_truck/` `label_vru/` 写进输出 clip |
 | `--in-place` | 关 | 原地端到端：输入 clip 改名 `<clip>_pre` |
 | `--export-sust` | **开** | 导出到 `<output_root>/<clip>_pre`；与 `--in-place` 互斥 |
@@ -355,7 +413,7 @@ done
 | `--trailer-score-threshold` | `0.25` | Trailer 类别分数阈值（Truck 固定 0.2） |
 | `--trailer-dup-iom` / `--trailer-dup-iou` | `0.70` / `0.50` | 判"挂车是货车的重复框"的 IoM / IoU 门限 |
 | `--trailer-merge-iou` | `0.05` | 挂车与货车有交集判据（命中就并集成大长 Truck） |
-| `--trailer-policy` | `keep` | `keep`：纯挂车轨迹保留 Trailer；`to-truck`：一律并成 Truck |
+| `--trailer-policy` | **`to-truck`** | `to-truck`（默认，标注侧没有 Trailer）：一律并成 Truck；`keep`：纯挂车轨迹保留 Trailer |
 | `--no-trailer-rules` | 关 | 关掉类别合并（去重/并集/轨迹统一），回退到只有 Truck 的旧行为 |
 
 其余（范围 80/20/40、Truck 0.2 / Trailer 0.25、短轨迹 4、yaw v2、Truck 后处理各开关）
@@ -425,13 +483,18 @@ done
 ## 目录
 
 ```text
-hybrid_run.sh           入口（三链：Car -> Truck -> VRU）
-main_chain/             最新 OD-main-0909 快照（Waymo Car 链路 + Step4.5；
-                        pipeline/step1_bevfusion.py 支持 --detector bevfusion）
-pipeline/               各链主体：hybrid_expD_noncar / hybrid_expD_truck / hybrid_expD_vru
-                        hybrid_main_car（Car 链调用）、hybrid_merge（标签合并）
-                        step1_bevfusion_truck.py（Truck 链 BEVFusion 检测入口）
-                        hybrid_expD_car.py（Car 通用后处理链：--car-pipeline hybrid 时用）
+hybrid_run.sh           入口（两条后处理：车链 Car+Truck -> VRU）
+main_chain/             最新 OD-main-0909 快照（Car 链路 + region 动静态区域）
+                        pipeline/step_vehicle_chain.py  车链共享阶段驱动（step2 + step3/4/4.5/5）
+                        pipeline/step1_bevfusion.py      BEVFusion 检测入口
+pipeline/               各链主体：
+                        vehicle_pass.py   车链编排（Car+Truck 一次后处理，默认路径）
+                        hybrid_expD_vru.py            VRU 链（VoxelNeXt 单头两类，原样不动）
+                        hybrid_expD_noncar.py         非车后处理主体（step2_5 / step3 等阶段）
+                        hybrid_expD_truck.py          Truck 单链（调试/回退）+ Truck 分支阶段
+                        hybrid_expD_car.py            Car 通用后处理单链（调试/回退）
+                        hybrid_main_car.py            main_chain Car 链调用
+                        hybrid_merge.py               标签合并
 bevfusion/              Truck 链的 BEVFusion 工具箱（配置 + prep/infer/评测脚本，见其 README）
 geometry/truck_trailer_rules.py  货车/挂车类别合并（去重 / 并集 / 轨迹级类别统一）
 geometry/truck_postprocess.py   Truck 专用后处理（yaw 修正 / 静止平滑 / 可选并集与贴合）
@@ -450,8 +513,16 @@ tests/                  单元测试
 测试：
 
 ```bash
-python -m unittest discover -s tests -p 'test_*.py'
+# 车链（混合链路侧）
+~/miniconda3/envs/openpcdet/bin/python -m unittest discover -s tests -t .
+# main_chain（Car 链 + 动静态区域 + 车链共享驱动）
+cd main_chain && ~/miniconda3/envs/openpcdet/bin/python -m unittest discover -s tests -t .
 ```
+
+车链相关测试：`tests/test_bevfusion_range.py`（检测范围配置一致性）、
+`tests/test_class_policy.py`（挂车/工程车并 Truck、覆盖规则停用）、
+`tests/test_vehicle_pass.py`（类别视图切分、Truck 几何还原）、
+`main_chain/tests/test_class_priority.py`（Car 优先的四处落点）。
 
 ## 附录：旧五类非车链（`--chains car,noncar`）
 

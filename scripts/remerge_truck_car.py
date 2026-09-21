@@ -3,9 +3,15 @@
 
 适用场景：只改了 Truck 链参数或合并规则，不想重跑耗时的 Car 链。
 
+【2026-09-21 注意】Car 与 Truck 已经合并成一条后处理（pipeline/vehicle_pass.py）：
+Truck 的 id 来自与 Car 共享的那一遍身份跟踪 / 动态区域，所以**单独重跑 Truck 链已经
+拿不到同一套 id**。默认路径下要重跑就整条车链重跑（加 --no-car-truck-merged 才回到
+老的两条独立链，此时本脚本仍然适用）。
+
 规则（2026-09-18 用户指定）：
   1. Truck 链不再做 IoU 并集合并（geometry/truck_postprocess.py: merge_enabled=False）
   2. Car 被 Truck 覆盖的面积 / Car 面积 >= 阈值 → 删掉【该 Car id 的全部帧】
+     （2026-09-21 起该规则在车链内部被 Car 优先取代，本脚本传 0 关闭）
 
 用法：
   python scripts/remerge_truck_car.py --output-root <含 <clip>_pre 的目录> [--write]
