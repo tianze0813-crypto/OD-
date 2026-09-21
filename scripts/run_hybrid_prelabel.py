@@ -796,8 +796,9 @@ def main() -> int:
     parser.add_argument("--noncar-ckpt", type=Path, default=NONCAR_CKPT,
                         help="non-Car checkpoint (default: expD_e8.pth)")
     parser.add_argument("--chains", type=str, default=",".join(DEFAULT_CHAINS),
-                        help="要跑的链，逗号分隔，按 car -> truck -> vru 顺序执行；"
-                             "可选 car,truck,vru,noncar（noncar=旧五类单链）")
+                        help="要跑的链，逗号分隔；默认 car+truck 合成一条车链跑完再跑 vru；"
+                             "可选 car,truck,vru,noncar（noncar=旧五类单链）。"
+                             "只选 car 或只选 truck 时走各自的单链（调试用）")
     parser.add_argument("--truck-cfg", type=Path, default=TRUCK_CFG)
     parser.add_argument("--truck-ckpt", type=Path, default=TRUCK_CKPT)
     parser.add_argument("--truck-raw-threshold", type=float, default=0.1)

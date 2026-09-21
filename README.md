@@ -3,6 +3,123 @@
 输入：SUSTechPOINTS 原始 clip（含 `lidar/lidar_top/*.bin` 与 `transforms/`）。
 输出：每帧写在 `<clip>_pre/label/<frame_id>.json`，可直接用 SUSTechPOINTS 打开。
 
+## 常用命令（先看这里）
+
+> 详细原理、阈值、阶段表都在下面《详细说明》里；这里只放平时要敲的命令。
+
+### 0. 环境（一次性）
+
+```bash
+git lfs pull                     # models/*.pth 是 LFS 指针（133 字节），不拉会跑不了
+bash hybrid_run.sh --help        # 入口会自动探测 openpcdet 环境，不用手动 activate
+# 指定 python：PYTHON=/home/moga/miniconda3/envs/openpcdet/bin/python bash hybrid_run.sh ...
+```
+
+BEVFusion 需要额外的 `mmdet3d` 环境与 CUDA 算子，见《详细说明 → 依赖（BEVFusion 相关）》。
+
+### 1. 整批 / 单条 clip：原地端到端（最常用）
+
+结果写在**原 clip 同级的 `<clip>_pre/label/*.json`**（base_link，SUST 直接能开）。
+
+```bash
+# 单条 clip
+bash hybrid_run.sh /media/moga/police/scene_001_crossroad_my_record_20260914_141401_clip4 --in-place --overwrite
+
+# 一整个目录下的所有 clip（自动收集，跳过 *_pre 与 lost+found）
+# 注意：--in-place 会把这些 clip 全部就地改名成 *_pre，想先看效果就用第 2 种 + --link-only
+bash hybrid_run.sh /media/moga/police --in-place --overwrite
+
+# 分场景 / step2 的嵌套结构（police/0903）：用 shell 逐层遍历，见《详细说明 → 批量运行》
+```
+
+注意：`--in-place` 会把原目录改名成 `<clip>_pre`（标签写在里面），原路径不再存在。
+
+### 2. 不改输入：导出到别的目录
+
+```bash
+bash hybrid_run.sh <input_root> <output_root> --overwrite
+bash hybrid_run.sh <input_root> <output_root> --overwrite --link-only        # 只软链 image/lidar/transforms，快
+bash hybrid_run.sh <input_root> <output_root> --output-suffix _vehicle ...   # 输出名 <clip>_vehicle（不套 _pre）
+```
+
+### 3. 选链
+
+```bash
+--chains car,truck,vru   # 默认：车链（Car+Truck 合并后处理）+ VRU
+--chains car,truck       # 只车链
+--chains vru             # 只行人/非机动车
+--chains car,noncar      # 旧的「main Car + 五类非车」两链（见附录）
+```
+
+### 4. 只跑链路、不落盘（调试，只打印统计）
+
+```bash
+bash hybrid_run.sh <clip> /tmp/unused --no-export-sust --overwrite
+```
+
+### 5. 复用已经跑好的 BEVFusion 原始检测（不重新推理）
+
+```bash
+bash hybrid_run.sh <input_root> <output_root> --bev-raw-dir <存放 <clip名>_raw.json 的目录> ...
+```
+
+### 6. 单条链单独跑（排查用）
+
+```bash
+# 车链（Car+Truck 一次后处理）—— --export 只把两支写进 clip 的 label_car/ label_truck/，
+# 合成后的 label/ 由整批入口（hybrid_run.sh）负责；诊断在 <work-root>/vehicle_pass_diagnostics.json
+python pipeline/vehicle_pass.py --raw-json <bev_raw.json> --clip <clip> \
+    --work-root /tmp/vehicle --diagnostics /tmp/vehicle/diag.json --export
+
+# 只跑 BEVFusion 推理，拿 raw json（纯雷达）
+python pipeline/step1_bevfusion_truck.py --clip <clip> --work-root work/step1 --mode lidar --score-thresh 0.1
+
+# Car 单链（通用后处理）/ Truck 单链 / main_chain 的 Waymo Car 链
+python pipeline/hybrid_expD_car.py   --clip <clip> --out-json work/car.json   --label-subdir label_car   --link-dir <输出目录>
+python pipeline/hybrid_expD_truck.py --clip <clip> --out-json work/truck.json --detector bevfusion --detector-mode lidar --label-subdir label_truck
+cd main_chain && python run_end_to_end.py --clip <clip> --export-sust
+
+# VRU 单链（先用 models/voxelnext_vru_infer.yaml + voxelnext_vru_1head2cls_epoch20.pth 出 raw）
+python pipeline/hybrid_expD_vru.py --raw-json <vru_raw.json> --clip <clip> --out-json work/vru.json --label-subdir label_vru
+```
+
+### 7. 回退 / A-B 开关
+
+```bash
+--no-car-truck-merged     # 车链拆回 Car / Truck 两条独立链（对比用）
+--trailer-policy keep     # 纯挂车轨迹保留 Trailer 类（默认 to-truck：一律并成 Truck）
+--car-pipeline hybrid     # Car 走通用后处理单链（默认 main_chain）
+--car-detector waymo|bevfusion   --vru-detector voxelnext|bevfusion
+--car-truck-cover-threshold      # 已停用（车链内部按 Car 优先裁决）
+```
+
+### 8. 跑测试
+
+```bash
+~/miniconda3/envs/openpcdet/bin/python -m unittest discover -s tests -t .            # 混合链路侧
+cd main_chain && ~/miniconda3/envs/openpcdet/bin/python -m unittest discover -s tests -t .
+```
+
+### 9. 跑完先看哪里
+
+```text
+<clip>_pre/
+├── label/                        ← 合并后的标签（Car 1+ / Truck +1000 / PedNMV +2000）
+├── label_car / label_truck / label_vru   ← 分链标签（--keep-chain-labels）
+├── vehicle_pass_diagnostics.json ← 车链过程数据：shared_region（槽位数/类别、动态区域面积、
+│                                   候选轨迹、可重跟踪检测数、static_freeze）、挂车折叠数、
+│                                   Truck 几何还原数、Car step5 统计
+├── lidar / image / transforms
+└── （每次运行入口也会打印一行计时：vehicle / vru / merge / export / total）
+```
+
+常见问题：权重只有 133 字节 → `git lfs pull`；`<clip>` 不见了 → `--in-place` 已改名成
+`<clip>_pre`；已标注的 `*_pre` 不会被重复处理（要重跑就改回不带 `_pre` 的名字）。
+
+---
+
+# 详细说明
+
 ## 接入链路：两次推理、两条后处理（Car+Truck 合并）
 
 ```text
@@ -50,25 +167,19 @@
 入口是 `hybrid_run.sh`，会自动探测本机 OpenPCDet 环境（默认
 `~/miniconda3/envs/openpcdet`），不需要手动激活 conda。
 
-## 两条后处理的权重
 
-| 链 | 权重 | 推理配置 | raw 分数门槛 |
-| --- | --- | --- | --- |
-| 车链（Car + Truck）<br>**一次推理** | `models/bevfusion_mmdet3d_lidaronly.pth`（默认，纯雷达，46 MB）<br>可选 `models/bevfusion_mmdet3d_lidarcam.pth`（C+L，慢约 2.5 倍） | `bevfusion/configs/police_bevfusion_mmdet3d_lidaronly.py`<br>可选 `..._mmdet3d.py` | `--bev-raw-threshold`（默认 `0.1`）；链内 per-class：Car 0.2 / Truck 0.2 / Trailer 0.25 |
-| 车链（旧单链） | Car：`main_chain/models/vn_waymo_v2_4gpu_full_epoch10.pth`（Waymo）<br>Truck：可选 `models/voxelnext_truckB_epoch15.pth` | `main_chain/models/voxelnext_v2_waymo_infer.yaml`<br>`models/voxelnext_truck_infer.yaml` | `--score-thresh` / `--truck-raw-threshold` |
-| VRU | `models/voxelnext_vru_1head2cls_epoch20.pth` | `models/voxelnext_vru_infer.yaml` | `--vru-raw-threshold`（默认 `0.3`） |
+## 2026-09-21 行为变更清单（对比改动前）
 
-`models/*.pth` 只有 133 字节 = Git LFS 指针，先 `git lfs pull` 再跑。
-
-## 合并规则
-
-1. 车链一次输出 Car（obj_id 0+）与 Truck（+1000），VRU 链输出 Ped/NMV（+2000），
-   按 `frame_id` 拼到一起；同帧 `obj_id` 冲突时自动分配一个空闲 id。
-2. **旧的「Car 被 Truck 覆盖 ≥ 阈值就删整条 Car 轨迹」规则已停用**（2026-09-21）。
-   现在 Car/Truck 归属冲突在车链内部就按 **Car 优先**裁决（同一槽位、同一目标被两类
-   重复表示时都算 Car），所以合并阶段不再需要互相删除。
-   `_drop_cars_covered_by_trucks` 函数体与 `--car-truck-cover-threshold` 参数都保留着，
-   恢复调用即可回退到旧行为。
+| # | 变更 | 影响 |
+| --- | --- | --- |
+| 1 | Car 与 Truck **合并成一条后处理**：一次身份跟踪 + 一次动态区域 | Car 的 id/框数现在由「Car+Truck 并集」决定，不再等于旧 Car 单链的数；动静态区域不再各算一份 |
+| 2 | **Car 优先**：car 与 truck 冲突（同一槽位 / 同一目标被两类重复表示）一律算 Car | 混类轨迹统一、同中心去重、槽位类别投票、槽位绑定顺序四处按优先级取 Car |
+| 3 | 旧的「Car 被 Truck 覆盖 ≥ 阈值就删整条 Car 轨迹」**停用** | 合并阶段不再互相删除；函数与参数保留，恢复调用即可回退 |
+| 4 | 挂车（trailer）**并进 Truck**（去重/并集沿用原规则，剩余纯挂车改名 Truck） | 标注侧没有 Trailer 类；`--trailer-policy` 默认 `to-truck` |
+| 5 | 工程车（construction_vehicle）**并进 Truck** | 之前是直接丢弃（映射成 `Engineering_vehicle`，不在目标类别里） |
+| 6 | 检测范围扩到 **前 80.4 / 后 20.4 / 侧 ±54 m** | 原来是 ±54 对称，前方只能看 54 m；BEV 网格 `[1440, 1344, 41]` |
+| 7 | 按类别的过滤门槛 | 稀疏度 Car 5 / Truck 10；短轨迹 Car 3 / Truck 4（原来是一条链一个值） |
+| 8 | VRU 链**完全不动** | VoxelNeXt 单头两类推理 + 原后处理、原参数 |
 
 ## 车链（Car + Truck 合并后处理）
 
@@ -102,6 +213,270 @@
 `car_step5` / `truck_geometry_restore` / `truck_branch`，再去看
 `vehicle_chain/<clip>_step2_diagnostics.json`（槽位、按类别短轨迹、混类轨迹统一）
 与 `<clip>_step45_diagnostics.json`（动态区域、候选轨迹、static_freeze）。
+
+
+## 两条后处理的权重
+
+| 链 | 权重 | 推理配置 | raw 分数门槛 |
+| --- | --- | --- | --- |
+| 车链（Car + Truck）<br>**一次推理** | `models/bevfusion_mmdet3d_lidaronly.pth`（默认，纯雷达，46 MB）<br>可选 `models/bevfusion_mmdet3d_lidarcam.pth`（C+L，慢约 2.5 倍） | `bevfusion/configs/police_bevfusion_mmdet3d_lidaronly.py`<br>可选 `..._mmdet3d.py` | `--bev-raw-threshold`（默认 `0.1`）；链内 per-class：Car 0.2 / Truck 0.2 / Trailer 0.25 |
+| 车链（旧单链） | Car：`main_chain/models/vn_waymo_v2_4gpu_full_epoch10.pth`（Waymo）<br>Truck：可选 `models/voxelnext_truckB_epoch15.pth` | `main_chain/models/voxelnext_v2_waymo_infer.yaml`<br>`models/voxelnext_truck_infer.yaml` | `--score-thresh` / `--truck-raw-threshold` |
+| VRU | `models/voxelnext_vru_1head2cls_epoch20.pth` | `models/voxelnext_vru_infer.yaml` | `--vru-raw-threshold`（默认 `0.3`） |
+
+`models/*.pth` 只有 133 字节 = Git LFS 指针，先 `git lfs pull` 再跑。
+
+
+## 合并规则
+
+1. 车链一次输出 Car（obj_id 0+）与 Truck（+1000），VRU 链输出 Ped/NMV（+2000），
+   按 `frame_id` 拼到一起；同帧 `obj_id` 冲突时自动分配一个空闲 id。
+2. **旧的「Car 被 Truck 覆盖 ≥ 阈值就删整条 Car 轨迹」规则已停用**（2026-09-21）。
+   现在 Car/Truck 归属冲突在车链内部就按 **Car 优先**裁决（同一槽位、同一目标被两类
+   重复表示时都算 Car），所以合并阶段不再需要互相删除。
+   `_drop_cars_covered_by_trucks` 函数体与 `--car-truck-cover-threshold` 参数都保留着，
+   恢复调用即可回退到旧行为。
+
+
+## 两种运行模式
+
+### 模式一：原地端到端（**默认推荐**）
+
+输入 clip 在**原位置**改名成 `<clip>_pre`，并把合并后的 `label/` 写进去；
+不额外保留一份 raw，也不往 SUSTechPOINTS/data 拷贝（SUST 现在能直接打开别的目录）。
+
+```bash
+bash hybrid_run.sh <clip> --in-place --overwrite
+```
+
+输出：
+
+```text
+<clip>_pre/
+├── lidar/
+├── image/
+├── transforms/
+└── label/<frame_id>.json
+```
+
+注意：运行成功后原路径 `<clip>` 会消失，变成 `<clip>_pre`；已有同名
+`<clip>_pre` 时会被 `--overwrite` 先删再生成。
+
+### 模式二：导出到指定目录（原始 clip 保留不动）
+
+结果写到 `<output_root>/<clip>_pre`；`<output_root>` 省略时默认 `~/SUSTechPOINTS/data`。
+
+```bash
+bash hybrid_run.sh <clip> <output_root> --overwrite
+```
+
+例如：
+
+```bash
+bash hybrid_run.sh \
+  /media/moga/police/0903/nonmotor_lane_my_record_20260903_100541/step2/scene_nonmotor_lane_my_record_20260903_100541_clip43 \
+  /home/moga/桌面/SUSTechPOINTS/data --overwrite
+```
+
+输出：
+
+```text
+<output_root>/
+└── <clip>_pre/
+    ├── 原始 clip 数据（lidar / image / transforms）
+    └── label/<frame_id>.json
+```
+
+- `--output-tag truckb_e15`：输出名变成 `<clip>_truckb_e15_pre`，方便保留多组对比。
+- `--output-suffix _vehicle`：输出名变成 `<clip>_vehicle`（不套 `_pre`），适合测试输出。
+- `--link-only`：输出目录里 image/lidar/transforms 只放软链，不复制数据（快）。
+- `--keep-chain-labels`：额外写 `label_car/`、`label_truck/`、`label_vru/` 便于按链排查。
+
+### 仅调试：只跑链路、不落盘
+
+```bash
+bash hybrid_run.sh <clip> /tmp/unused --no-export-sust --overwrite
+```
+
+只打印统计信息，临时 JSON 跑完自动删除，不产生 `<clip>_pre`，也不改输入。
+
+
+## 批量运行（两种目录结构）
+
+批量按目录结构分两种，两种输出模式（原地 / 导出 SUST）都适用。
+
+### 批量 A：一个大目录下直接就是一批 clip
+
+`<clip_parent>/` 下面直接是各个 clip 目录，每个 clip 含 `lidar/lidar_top/*.bin`。
+`hybrid_run.sh` 会自动扫描并逐个处理。
+
+```bash
+bash hybrid_run.sh /path/to/clips --in-place --overwrite
+bash hybrid_run.sh /home/moga/桌面/预标测效/ /home/moga/桌面/SUSTechPOINTS/data --overwrite
+```
+
+### 批量 B：分场景 / step2 的嵌套结构（police/0903）
+
+`/media/moga/police/0903` 是 `<scene>/step2/<clip>/` 结构，需要用 shell 逐层遍历：
+
+```bash
+DATA_ROOT=/media/moga/GEN2/0915/
+SUST=/home/moga/桌面/SUSTechPOINTS/data
+
+for scene in "$DATA_ROOT"/*/; do
+  for clip in "${scene%/}"/step2/scene_*clip*/; do
+    clip="${clip%/}"
+    name="$(basename "$clip")"
+
+    [ -d "$clip/lidar/lidar_top" ] || continue      # 不是有效 clip
+    [[ "$name" == *_pre ]] && continue              # 已经是输出，跳过
+    [ -d "$SUST/${name}_pre" ] && continue          # SUST 已有输出，跳过
+
+    echo "== 处理 $clip =="
+    bash hybrid_run.sh "$clip" --in-place --overwrite
+    # 导出 SUST 模式：把上面一行换成
+    # bash hybrid_run.sh "$clip" "$SUST" --overwrite
+  done
+done
+```
+
+
+## 参数与默认值
+
+默认路径（车链）的阈值分两处：
+
+| 位置 | 管什么 |
+| --- | --- |
+| `pipeline/vehicle_pass.py::DEFAULTS` | 类别合并阈值、类别白名单、早期范围/分数、Truck 分支（step2_5 / step3_refinement / truck_postprocess / 挂车策略） |
+| `main_chain/pipeline/step_vehicle_chain.py::DEFAULTS` | 共享阶段的门槛：per-class 分数、per-class 稀疏度（Car 5 / Truck 10）、per-class 短轨迹（Car 3 / Truck 4）、范围、可见度、Car 的 step4 是否按尺寸改类、Car 的 step5 点数/短轨 |
+
+常用默认值：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| 检测范围 | 前 80.4 / 后 20.4 / 侧 ±54 m | `bevfusion/configs/police_bevfusion_mmdet3d*.py`（`tests/test_bevfusion_range.py` 守一致性） |
+| BEV raw 阈值 | 0.1 | `--bev-raw-threshold` |
+| 链内分数 | Car 0.2 / Truck 0.2 / Trailer 0.25 | `vehicle_pass.DEFAULTS["class_score_thresholds"]` |
+| 稀疏度 | Car 5 / Truck 10 点 | `step_vehicle_chain.DEFAULTS["class_sparsity"]` |
+| 短轨迹 | Car 3 / Truck 4 帧 | `step_vehicle_chain.DEFAULTS["class_min_lifecycle"]` |
+| 挂车策略 | `to-truck` | `--trailer-policy keep` 可保留 Trailer 类 |
+| Truck yaw | v2（保留 detector yaw，关静态方向投票/静态 yaw 锁） | `vehicle_pass.DEFAULTS["truck_yaw_*"]` |
+| VRU | Ped/NMV 0.2、范围 60/20/40、短轨 4、行人 15 m + 20 帧、NMV 静止 15 m、yaw legacy | `pipeline/hybrid_expD_vru.py::DEFAULTS`（未改动） |
+
+下面几张表是**回退路径**（`--no-car-truck-merged` 或单链调试入口 `pipeline/hybrid_expD_car.py` /
+`hybrid_expD_truck.py` / `main_chain/run_end_to_end.py`）的参数。
+
+### 入口参数
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `<input_root>` | 必填 | 单个 clip 目录，或包含多个 clip 的父目录 |
+| `<output_root>` | `~/SUSTechPOINTS/data` | 导出模式的输出根目录；`--in-place` 时忽略 |
+| `--chains` | `car,truck,vru` | 要跑的后处理，逗号分隔；默认 `car`+`truck` 合成**一条车链**跑完再跑 `vru`。可选 `car` / `truck` / `vru` / `noncar`（旧五类单链） |
+| `--no-car-truck-merged` | 关（即默认合并） | 回退到 Car / Truck 两条独立链，A/B 用 |
+| `--car-truck-cover-threshold` | `0.5` | **已停用**：Car/Truck 冲突改由车链内部的 Car 优先裁决（函数体保留） |
+| `--keep-chain-labels` | 关 | 额外把 `label_car/` `label_truck/` `label_vru/` 写进输出 clip |
+| `--in-place` | 关 | 原地端到端：输入 clip 改名 `<clip>_pre` |
+| `--export-sust` | **开** | 导出到 `<output_root>/<clip>_pre`；与 `--in-place` 互斥 |
+| `--no-export-sust` | 关 | 只跑链路，不落盘 |
+| `--output-tag` | 空 | 在 `<clip>` 和 `_pre` 之间加标签 |
+| `--output-suffix` | 空 | 直接指定输出后缀（如 `_vehicle`），输出名不套 `_pre` |
+| `--link-only` | 关 | 输出目录只软链 image/lidar/transforms，不复制数据 |
+| `--overwrite` | 关 | 输出已存在时先删除再生成 |
+| `--python` | 自动探测 | 指定运行/后处理 Python |
+| `--skip-install` | 关 | 只允许使用已有 CUDA/OpenPCDet 环境 |
+| `--drop-vis-below` | `0.05` | 非车链可见度硬过滤阈值（Truck/VRU 链内部固定 0.05） |
+
+### Truck 链参数（透出部分）
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--truck-detector` | `bevfusion` | Truck 检测器：`bevfusion`（BEVFusion）或 `voxelnext`（旧 VoxelNeXt truckB） |
+| `--truck-detector-mode` | `lidar` | BEVFusion 模式：`lidar`（纯雷达，46 MB，快）或 `fusion`（C+L，160 MB，读 4 路相机图） |
+| `--truck-ckpt` / `--truck-cfg` | `models/voxelnext_truckB_epoch15.pth` / `models/voxelnext_truck_infer.yaml` | 仅 `--truck-detector voxelnext` 时使用 |
+| `--truck-raw-threshold` | `0.1` | 检测器 raw 分数门槛（链内类别阈值另外把关） |
+| `--trailer-score-threshold` | `0.25` | Trailer 类别分数阈值（Truck 固定 0.2） |
+| `--trailer-dup-iom` / `--trailer-dup-iou` | `0.70` / `0.50` | 判"挂车是货车的重复框"的 IoM / IoU 门限 |
+| `--trailer-merge-iou` | `0.05` | 挂车与货车有交集判据（命中就并集成大长 Truck） |
+| `--trailer-policy` | **`to-truck`** | `to-truck`（默认，标注侧没有 Trailer）：一律并成 Truck；`keep`：纯挂车轨迹保留 Trailer |
+| `--no-trailer-rules` | 关 | 关掉类别合并（去重/并集/轨迹统一），回退到只有 Truck 的旧行为 |
+
+其余（范围 80/20/40、Truck 0.2 / Trailer 0.25、短轨迹 4、yaw v2、Truck 后处理各开关）
+是 `pipeline/hybrid_expD_truck.py::DEFAULTS` 的模块默认值，改那里即可。
+
+### VRU 链参数（透出部分）
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--vru-ckpt` | `models/voxelnext_vru_1head2cls_epoch20.pth` | VRU 权重 |
+| `--vru-cfg` | `models/voxelnext_vru_infer.yaml` | 推理配置 |
+| `--vru-raw-threshold` | `0.3` | VRU raw 推理分数门槛 |
+
+其余（范围 60/20/40、Ped/NMV 阈值 0.2/0.2、短轨迹 4、行人 15m、NMV 静止 15m、
+行人生命周期 20 帧）是 `pipeline/hybrid_expD_vru.py::DEFAULTS` 的模块默认值。
+
+`pedestrian_min_frames` 目前只在 VRU 链自己的 CLI 上透出
+（`hybrid_expD_vru.py --pedestrian-min-frames`，`0` = 关闭）；hybrid 入口暂未加对应参数，
+要改就动 `DEFAULTS`。
+
+### Car 链参数（新增部分）
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--car-pipeline` | `main_chain` | `main_chain`（Waymo Car + Step4.5）或 `hybrid`（`pipeline/hybrid_expD_car.py`，只做通用后处理） |
+| `--car-detector` | `waymo` | `waymo` 或 `bevfusion`（BEVFusion 的 car 头；hybrid 链默认建议 bevfusion） |
+| `--car-score-threshold` | `0.2` | `--car-pipeline hybrid` 时的 Car 分数阈值 |
+
+### main_chain Car 参数（OD-main-0909 默认）
+
+`main_chain/run_end_to_end.py` 使用以下固定默认值，目前没有全部透出成 hybrid 入口参数：
+
+| 环节 | 参数 | 默认值 |
+| --- | --- | --- |
+| Step1 推理 | `--score-thresh` | `0.3` |
+| Step1 可见度 | `--drop-vis-below` | `0.05` |
+| Step5 终检 | `--sparsity-max-points` | `5` |
+| Step5 终检 | `--short-track-max-frames` | `3` |
+| Step4.5 动态区域 | `--extension-length-m` | `30.0` |
+| Step4.5 相位拼接 | `--phase-merge-max-gap-sec` | `30.0` |
+| Step4.5 右转 yielding | `--yielding-max-gap-sec` | `6.0` |
+
+### 实测耗时
+
+本机 RTX A4000 16GB、不与其他大任务并行时，单个 80 帧 clip（含 BEVFusion 预处理 + 推理）：
+
+| 场景 | 车链（Car+Truck 一次） | VRU 链 | 合计 |
+| --- | --- | --- | --- |
+| clip4 十字路口（Car 830 / Truck 380） | 46.2 s | 23.6 s | **93.0 s** |
+| clip5 十字路口（Car 561 / Truck 242） | 32.2 s | 24.3 s | **78.1 s** |
+| clip14 十字路口（Car 365 / Truck 401） | 26.4 s | 21.7 s | **70.6 s** |
+| clip17 十字路口（Car 529 / Truck 210） | 25.3 s | 40.6 s | **90.1 s** |
+
+对照：改动前是 Car 链 102.6 s + Truck 链 30~38 s（各自一遍推理与后处理）≈ 166 s/clip，
+所以现在每 clip 省 **44%~58%**。每次运行入口都会打印一行实测值：
+
+```text
+[hybrid] <clip>: 计时 vehicle=32.2s, car=32.2s, truck=0.0s, vru=24.3s, merge=0.0s,
+                export=0.1s, total_without_export=56.5s, total=78.1s
+```
+
+（`car` 与 `vehicle` 是同一个数：车链一次跑完同时产出 Car 与 Truck，`truck=0`。
+车链内部 `step_vehicle_chain` 的诊断会写在输出目录的 `vehicle_pass_diagnostics.json`。）
+
+## VRU 链（`pipeline/hybrid_expD_vru.py`）
+
+- 保留 `Pedestrian` + `Nonmotorized_vehicle`
+- 范围：前 60 / 后 20 / 左右 40 m；行人额外 15 m 半径
+- 分数阈值：Pedestrian `0.2`、Nonmotorized_vehicle `0.2`；短轨迹过滤 4 帧（链级，`<=` 语义）
+- yaw：沿用旧版 `legacy`
+- NMV 静止过滤：world 系首尾净位移 ≤ 15 m 的轨迹丢弃（行人不过滤）
+- 行人生命周期过滤：**只对行人**，观测帧数 < 20 的轨迹整条删除
+  （`pedestrian_min_frames=20`，严格 `<`；非机动车仍走链级 4 帧规则，输出不受影响）
+- `obj_id` 从 2000 起
+
+> 原「世界系一排行人共线（同一帧内 ≥ 6 个、垂距 ≤ 1.0 m）整排删除」规则已废弃：
+> 它区分不了真行人与噪声——车旁行人的世界轨迹与车辆路径共线，而真正的绿篱排 id 太少触发不了。
+> 行人噪点（以短命碎片为主）改由上面的 `pedestrian_min_frames` 处理。
+
 
 ## Car 单链（**调试/回退**：`--no-car-truck-merged` 时才走）
 
@@ -149,6 +524,7 @@ main_chain 的硬过滤用**原始类别字符串**比对白名单、且分数/�
 分数阈值 0.2，保留率 85~90%。
 
 > 测试用的一键脚本：`scripts/run_bevfusion_test_chains.py`（原始检测 → Car(hybrid)+Truck+VRU 合成一份标签）。
+
 
 ## Truck 单链（**调试/回退**）
 
@@ -215,7 +591,7 @@ face-visibility 拟合把可见点簇边缘当成了"面"）。需要时改 `Tru
 python pipeline/hybrid_expD_truck.py --clip <clip> --out-json work/truck.json \
     --detector bevfusion --detector-mode lidar --label-subdir label_truck
 
-# 整批（Car -> Truck -> VRU 合成 <clip>_pre/label）
+# 整批（车链 Car+Truck -> VRU，合成 <clip>_pre/label）
 bash hybrid_run.sh <input_root> --in-place --overwrite
 python scripts/run_hybrid_prelabel.py <input_root> <output_root> --chains truck
 
@@ -256,22 +632,12 @@ python scripts/run_hybrid_prelabel.py <input_root> <output_root> --chains truck
 2. 纯挂车轨迹（与任何货车都不相交）在 5 条测试 clip 里都没能活过 4 帧门槛，所以目前输出几乎只有 Truck。
 3. H800 / 云端尚未同步（云端没有 mmdet3d 环境，需要在云端建环境 + 编算子）。
 
-## VRU 链（`pipeline/hybrid_expD_vru.py`）
 
-- 保留 `Pedestrian` + `Nonmotorized_vehicle`
-- 范围：前 60 / 后 20 / 左右 40 m；行人额外 15 m 半径
-- 分数阈值：Pedestrian `0.2`、Nonmotorized_vehicle `0.2`；短轨迹过滤 4 帧（链级，`<=` 语义）
-- yaw：沿用旧版 `legacy`
-- NMV 静止过滤：world 系首尾净位移 ≤ 15 m 的轨迹丢弃（行人不过滤）
-- 行人生命周期过滤：**只对行人**，观测帧数 < 20 的轨迹整条删除
-  （`pedestrian_min_frames=20`，严格 `<`；非机动车仍走链级 4 帧规则，输出不受影响）
-- `obj_id` 从 2000 起
+## 只改了 Truck 时：复用 Car/VRU 标签重跑（仅回退路径适用）
 
-> 原「世界系一排行人共线（同一帧内 ≥ 6 个、垂距 ≤ 1.0 m）整排删除」规则已废弃：
-> 它区分不了真行人与噪声——车旁行人的世界轨迹与车辆路径共线，而真正的绿篱排 id 太少触发不了。
-> 行人噪点（以短命碎片为主）改由上面的 `pedestrian_min_frames` 处理。
-
-## 只改了 Truck 时：复用 Car/VRU 标签重跑
+> 【2026-09-21】默认路径下 Truck 的 id 来自与 Car 共享的那一遍跟踪与动态区域，
+> **单独重跑 Truck 链已经对不上号**：要么整条车链重跑（默认），要么加
+> `--no-car-truck-merged` 回到两条独立链再用本脚本。
 
 ```bash
 python scripts/remerge_truck_car.py --output-root <含 <clip>_pre 的目录> [--write]
@@ -281,204 +647,6 @@ python scripts/remerge_truck_car.py --output-root <含 <clip>_pre 的目录> [--
 再按上面的合并规则重写 `label/` 和 `label_truck/`。改 Truck 参数或合并规则时用它，
 可以省掉最慢的 Car 链。
 
-## 两种运行模式
-
-### 模式一：原地端到端（不导出 SUST）
-
-输入 clip 在**原位置**改名成 `<clip>_pre`，并把合并后的 `label/` 写进去；
-不会额外保留一份 raw，也不会往 SUST 拷贝。
-
-```bash
-bash hybrid_run.sh <clip> --in-place --overwrite
-```
-
-输出：
-
-```text
-<clip>_pre/
-├── lidar/
-├── image/
-├── transforms/
-└── label/<frame_id>.json
-```
-
-注意：运行成功后原路径 `<clip>` 会消失，变成 `<clip>_pre`；已有同名
-`<clip>_pre` 时会被 `--overwrite` 先删再生成。
-
-### 模式二：导出到 SUST
-
-原始 clip 保留不动，结果写到 `<output_root>/<clip>_pre`。
-
-```bash
-bash hybrid_run.sh <clip> <output_root> --overwrite
-```
-
-例如：
-
-```bash
-bash hybrid_run.sh \
-  /media/moga/police/0903/nonmotor_lane_my_record_20260903_100541/step2/scene_nonmotor_lane_my_record_20260903_100541_clip43 \
-  /home/moga/桌面/SUSTechPOINTS/data --overwrite
-```
-
-输出：
-
-```text
-<output_root>/
-└── <clip>_pre/
-    ├── 原始 clip 数据（lidar / image / transforms）
-    └── label/<frame_id>.json
-```
-
-`<output_root>` 省略时默认是 `~/SUSTechPOINTS/data`。
-`--output-tag truckb_e15` 可以把输出名改成 `<clip>_truckb_e15_pre`，方便保留多组对比结果。
-加 `--keep-chain-labels` 会额外写出 `label_truck/` 与 `label_vru/`，便于按链排查。
-
-### 仅调试：只跑链路、不落盘
-
-```bash
-bash hybrid_run.sh <clip> /tmp/unused --no-export-sust --overwrite
-```
-
-只打印统计信息，临时 JSON 跑完自动删除，不产生 `<clip>_pre`，也不改输入。
-
-## 批量运行（两种目录结构）
-
-批量按目录结构分两种，两种输出模式（原地 / 导出 SUST）都适用。
-
-### 批量 A：一个大目录下直接就是一批 clip
-
-`<clip_parent>/` 下面直接是各个 clip 目录，每个 clip 含 `lidar/lidar_top/*.bin`。
-`hybrid_run.sh` 会自动扫描并逐个处理。
-
-```bash
-bash hybrid_run.sh /path/to/clips --in-place --overwrite
-bash hybrid_run.sh /home/moga/桌面/预标测效/ /home/moga/桌面/SUSTechPOINTS/data --overwrite
-```
-
-### 批量 B：分场景 / step2 的嵌套结构（police/0903）
-
-`/media/moga/police/0903` 是 `<scene>/step2/<clip>/` 结构，需要用 shell 逐层遍历：
-
-```bash
-DATA_ROOT=/media/moga/GEN2/0915/
-SUST=/home/moga/桌面/SUSTechPOINTS/data
-
-for scene in "$DATA_ROOT"/*/; do
-  for clip in "${scene%/}"/step2/scene_*clip*/; do
-    clip="${clip%/}"
-    name="$(basename "$clip")"
-
-    [ -d "$clip/lidar/lidar_top" ] || continue      # 不是有效 clip
-    [[ "$name" == *_pre ]] && continue              # 已经是输出，跳过
-    [ -d "$SUST/${name}_pre" ] && continue          # SUST 已有输出，跳过
-
-    echo "== 处理 $clip =="
-    bash hybrid_run.sh "$clip" --in-place --overwrite
-    # 导出 SUST 模式：把上面一行换成
-    # bash hybrid_run.sh "$clip" "$SUST" --overwrite
-  done
-done
-```
-
-## 参数与默认值
-
-### 入口参数
-
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `<input_root>` | 必填 | 单个 clip 目录，或包含多个 clip 的父目录 |
-| `<output_root>` | `~/SUSTechPOINTS/data` | 导出 SUST 时的输出根目录；`--in-place` 时忽略 |
-| `--chains` | `car,truck,vru` | 要跑的链，逗号分隔，按 car -> truck -> vru 顺序执行；可选 `car` / `truck` / `vru` / `noncar`（旧五类单链） |
-| `--no-car-truck-merged` | 关（即默认合并） | 回退到 Car / Truck 两条独立链，A/B 用 |
-| `--car-truck-cover-threshold` | `0.5` | **已停用**：Car/Truck 冲突改由车链内部的 Car 优先裁决（函数体保留） |
-| `--keep-chain-labels` | 关 | 额外把 `label_truck/` `label_vru/` 写进输出 clip |
-| `--in-place` | 关 | 原地端到端：输入 clip 改名 `<clip>_pre` |
-| `--export-sust` | **开** | 导出到 `<output_root>/<clip>_pre`；与 `--in-place` 互斥 |
-| `--no-export-sust` | 关 | 只跑链路，不落盘 |
-| `--output-tag` | 空 | 在 `<clip>` 和 `_pre` 之间加标签 |
-| `--overwrite` | 关 | 输出已存在时先删除再生成 |
-| `--python` | 自动探测 | 指定运行/后处理 Python |
-| `--skip-install` | 关 | 只允许使用已有 CUDA/OpenPCDet 环境 |
-| `--drop-vis-below` | `0.05` | 非车链可见度硬过滤阈值（Truck/VRU 链内部固定 0.05） |
-
-### Truck 链参数（透出部分）
-
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `--truck-detector` | `bevfusion` | Truck 检测器：`bevfusion`（BEVFusion）或 `voxelnext`（旧 VoxelNeXt truckB） |
-| `--truck-detector-mode` | `lidar` | BEVFusion 模式：`lidar`（纯雷达，46 MB，快）或 `fusion`（C+L，160 MB，读 4 路相机图） |
-| `--truck-ckpt` / `--truck-cfg` | `models/voxelnext_truckB_epoch15.pth` / `models/voxelnext_truck_infer.yaml` | 仅 `--truck-detector voxelnext` 时使用 |
-| `--truck-raw-threshold` | `0.1` | 检测器 raw 分数门槛（链内类别阈值另外把关） |
-| `--trailer-score-threshold` | `0.25` | Trailer 类别分数阈值（Truck 固定 0.2） |
-| `--trailer-dup-iom` / `--trailer-dup-iou` | `0.70` / `0.50` | 判"挂车是货车的重复框"的 IoM / IoU 门限 |
-| `--trailer-merge-iou` | `0.05` | 挂车与货车有交集判据（命中就并集成大长 Truck） |
-| `--trailer-policy` | **`to-truck`** | `to-truck`（默认，标注侧没有 Trailer）：一律并成 Truck；`keep`：纯挂车轨迹保留 Trailer |
-| `--no-trailer-rules` | 关 | 关掉类别合并（去重/并集/轨迹统一），回退到只有 Truck 的旧行为 |
-
-其余（范围 80/20/40、Truck 0.2 / Trailer 0.25、短轨迹 4、yaw v2、Truck 后处理各开关）
-是 `pipeline/hybrid_expD_truck.py::DEFAULTS` 的模块默认值，改那里即可。
-
-### VRU 链参数（透出部分）
-
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `--vru-ckpt` | `models/voxelnext_vru_1head2cls_epoch20.pth` | VRU 权重 |
-| `--vru-cfg` | `models/voxelnext_vru_infer.yaml` | 推理配置 |
-| `--vru-raw-threshold` | `0.3` | VRU raw 推理分数门槛 |
-
-其余（范围 60/20/40、Ped/NMV 阈值 0.2/0.2、短轨迹 4、行人 15m、NMV 静止 15m、
-行人生命周期 20 帧）是 `pipeline/hybrid_expD_vru.py::DEFAULTS` 的模块默认值。
-
-`pedestrian_min_frames` 目前只在 VRU 链自己的 CLI 上透出
-（`hybrid_expD_vru.py --pedestrian-min-frames`，`0` = 关闭）；hybrid 入口暂未加对应参数，
-要改就动 `DEFAULTS`。
-
-### Car 链参数（新增部分）
-
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `--car-pipeline` | `main_chain` | `main_chain`（Waymo Car + Step4.5）或 `hybrid`（`pipeline/hybrid_expD_car.py`，只做通用后处理） |
-| `--car-detector` | `waymo` | `waymo` 或 `bevfusion`（BEVFusion 的 car 头；hybrid 链默认建议 bevfusion） |
-| `--car-score-threshold` | `0.2` | `--car-pipeline hybrid` 时的 Car 分数阈值 |
-
-### main_chain Car 参数（OD-main-0909 默认）
-
-`main_chain/run_end_to_end.py` 使用以下固定默认值，目前没有全部透出成 hybrid 入口参数：
-
-| 环节 | 参数 | 默认值 |
-| --- | --- | --- |
-| Step1 推理 | `--score-thresh` | `0.3` |
-| Step1 可见度 | `--drop-vis-below` | `0.05` |
-| Step5 终检 | `--sparsity-max-points` | `5` |
-| Step5 终检 | `--short-track-max-frames` | `3` |
-| Step4.5 动态区域 | `--extension-length-m` | `30.0` |
-| Step4.5 相位拼接 | `--phase-merge-max-gap-sec` | `30.0` |
-| Step4.5 右转 yielding | `--yielding-max-gap-sec` | `6.0` |
-
-### 实测耗时
-
-本机 RTX A4000 16GB、不与其他大任务并行时，单个 80 帧 clip（`155112_clip6`）：
-
-| 阶段 | 耗时 |
-| --- | --- |
-| Car 链（main_chain：raw 推理 + Step2~Step5 + Step4.5） | 102.6 s |
-| Truck 链（BEVFusion 纯雷达：检测 + 合并 + 跟踪/过滤/精修） | 30~38 s（C+L 模式 80~100 s） |
-| VRU 链（raw 推理 + 后处理） | 39.1 s |
-| 三链合并 + Car/Truck 覆盖规则 | 0.5 s |
-| 导出 `<clip>_pre`（约 600 MB copytree） | 0.6 s |
-| **合计** | **166.5 s（≈2 分 47 秒）/clip** |
-
-每次运行入口都会打印这一行，可直接看自己机器/场景的实测值：
-
-```text
-[hybrid] <clip>: 计时 car=102.6s, truck=23.5s, vru=39.1s, merge=0.5s, export=0.6s,
-                total_without_export=165.7s, total=166.5s
-```
-
-- Car 链占约 6 成；CPU 后处理（跟踪关联、可见度、几何精修）是主要瓶颈，阈值越低越慢。
-- 框越多越慢：同批三条 clip 实测 150–167 s/clip。
-- 只改 Truck 时用 `scripts/remerge_truck_car.py` 约 **35 s/clip**（复用 Car/VRU 标签，只重跑 Truck 链；默认同样是 BEVFusion 纯雷达）。
 
 ## 目录
 
@@ -504,9 +672,9 @@ filtering/              可见度、硬过滤、五类输出、低置信类别�
 tracking/               跟踪、坐标变换、SUST label 映射
 geometry/               yaw、Car 几何、Truck/NMV 精修
 inference/              OpenPCDet LiDAR 推理
-models/                 三条链的配置与 checkpoint
+models/                 各链的配置与 checkpoint
 scripts/                入口脚本、merge_two_chains（旧两链合成）、remerge_truck_car（只重跑 Truck）、
-                        run_bevfusion_test_chains.py（BEV 原始检测 → 测试三条链）
+                        run_bevfusion_test_chains.py（BEV 原始检测 → 测试三支标签合成）
 tests/                  单元测试
 ```
 
@@ -523,6 +691,7 @@ cd main_chain && ~/miniconda3/envs/openpcdet/bin/python -m unittest discover -s 
 `tests/test_class_policy.py`（挂车/工程车并 Truck、覆盖规则停用）、
 `tests/test_vehicle_pass.py`（类别视图切分、Truck 几何还原）、
 `main_chain/tests/test_class_priority.py`（Car 优先的四处落点）。
+
 
 ## 附录：旧五类非车链（`--chains car,noncar`）
 
