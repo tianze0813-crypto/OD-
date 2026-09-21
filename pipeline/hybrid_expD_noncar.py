@@ -382,6 +382,11 @@ def run(raw_json: Path, clip: Path, out_json: Path,
         yaw_impl: str = "legacy",
         # 【改动】以下四个用于 Truck 链：关掉"钉停车位"与静态 yaw 锁，并启用直线行驶 yaw 修正
         disable_slot_binding: bool = False,
+        # 【改动】2026-09-20 方案A（Truck 链动态跟踪加固）：遮挡存活/复活 + 横向跳变门 +
+        # 静态锚点。默认全部保持老行为，只有 Truck 链在 DEFAULTS 里打开。
+        dynamic_occlusion_max_gap: float = 0.0,
+        lateral_jump_gate: bool = False,
+        static_anchor_min_hits: int = 10 ** 9,
         static_yaw_enabled: bool = True,
         # 【改动】2026-09-20 透传 step2_5 的「静止旋转轨迹整条删除」开关。
         # 默认 True（Car/VRU 链行为完全不变）；只有 Truck 链传 False —— 见 hybrid_expD_truck.py。
@@ -459,6 +464,9 @@ def run(raw_json: Path, clip: Path, out_json: Path,
         diagnostics_path=step2_diag,
         hard_filter_config=hard_config,
         disable_slot_binding=bool(disable_slot_binding),   # 【改动】
+        dynamic_occlusion_max_gap=float(dynamic_occlusion_max_gap),   # 【改动】方案A
+        lateral_jump_gate=bool(lateral_jump_gate),                    # 【改动】方案A
+        static_anchor_min_hits=int(static_anchor_min_hits),           # 【改动】方案A
     )
 
     step2_5_json = work_root / (Path(out_json).stem + "_step2_5.json")

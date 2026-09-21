@@ -38,6 +38,10 @@ def run(
         hard_filter_config: HardFilterConfig = HardFilterConfig(),
         same_center_gate: float = 0.35,
         disable_slot_binding: bool = False,     # 【改动】不把动态轨迹钉到停车位 id
+        # 【改动】2026-09-20 方案A：动态跟踪的遮挡存活 / 复活 / 静态锚点（默认=老行为）
+        dynamic_occlusion_max_gap: float = 0.0,
+        lateral_jump_gate: bool = False,
+        static_anchor_min_hits: int = 10 ** 9,
 ) -> Dict[str, Any]:
     source = json.loads(Path(in_json).read_text(encoding="utf-8"))
     if not isinstance(source, list):
@@ -46,7 +50,10 @@ def run(
     frames: List[Dict[str, Any]] = copy.deepcopy(source)
     coords = tracking.CoordinateProvider(Path(clip))
     tracker = static_first.StaticFirstTracker(
-        coords, disable_slot_binding=bool(disable_slot_binding))   # 【改动】
+        coords, disable_slot_binding=bool(disable_slot_binding),   # 【改动】
+        dynamic_occlusion_max_gap=float(dynamic_occlusion_max_gap),   # 【改动】
+        lateral_jump_gate=bool(lateral_jump_gate),                    # 【改动】
+        static_anchor_min_hits=int(static_anchor_min_hits))           # 【改动】
     tracked, tracking_diagnostics = tracker.process(frames)
     identity_check = static_first.verify_identity_only(source, tracked)
 

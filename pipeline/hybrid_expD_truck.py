@@ -76,6 +76,17 @@ DEFAULTS: Dict[str, Any] = dict(
     pre_tracking_filters=True,
     # 【改动】不把动态轨迹钉到停车位 id（保留跟踪器其余逻辑）
     disable_slot_binding=True,
+    # 【改动】2026-09-20 方案A：动态跟踪加固（只搬 Car 链 tracker 的能力，不搬 region 那套）
+    #  ① 遮挡复活：动态轨迹活到 3.0 s（原来 1.8 s 就死且不会再接回）；超过 1.8 s 的重现
+    #     用「可达速度 × 间隔」的走廊 + 方向一致性判定，而不是 10 Hz 的固定小门。
+    #     实测依据：5 个 clip 里卡车被切开的 26 处，间隔中位 1.9 s / P90 4.3 s / 最大 5.1 s，
+    #     其中 50% 超过 1.8 s，很多切开处端点只差 0.2~0.8 m（同车同位置丢 id）。
+    #  ② 横向跳变门：不许横向瞬移到隔壁车（卡车车队邻距小，防串 id）。
+    #  ③ 静态锚点：min_static_hits 由 10**9 改为 6 —— 停着的卡车能够升级成静态锚点，
+    #     长期保留 id 并且能在丢失后用锚点复活（这正是"排队/等灯卡车"要的行为）。
+    dynamic_occlusion_max_gap=3.0,
+    lateral_jump_gate=True,
+    static_anchor_min_hits=6,
     # 【改动】跳过静态 yaw 稳定（不把静止段 yaw 锁到停车方向）
     static_yaw_enabled=False,
     # 【改动】yaw v2 开关：关静态方向投票；直线行驶的轨迹用运动方向作 yaw

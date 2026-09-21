@@ -112,6 +112,11 @@ class StaticFirstTracker:
         duplicate_slot_cross_gate: float = 2.2,
         duplicate_slot_iou_gate: float = 0.35,
         disable_slot_binding: bool = False,   # 【改动】
+        # 【改动】2026-09-20 方案A（Truck 链动态跟踪加固）：三者的默认值都保持老行为，
+        # 只有 Truck 链显式打开 —— Car 链走 main_chain 自己的副本，VRU/旧五类链不受影响。
+        dynamic_occlusion_max_gap: float = 0.0,   # >0 打开"遮挡复活"，值=动态轨迹最长存活(秒)
+        lateral_jump_gate: bool = False,          # 横向跳变门：不许横向瞬移到隔壁车
+        static_anchor_min_hits: int = 10 ** 9,    # 10**9=关掉 tracker 自带静态锚点(老行为)
         duplicate_slot_max_weak_fraction: float = 0.5,
         topology_gap_max_frames: int = 3,
         stop_frames: int = 10,
@@ -141,6 +146,9 @@ class StaticFirstTracker:
         self.duplicate_slot_iou_gate = float(duplicate_slot_iou_gate)
         # 【改动】True = 不把动态轨迹"钉"到停车位的固定 id（保留跟踪器其余逻辑）
         self.disable_slot_binding = bool(disable_slot_binding)
+        self.dynamic_occlusion_max_gap = float(dynamic_occlusion_max_gap)   # 【改动】
+        self.lateral_jump_gate = bool(lateral_jump_gate)                    # 【改动】
+        self.static_anchor_min_hits = int(static_anchor_min_hits)           # 【改动】
         self.duplicate_slot_max_weak_fraction = float(
             duplicate_slot_max_weak_fraction)
         self.topology_gap_max_frames = int(topology_gap_max_frames)
@@ -703,10 +711,15 @@ class StaticFirstTracker:
             source_refs.append(refs)
         self.motion_tracker = tracking.ConservativeTracker(
             self.coords,
-            # Static evidence is authoritative in pass 1. Disable the legacy tracker's
-            # track-first promotion so parking fragments cannot create anchors.
-            min_static_hits=10 ** 9,
+            # Static evidence is authoritative in pass 1.  【改动】static_anchor_min_hits
+            # 默认仍是 10**9（关掉 tracker 自带的静态锚点）；Truck 链传 6，让"停着的卡车"
+            # 能升级成静态锚点 —— 长期保留 + 用锚点复活。
+            min_static_hits=int(self.static_anchor_min_hits),
             dynamic_max_gap=self.dynamic_max_gap,
+            # 【改动】2026-09-20 方案A：遮挡复活 + 横向跳变门（默认关，Truck 链打开）
+            occlusion_enabled=bool(self.dynamic_occlusion_max_gap > 0.0),
+            occlusion_max_gap=float(self.dynamic_occlusion_max_gap),
+            lateral_jump_gate_enabled=bool(self.lateral_jump_gate),
         )
         dynamic_output, dynamic_diag = self.motion_tracker.process(
             dynamic_frames, enable_stitching=False)
