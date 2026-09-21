@@ -474,6 +474,17 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
     selected = [name for name in ("car", "truck", "vru", "noncar") if name in set(chains)]
     if not selected:
         raise RuntimeError("--chains 至少选一条")
+    # 【改动】车链是否可用：chains 同时含 car+truck、且 truck 检测器是 BEVFusion。
+    # --car-detector auto（默认）在这里解析：能用就用 BEVFusion（= 车链），否则用 Waymo。
+    merged_vehicle = bool(
+        car_truck_merged and "car" in selected and "truck" in selected
+        and str(truck_detector) == "bevfusion"
+        and str(car_detector) in ("auto", "bevfusion"))
+    if str(car_detector) == "auto":
+        car_detector = "bevfusion" if merged_vehicle else "waymo"
+        _print(f"{base}: --car-detector auto -> {car_detector}"
+               + ("（车链：Car+Truck 合并后处理）" if merged_vehicle
+                  else "（单链：Waymo Car 头；车链需要 --chains 同时含 car,truck）"))
     chain_labels: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
     chain_stats: Dict[str, Any] = {}
     merged: List[Dict[str, Any]] | None = None
@@ -499,9 +510,6 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
                 bev_raw = _run_raw_bevfusion(python, clip, work / "bev_raw",
                                              bev_raw_threshold, truck_detector_mode)
                 _print(f"{base}: BEVFusion raw json（三链共用）-> {bev_raw.name}")
-        merged_vehicle = bool(
-            car_truck_merged and "car" in selected and "truck" in selected
-            and str(car_detector) == "bevfusion" and str(truck_detector) == "bevfusion")
         if merged_vehicle:
             # 【改动】2026-09-21 车链：Car 与 Truck 共用一份 BEVFusion 检测 + 一次后处理
             # （静态槽位 / 动态区域 / 重跟踪 / ID 继承只算一次，类别冲突按 Car 优先）
@@ -810,8 +818,11 @@ def main() -> int:
                              "或 hybrid（pipeline/hybrid_expD_car.py：只做通用后处理）")
     parser.add_argument("--car-score-threshold", type=float, default=0.2,
                         help="--car-pipeline hybrid 时的 Car 分数阈值")
-    parser.add_argument("--car-detector", choices=["waymo", "bevfusion"], default="waymo",
-                        help="Car 链检测器：waymo（默认）或 bevfusion（用 BEVFusion 的 car 头）")
+    parser.add_argument("--car-detector", choices=["auto", "waymo", "bevfusion"],
+                        default="auto",
+                        help="【改动】Car 检测器：auto（默认）= 车链能跑（chains 含 car+truck 且 "
+                             "truck 检测器是 bevfusion）时用 BEVFusion，否则用 Waymo；"
+                             "也可以显式 waymo / bevfusion")
     parser.add_argument("--vru-detector", choices=["voxelnext", "bevfusion"], default="voxelnext",
                         help="VRU 链检测器：voxelnext（默认）或 bevfusion（ped/bicycle/motorcycle 头）")
     parser.add_argument("--bev-raw-dir", type=Path, default=None,
