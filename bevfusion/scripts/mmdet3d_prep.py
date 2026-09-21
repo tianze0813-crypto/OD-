@@ -37,10 +37,14 @@ def main():
     cams = [c.strip() for c in args.cams.split(",") if c.strip()]
     ow, oh = (int(x) for x in args.out_size.split("x"))
 
-    clips = sorted(d.name for d in (root / "data" / "police").glob("scene_*") if d.is_dir())
+    # 【修】同 prep_data：给了 --clips 就不限定 scene_ 前缀
+    cached = [d.name for d in (root / "data" / "police").iterdir()
+              if d.is_dir() and not d.name.startswith(".")]
     if args.clips:
         want = {c.strip() for c in args.clips.split(",") if c.strip()}
-        clips = [c for c in clips if c in want]
+        clips = sorted(c for c in cached if c in want)
+    else:
+        clips = sorted(c for c in cached if c.startswith("scene_"))
     infos = []
     idx = 0
     for clip in clips:

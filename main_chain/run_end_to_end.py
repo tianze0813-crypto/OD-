@@ -119,6 +119,10 @@ def main():
     parser.add_argument("--car-only", "--step6-car-only", dest="car_only",
                         action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--score-thresh", type=float, default=0.3)
+    # 【改动】检测器：waymo（自带 Waymo/VoxelNeXt step1，默认）或 bevfusion（pipeline/step1_bevfusion.py）
+    parser.add_argument("--detector", choices=["waymo", "bevfusion"], default="waymo")
+    parser.add_argument("--bevfusion-mode", choices=["lidar", "fusion"], default="lidar")
+    parser.add_argument("--bevfusion-score-thresh", type=float, default=0.2)
     parser.add_argument("--drop-vis-below", type=float, default=0.05)
     parser.add_argument("--keep-intermediate", action="store_true",
                         help="keep step1..step4.5 JSON/diagnostics under "
@@ -167,11 +171,18 @@ def main():
             raw_json = (Path(args.raw_json).resolve() if args.raw_json
                         else step1_root / f"{base}_raw.json")
             if not args.raw_json:
-                run([args.inference_python,
-                     ROOT / "pipeline" / "step1_lidar_inference.py",
-                     "--clip", clip, "--work-root", step1_root,
-                     "--score-thresh", args.score_thresh,
-                     "--drop-vis-below", args.drop_vis_below])
+                if args.detector == "bevfusion":      # 【改动】换 BEVFusion 检测器
+                    run([args.post_python,
+                         ROOT / "pipeline" / "step1_bevfusion.py",
+                         "--clip", clip, "--work-root", step1_root,
+                         "--mode", args.bevfusion_mode,
+                         "--score-thresh", args.bevfusion_score_thresh])
+                else:
+                    run([args.inference_python,
+                         ROOT / "pipeline" / "step1_lidar_inference.py",
+                         "--clip", clip, "--work-root", step1_root,
+                         "--score-thresh", args.score_thresh,
+                         "--drop-vis-below", args.drop_vis_below])
 
             step2_json = step2_root / f"{base}_step2.json"
             step2_diag = step2_root / f"{base}_step2_diagnostics.json"

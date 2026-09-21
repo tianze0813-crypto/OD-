@@ -71,6 +71,8 @@ def main():
     ap.add_argument("--clip", required=True, type=Path, help="源 clip（提供 calib 与 image/lidar/transforms）")
     ap.add_argument("--name", required=True, help="SUST 数据集名")
     ap.add_argument("--score-thresh", type=float, default=0.2)
+    ap.add_argument("--keep-unmapped", action="store_true",
+                    help="映射表里没有的类别原样保留（做'真·原始检测'直出时用）")
     ap.add_argument("--classes", default=DEFAULT_CLASSES,
                     help="只保留这些（项目口径）类别，逗号分隔；留空=全部")
     ap.add_argument("--sust-root", type=Path,
@@ -90,8 +92,13 @@ def main():
         for d in fr["detections"]:
             if d["score"] < args.score_thresh:
                 continue
-            obj_type = MAP_CLASS.get(str(d["class_name"]).lower())
-            if obj_type is None or (keep and obj_type not in keep):
+            raw_name = str(d["class_name"])
+            obj_type = MAP_CLASS.get(raw_name.lower())
+            if obj_type is None:
+                if not args.keep_unmapped:      # 默认丢未映射类别
+                    continue
+                obj_type = raw_name             # 原样保留（traffic_cone / barrier / ...）
+            if keep and obj_type not in keep:
                 continue
             box = tracking.box_lidar_to_base_link(d["box_lidar"][:7], base_from_lidar)
             dets.append({"obj_type": obj_type, "source_class": d["class_name"],

@@ -120,10 +120,15 @@ def main():
 
     root = Path(args.out_root)
     data_root = Path(args.data_root)
-    clips = sorted([d for d in os.listdir(data_root) if d.startswith("scene_")])
+    # 【修】指定 --clips 时接受任意目录名（主链/别的工程可能用临时 clip 名，如 clip5）；
+    # 不指定时仍只扫 scene_* 前缀，避免误扫无关目录。
+    all_dirs = sorted(d for d in os.listdir(data_root)
+                      if not d.startswith(".") and (Path(data_root) / d).is_dir())
     if args.clips:
         want = {c.strip() for c in args.clips.split(",") if c.strip()}
-        clips = [c for c in clips if c in want or Path(c).name in want]
+        clips = [c for c in all_dirs if c in want or Path(c).name in want]
+    else:
+        clips = [c for c in all_dirs if c.startswith("scene_")]
 
     infos = []
     report = []

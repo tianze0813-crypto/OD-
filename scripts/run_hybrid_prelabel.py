@@ -32,6 +32,7 @@ if str(ROOT) not in sys.path:
 
 from pipeline.hybrid_expD_noncar import run as run_expd_noncar
 from pipeline.hybrid_expD_truck import run as run_expd_truck
+from pipeline.hybrid_expD_car import run as run_expd_car            # noqa: E402
 from pipeline.hybrid_expD_vru import run as run_expd_vru
 from pipeline.hybrid_main_car import run as run_main_car
 from pipeline.hybrid_merge import merge_label_frames
@@ -44,6 +45,8 @@ NONCAR_CFG = ROOT / "models" / "voxelnext_fiveclass_nuscenes_infer.yaml"
 # --noncar-ckpt but is no longer the default.
 NONCAR_CKPT = ROOT / "models" / "vod_2cls_ft_e12.pth"
 # 【改动】三条链各自的权重/配置
+MAIN_CAR_CFG = ROOT / "main_chain" / "models" / "voxelnext_v2_waymo_infer.yaml"
+MAIN_CAR_CKPT = ROOT / "main_chain" / "models" / "vn_waymo_v2_4gpu_full_epoch10.pth"
 TRUCK_CFG = ROOT / "models" / "voxelnext_truck_infer.yaml"
 TRUCK_CKPT = ROOT / "models" / "voxelnext_truckB_epoch15.pth"
 VRU_CFG = ROOT / "models" / "voxelnext_vru_infer.yaml"
@@ -415,8 +418,13 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
              truck_detector_mode: str = "lidar",     # 【改动】fusion | lidar
              # 【改动】Car / VRU 链也可换成 BEVFusion 检测（复用同一份 raw json，只推理一次）
              car_detector: str = "waymo",            # waymo | bevfusion
+             # 【改动】Car 走哪条链：main_chain（Waymo Car + Step4.5，生产）
+             # 或 hybrid（pipeline/hybrid_expD_car.py：只做通用后处理，换检测器时用）
+             car_pipeline: str = "main_chain",
+             car_score_threshold: float = 0.2,       # hybrid Car 链的 Car 分数阈值
              vru_detector: str = "voxelnext",        # voxelnext | bevfusion
              bev_raw_threshold: float = 0.1,         # 共享 BEVFusion raw json 的分数门槛
+             bev_raw_dir: Path | None = None,        # 【改动】复用已生成好的 raw json 目录（不再重新推理）
              output_suffix: str = "",                # 非空则输出名 = <clip名><后缀>（不套 _pre）
              link_only: bool = False,                # 输出目录只放软链 + label（不 copytree）
              trailer_rules: bool = True,
@@ -467,29 +475,62 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
         step = 0
         bev_raw: Path | None = None
         if "bevfusion" in (str(car_detector), str(truck_detector), str(vru_detector)):
-            # 【改动】三条链共用一份 BEVFusion 原始检测（只推理一次）
-            bev_raw = _run_raw_bevfusion(python, clip, work / "bev_raw",
-                                         bev_raw_threshold, truck_detector_mode)
-            _print(f"{base}: BEVFusion raw json（三链共用）-> {bev_raw.name}")
+            # 【改动】三条链共用一份 BEVFusion 原始检测（只推理一次）；
+            # 给了 bev_raw_dir 就直接用那份（保证与留档的原始检测是同一份）
+            if bev_raw_dir is not None:
+                bev_raw = Path(bev_raw_dir) / f"{clip.name}_raw.json"
+                if not bev_raw.is_file():
+                    raise RuntimeError(f"bev_raw_dir 里缺少 {bev_raw.name}: {bev_raw_dir}")
+                _print(f"{base}: 复用 BEVFusion raw json -> {bev_raw}")
+            else:
+                bev_raw = _run_raw_bevfusion(python, clip, work / "bev_raw",
+                                             bev_raw_threshold, truck_detector_mode)
+                _print(f"{base}: BEVFusion raw json（三链共用）-> {bev_raw.name}")
         if "car" in selected:
             step += 1
-            car_src = ("BEVFusion car 头 + Step4.5" if car_detector == "bevfusion"
-                       else "Waymo Car + Step4.5")
-            _print(f"{base}: {step}/{total} Car 链（main_chain: {car_src}）")
-            _t = time.monotonic()
-            main_labels, main_result = run_main_car(
-                python, clip, work / "main", overwrite=True,
-                raw_json=(bev_raw if car_detector == "bevfusion" else None))
-            timings["car"] = round(time.monotonic() - _t, 1)
-            chain_labels["car"] = {str(key): list(value)
-                                   for key, value in main_labels.items()}
-            chain_stats["car"] = {
-                "detector": str(car_detector),
-                "checkpoint": ("BEVFusion " + str(truck_detector_mode)
-                               if car_detector == "bevfusion"
-                               else "main_chain/models/vn_waymo_v2_4gpu_full_epoch10.pth"),
-                "final_detections": main_result.get("final_detections"),
-                "frames": len(chain_labels["car"])}
+            if car_pipeline == "hybrid":     # 【改动】项目内的测试适配 Car 链
+                car_det = ("BEVFusion car 头" if car_detector == "bevfusion"
+                           else "Waymo Car 头")
+                _print(f"{base}: {step}/{total} Car 链（hybrid_expD_car: {car_det} + 通用后处理）")
+                _t = time.monotonic()
+                if car_detector == "bevfusion":
+                    car_raw = bev_raw if bev_raw is not None else _run_raw_bevfusion(
+                        python, clip, work / "bev_raw", bev_raw_threshold, truck_detector_mode)
+                else:                        # hybrid 链 + Waymo 检测器：单独跑一次 Waymo step1
+                    car_raw = _run_raw(python, clip, MAIN_CAR_CFG, MAIN_CAR_CKPT,
+                                       work / "car_raw", "car", 0.3)
+                car_json = work / "car.json"
+                car_diag = work / "car_diag.json"
+                car_result = run_expd_car(
+                    car_raw, clip, car_json, car_diag,
+                    class_score_thresholds={"Car": float(car_score_threshold)})
+                car_frames = json.loads(car_json.read_text(encoding="utf-8"))
+                timings["car"] = round(time.monotonic() - _t, 1)
+                chain_labels["car"] = _frames_to_labels(car_frames, 0)
+                chain_stats["car"] = {
+                    "pipeline": "hybrid_expD_car",
+                    "detector": str(car_detector),
+                    "final_detections": (car_result or {}).get("final_detections"),
+                    "frames": len(chain_labels["car"])}
+            else:
+                car_src = ("BEVFusion car 头 + Step4.5" if car_detector == "bevfusion"
+                           else "Waymo Car + Step4.5")
+                _print(f"{base}: {step}/{total} Car 链（main_chain: {car_src}）")
+                _t = time.monotonic()
+                main_labels, main_result = run_main_car(
+                    python, clip, work / "main", overwrite=True,
+                    raw_json=(bev_raw if car_detector == "bevfusion" else None))
+                timings["car"] = round(time.monotonic() - _t, 1)
+                chain_labels["car"] = {str(key): list(value)
+                                       for key, value in main_labels.items()}
+                chain_stats["car"] = {
+                    "pipeline": "main_chain",
+                    "detector": str(car_detector),
+                    "checkpoint": ("BEVFusion " + str(truck_detector_mode)
+                                   if car_detector == "bevfusion"
+                                   else "main_chain/models/vn_waymo_v2_4gpu_full_epoch10.pth"),
+                    "final_detections": main_result.get("final_detections"),
+                    "frames": len(chain_labels["car"])}
         if "truck" in selected:
             step += 1
             if truck_detector == "bevfusion":
@@ -695,10 +736,17 @@ def main() -> int:
     # 【改动】2026-09-20 Truck 链检测器（BEVFusion / 旧 VoxelNeXt）与货车/挂车规则
     parser.add_argument("--include-pre", action="store_true",
                         help="允许把已经预标过的 <clip>_pre 也当输入（换检测器重跑用）")
+    parser.add_argument("--car-pipeline", choices=["main_chain", "hybrid"], default="main_chain",
+                        help="Car 走哪条链：main_chain（Waymo Car + Step4.5，默认）"
+                             "或 hybrid（pipeline/hybrid_expD_car.py：只做通用后处理）")
+    parser.add_argument("--car-score-threshold", type=float, default=0.2,
+                        help="--car-pipeline hybrid 时的 Car 分数阈值")
     parser.add_argument("--car-detector", choices=["waymo", "bevfusion"], default="waymo",
                         help="Car 链检测器：waymo（默认）或 bevfusion（用 BEVFusion 的 car 头）")
     parser.add_argument("--vru-detector", choices=["voxelnext", "bevfusion"], default="voxelnext",
                         help="VRU 链检测器：voxelnext（默认）或 bevfusion（ped/bicycle/motorcycle 头）")
+    parser.add_argument("--bev-raw-dir", type=Path, default=None,
+                        help="复用该目录下 <clip名>_raw.json（不重新跑 BEVFusion 推理）")
     parser.add_argument("--bev-raw-threshold", type=float, default=0.1,
                         help="三链共享的 BEVFusion raw json 分数门槛（链内阈值另外把关）")
     parser.add_argument("--output-suffix", type=str, default="",
@@ -865,8 +913,11 @@ def main() -> int:
             truck_detector=args.truck_detector,
             truck_detector_mode=args.truck_detector_mode,
             car_detector=args.car_detector,
+            car_pipeline=args.car_pipeline,
+            car_score_threshold=args.car_score_threshold,
             vru_detector=args.vru_detector,
             bev_raw_threshold=args.bev_raw_threshold,
+            bev_raw_dir=args.bev_raw_dir,
             output_suffix=args.output_suffix,
             link_only=args.link_only,
             trailer_rules=not args.no_trailer_rules,

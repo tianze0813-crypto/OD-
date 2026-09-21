@@ -9,12 +9,21 @@
 链内统一走 `tracking.canonical_class_name()` 归一（hybrid 的硬过滤 `_class_allowed` /
 `score_threshold_for` 都接受原始名），**不需要预先重映射**。
 
-参数（可用 run(...) 的 overrides 覆盖）：
+参数（可用 run(...) 的 overrides 覆盖，或用命令行开关）：
   * 类别      keep_classes=("Car",)，分数阈值 Car 0.2
   * 范围      前 80 / 后 20 / 左右 40 m
   * 稀疏度    ≤5 点   可见度 0.05   短轨迹 3 帧
   * yaw       v2（直线段运动方向 / 静止点云主轴），Car 允许静态 slot 与静态 yaw 稳定
   * obj_id    从 1 起（单独看用；合并到三链时由 orchestrator 加偏移）
+
+**与 main_chain Car 链的分工**：main_chain 那条是 Waymo 权重 + Car 专属精修
+（step3_car_box_fit / step4 size filter / step4.5 region retrack / step5，
+分数/稀疏度门限与"原始类名字符串白名单"都是给 Waymo 头调的）；本链只保留通用后处理，
+换检测器（尤其 BEVFusion 的 car 头）时数更符合直觉。两条链的输出都是 SUST 可直接读的
+base_link 标签，可以并排对比。
+
+**整批集成**：`scripts/run_hybrid_prelabel.py --car-pipeline hybrid --car-detector bevfusion`
+即用本链（与 truck/vru 共用同一份 BEVFusion 原始检测）。
 """
 from __future__ import annotations
 
@@ -124,6 +133,12 @@ def main() -> None:
     parser.add_argument("--raw-score-threshold", type=float, default=0.1)
     parser.add_argument("--work-root", type=Path, default=None)
     parser.add_argument("--car-score-threshold", type=float, default=0.2)
+    parser.add_argument("--range-front", type=float, default=DEFAULTS["range_front"])
+    parser.add_argument("--range-rear", type=float, default=DEFAULTS["range_rear"])
+    parser.add_argument("--range-side", type=float, default=DEFAULTS["range_side"])
+    parser.add_argument("--sparsity-max-points", type=int, default=DEFAULTS["sparsity_max_points"])
+    parser.add_argument("--visibility-min-ratio", type=float, default=DEFAULTS["visibility_min_ratio"])
+    parser.add_argument("--short-track-max-frames", type=int, default=DEFAULTS["short_track_max_frames"])
     parser.add_argument("--label-subdir", default=LABEL_SUBDIR)
     parser.add_argument("--id-offset", type=int, default=ID_OFFSET)
     parser.add_argument("--link-dir", type=Path, default=None,
@@ -148,7 +163,13 @@ def main() -> None:
         parser.error("--detector raw 时必须给 --raw-json")
 
     diag = run(raw_json, args.clip, args.out_json, args.diagnostics,
-               class_score_thresholds={"Car": float(args.car_score_threshold)})
+               class_score_thresholds={"Car": float(args.car_score_threshold)},
+               range_front=float(args.range_front),
+               range_rear=float(args.range_rear),
+               range_side=float(args.range_side),
+               sparsity_max_points=int(args.sparsity_max_points),
+               visibility_min_ratio=float(args.visibility_min_ratio),
+               short_track_max_frames=int(args.short_track_max_frames))
     if not args.no_export:
         frames = json.loads(Path(args.out_json).read_text(encoding="utf-8"))
         n = export_labels(frames, Path(args.clip), args.label_subdir, args.id_offset)
