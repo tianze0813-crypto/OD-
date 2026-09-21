@@ -68,11 +68,24 @@ python scripts/run_hybrid_prelabel.py <input_root> <output_root> --chains car,tr
     --car-pipeline hybrid --car-detector bevfusion --vru-detector bevfusion
 ```
 
-**为什么需要 `hybrid` 这条**（停车场场景 4 条 clip 实测，BEVFusion 纯雷达 raw @0.2）：
+**为什么还需要 `hybrid` 这条 / main_chain 做了哪些对齐**（停车场场景 clip5，BEVFusion 纯雷达 raw @0.2）：
 
-| | BEV 原始检测 | main_chain（Waymo 头调的门限） | hybrid Car 链 |
-| --- | --- | --- | --- |
-| Car 框数 | 1910~3559 | 43~230 | **1682~2679** |
+| 配置 | Car 框数 | 说明 |
+| --- | --- | --- |
+| BEV 原始检测 | 1910 | 阈值 0.2 |
+| main_chain（原 Waymo 门限） | 203 | step2 分数 0.3 / 稀疏度 10 点 / 生命周期 4 帧 + 白名单按**原始字符串**比（`car` 不匹配 `Car`，整批删） |
+| main_chain + 对齐门限（现在） | **1552** | BEV 模式自动用 0.2 / 5 点 / 3 帧，白名单别名感知（已在 OD-main-0909 改并同步） |
+| hybrid Car 链 | **1681** | 只做通用后处理；差额（~130）来自 main 额外的 step4 尺寸过滤 / step4.5 重跟踪 / step5 运动过滤 |
+
+对齐清单（BEV 模式下 main_chain 与测试链的参数现在一致）：
+
+| 参数 | Waymo 模式 | BEV 模式（= 测试链） |
+| --- | --- | --- |
+| step2 分数阈值 | 0.3 | 0.2 |
+| step2 稀疏度 | ≤10 点 | ≤5 点 |
+| step2 生命周期 | 4 帧 | 3 帧 |
+| 类名归一 | 原样比 | 原样比 + `CLASS_MAP` casefold 归一 |
+| 范围 / 可见度 | 80-20-40 / 0.05 | 同 |
 
 main_chain 的硬过滤用**原始类别字符串**比对白名单、且分数/点数门限是给 Waymo 头调的，
 换成 BEVFusion 的 car 头会削掉 90%+；`hybrid` 这条链走 `canonical_class_name` 归一，

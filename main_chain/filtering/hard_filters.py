@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Sequence, Set, Tuple
 import numpy as np
 
 from filtering import camera_visibility
+from tracking import tracker_conservative as tracking      # 【改动】类别别名归一
 from tracking import tracker_conservative as tracking
 
 
@@ -38,6 +39,23 @@ def _load_lidar_xyz(clip: Path, frame_id: str) -> np.ndarray:
     if values.size % 4 != 0:
         raise ValueError(f"lidar frame is not xyzi float32: {path}")
     return values.reshape(-1, 4)[:, :3]
+
+
+def _class_allowed(value: Any, allowed: Sequence[str]) -> bool:
+    """【改动·2026-09-21】白名单同时接受模型原始名与规范名。
+
+    旧实现是 `class_name not in keep_classes` 直接比字符串，BEVFusion 的 raw json 用
+    模型原生小写名（car/truck/pedestrian…），会被当成"非白名单"整批删掉（连 car 都删）。
+    现在先原样比，再走 canonical_class_name 归一后比；类别纠正仍由 Step2.5 负责。
+    """
+    raw = str(value or "").strip()
+    allowed_set = {str(item) for item in allowed}
+    if raw in allowed_set:
+        return True
+    # 本仓库的 tracking 只提供 CLASS_MAP（canonical_class_name 是混合链路那边的）；
+    # 这里就地做一次别名归一：先原样查，再 casefold 查。
+    canonical = tracking.CLASS_MAP.get(raw) or tracking.CLASS_MAP.get(raw.casefold())
+    return canonical is not None and canonical in allowed_set
 
 
 def count_points_in_boxes(points: np.ndarray,
@@ -114,7 +132,7 @@ def apply_hard_filters(frames: List[Dict[str, Any]], clip: Path,
                 class_name = str(det.get("class_name", ""))
                 if float(det.get("score", 0.0)) < config.score_threshold:
                     reasons.append("score")
-                if class_name not in config.keep_classes:
+                if not _class_allowed(class_name, config.keep_classes):
                     reasons.append("class_whitelist")
                 if not _in_annotation_range(box, config):
                     reasons.append("annotation_range")

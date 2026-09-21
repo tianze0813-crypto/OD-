@@ -123,6 +123,11 @@ def main():
     parser.add_argument("--detector", choices=["waymo", "bevfusion"], default="waymo")
     parser.add_argument("--bevfusion-mode", choices=["lidar", "fusion"], default="lidar")
     parser.add_argument("--bevfusion-score-thresh", type=float, default=0.2)
+    # 【改动】step2 硬过滤门限：默认按检测器给（waymo=0.3/10/4；bevfusion=0.2/5/3，与
+    # 混合链路里测试用的 hybrid Car 链对齐）；显式给了就用显式值。
+    parser.add_argument("--step2-score-threshold", type=float, default=None)
+    parser.add_argument("--step2-sparsity-max-points", type=int, default=None)
+    parser.add_argument("--step2-min-lifecycle", type=int, default=None)
     parser.add_argument("--drop-vis-below", type=float, default=0.05)
     parser.add_argument("--keep-intermediate", action="store_true",
                         help="keep step1..step4.5 JSON/diagnostics under "
@@ -186,11 +191,22 @@ def main():
 
             step2_json = step2_root / f"{base}_step2.json"
             step2_diag = step2_root / f"{base}_step2_diagnostics.json"
+            # 【改动】BEV 模式默认用测试链调好的门限（0.2 / ≤5 点 / 3 帧）
+            bev_mode = str(args.detector) == "bevfusion"
+            step2_threshold = (args.step2_score_threshold if args.step2_score_threshold is not None
+                               else (0.2 if bev_mode else 0.3))
+            step2_sparsity = (args.step2_sparsity_max_points if args.step2_sparsity_max_points is not None
+                              else (5 if bev_mode else 10))
+            step2_lifecycle = (args.step2_min_lifecycle if args.step2_min_lifecycle is not None
+                               else (3 if bev_mode else 4))
             run([args.post_python,
                  ROOT / "pipeline" / "step2_identity_class_filter_yaw.py",
                  "--in-json", raw_json, "--clip", clip,
                  "--out-json", step2_json,
-                 "--diagnostics", step2_diag])
+                 "--diagnostics", step2_diag,
+                 "--score-threshold", step2_threshold,
+                 "--sparsity-max-points", step2_sparsity,
+                 "--min-lifecycle", step2_lifecycle])
 
             step3_json = step3_root / f"{base}_step3.json"
             step3_diag = step3_root / f"{base}_step3_diagnostics.json"
