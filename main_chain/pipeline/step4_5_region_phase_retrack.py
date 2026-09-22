@@ -19,6 +19,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from geometry.car_box_fit import CarBoxFitConfig
 from region.dynamic_region import DynamicRegionConfig
 from region.retrack import (
     Step45Config,
@@ -117,7 +118,8 @@ def run(step4_json: Path, clip: Path, step2_diagnostics: Path,
     static_yaw_diagnostics = step2.get("static_yaw_stabilization", {})
     _fitted_frames, box_fit_diagnostics = dynamic_box_fit(
         frames, Path(clip), coords, tracking_diagnostics,
-        static_yaw_diagnostics)
+        static_yaw_diagnostics,
+        CarBoxFitConfig(enabled=bool(config.car_box_fit_enabled)))
 
     # Final dynamic yaw: remove the 180-degree flip ambiguity and align the
     # box axis to the local driving heading.

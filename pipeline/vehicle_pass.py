@@ -78,6 +78,8 @@ DEFAULTS: Dict[str, Any] = dict(
     trailer_dup_iou=0.50,
     trailer_merge_iou=0.05,
     trailer_policy="to-truck",       # 标注侧没有 Trailer -> 一律并成 Truck
+    # ---- Car 几何：静态刚性框（OD-main-0909 同步；默认关）----
+    static_rigid=False,
     # ---- Truck 分支（复用原 Truck 单链参数）----
     truck_sparsity_max_points=10,
     truck_visibility_min_ratio=0.05,
@@ -424,6 +426,8 @@ def run(raw_json: Path, clip: Path, work_root: Path,
     command = [python, STEP_VEHICLE_CHAIN,
                "--raw-json", vehicle_raw, "--clip", clip,
                "--work-root", steps_root]
+    if params.get("static_rigid"):
+        command.append("--static-rigid")
     print("[vehicle-pass] $ " + " ".join(str(value) for value in command),
           flush=True)
     subprocess.run([str(value) for value in command], check=True)

@@ -59,6 +59,8 @@ class Step45Config:
     # Experimental post-pass2 dynamic yaw overwrite.  Disabled by default;
     # enable only after the yaw-lock issue is resolved.
     yaw_align_enabled: bool = False
+    # 【开关】step4.5 对动态区域重跟踪框再做一次 box fit；False = 不做。
+    car_box_fit_enabled: bool = True
     # Reviewed single-frame overlap noise filter (pass 1):
     # same-frame Car boxes with IoU > threshold -> remove the one with fewer
     # lidar points inside its box; equal points -> do nothing.
@@ -2147,12 +2149,14 @@ def dynamic_box_fit(
         coords: tracking.CoordinateProvider,
         tracking_diagnostics: Mapping[str, Any],
         static_yaw_diagnostics: Mapping[str, Any],
+        config: CarBoxFitConfig | None = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Re-fit boxes only for step-4.5 re-tracked detections."""
     source = copy.deepcopy(list(frames))
     fitted, diagnostics = apply_car_box_fit(
         source, coords, clip, tracking_diagnostics,
-        static_yaw_diagnostics, CarBoxFitConfig())
+        static_yaw_diagnostics,
+        config if config is not None else CarBoxFitConfig())
     replaced = 0
     for original, updated in zip(frames, fitted):
         for det, fitted_det in zip(

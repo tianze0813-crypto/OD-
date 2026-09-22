@@ -473,7 +473,8 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
              # 【改动】2026-09-21 Car+Truck 合并成一条后处理（共享动静态区域）；
              # --no-car-truck-merged 可回退到原来的两条链，方便 A/B。
              # 【改动】车链过程诊断（槽位/动态区域/…）默认不落盘；调试时才写进输出目录
-             keep_vehicle_diagnostics: bool = False) -> Dict[str, Any]:
+             keep_vehicle_diagnostics: bool = False,
+             static_rigid: bool = False) -> Dict[str, Any]:
     base = clip.name
     tag = output_tag.strip("_-")
     # 【改动】已经是 <clip>_pre 的输入 -> output_name == base：重跑就地覆盖，
@@ -562,6 +563,7 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
                 trailer_dup_iou=float(trailer_dup_iou),
                 trailer_merge_iou=float(trailer_merge_iou),
                 trailer_policy=str(trailer_policy),
+                static_rigid=bool(static_rigid),
                 class_score_thresholds={
                     "Car": 0.2,
                     "Truck": 0.2,
@@ -833,6 +835,8 @@ def main() -> int:
     parser.add_argument("--trailer-dup-iom", type=float, default=0.70)
     parser.add_argument("--trailer-dup-iou", type=float, default=0.50)
     parser.add_argument("--trailer-merge-iou", type=float, default=0.05)
+    parser.add_argument("--static-rigid", action="store_true",
+                        help="【改动】静态 Car 轨迹叠帧拟一个刚性 box 固定在世界系（默认关）")
     parser.add_argument("--keep-vehicle-diagnostics", action="store_true",
                         help="【改动】把车链过程诊断 vehicle_pass_diagnostics.json 写进输出 clip"
                              "（默认不写，只调试用）")
@@ -1012,6 +1016,7 @@ def main() -> int:
             trailer_dup_iou=args.trailer_dup_iou,
             trailer_merge_iou=args.trailer_merge_iou,
             trailer_policy=args.trailer_policy,
+            static_rigid=bool(args.static_rigid),
             keep_vehicle_diagnostics=bool(args.keep_vehicle_diagnostics),
             vru_cfg=vru_cfg,
             vru_ckpt=vru_ckpt,

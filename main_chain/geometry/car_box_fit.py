@@ -38,8 +38,34 @@ from tracking import tracker_conservative as tracking
 
 @dataclass(frozen=True)
 class CarBoxFitConfig:
-    # Ground / z policy.  These values are kept identical to the reviewed two-boundary
-    # face-fit stage, so "z-axis algorithm unchanged" is explicit.
+    # 【总开关】False = 整步「框尺寸拟合」关闭：XY 与 Z 一个字段都不改，原样返回。
+    # 用途：把「拟合」从车链里摘出来做 A/B（例如排查盒高逐帧忽高忽低到底是不是它造成的）。
+    enabled: bool = True
+    # ---- 静态刚性框（叠帧 + 世界系固定）----
+    # 开启后：对每条【静态】Car 轨迹，把各帧车体点云叠到一个车体系里拟一个刚性
+    # 尺寸，再把【一个】box 固定在世界系上，逐帧只按该帧位姿反算回 lidar 系。
+    # 效果：静态框尺寸/高度/世界系位置逐帧恒定，不再跟着逐帧拟合抖。
+    static_rigid_enabled: bool = False
+    static_rigid_motion_max: float = 1.0        # 世界系 net/span/step 上限（m）
+    static_rigid_min_observations: int = 3
+    static_rigid_min_frame_points: int = 20
+    static_rigid_crop_pad_xy: float = 0.55
+    static_rigid_body_bottom: float = 0.10
+    static_rigid_body_top: float = 2.60
+    static_rigid_xy_low_percentile: float = 0.5
+    static_rigid_xy_high_percentile: float = 99.5
+    static_rigid_height_from_roof: bool = True   # False = 一律用逐帧拟合高度的中位
+    static_rigid_slack: float = 0.10             # 尺寸最多比逐帧拟合框大这么多（m）
+    static_rigid_roof_band: float = 0.15
+    static_rigid_roof_min_points: int = 12
+    static_rigid_roof_min_fraction: float = 0.06
+    static_rigid_roof_min_long_span: float = 0.80
+    # 护栏：叠帧车体长度不足 -> 整条轨迹不动；stack roof 最多比逐帧拟合高度高这么多；
+    # 逐帧刚性框内点数 <= 这个值 -> 该帧退回原框（与 step5 的 <=max_points 规则一致，
+    # 避免刚性框把本来有点的框变成空框被终检删掉）
+    static_rigid_min_extent_long: float = 3.60
+    static_rigid_height_max_gain: float = 0.35
+    static_rigid_min_points_in_box: int = 6
     ground_ring_inner_margin: float = 0.18
     ground_ring_outer_margin: float = 1.20
     ground_z_below: float = 0.75
@@ -867,6 +893,219 @@ def _car_height_ground_ok(ground: float | None,
     return abs(float(ground) - float(ego_ground)) <= float(config.car_height_ground_prior_m)
 
 
+# --------------------------------------------------------------------------- #
+# Static rigid box: one box per *static* Car track, stacked over the track's
+# frames and fixed in the world frame.
+#
+# Runs after the per-frame fit, so the per-frame ground / XY / roof evidence that
+# stage already computed on every item is reused (no extra point-cloud pass
+# beyond the body crop).  Only Car, only tracks whose world motion stays inside
+# static_rigid_motion_max, and only box_lidar[0:6] is written (yaw stays the one
+# the yaw stage produced, i.e. the protected field is untouched).
+# --------------------------------------------------------------------------- #
+def _static_rigid_motion(items: Sequence[Mapping[str, Any]]
+                         ) -> Tuple[float, float, float]:
+    """net / max-span / max-step of the track's world-frame box centres (m)."""
+    centres = np.asarray([item["raw_world"][:2] for item in items
+                          if item.get("raw_world") is not None],
+                         dtype=np.float64)
+    if len(centres) < 2:
+        return 0.0, 0.0, 0.0
+    net = float(np.linalg.norm(centres[-1] - centres[0]))
+    span = float(np.max(np.linalg.norm(centres - np.median(centres, axis=0),
+                                       axis=1)))
+    step = float(np.max(np.linalg.norm(np.diff(centres, axis=0), axis=1)))
+    return net, span, step
+
+
+def _static_rigid_stack(items: Sequence[Mapping[str, Any]],
+                        config: CarBoxFitConfig
+                        ) -> Tuple[List[np.ndarray], int]:
+    """Per-frame body points expressed in that frame's car frame (z above ground).
+
+    Returns the point blocks plus the number of frames whose ground had to fall
+    back to the fitted box bottom (``ground_z`` is None, same fallback the
+    per-frame z fit uses)."""
+    blocks: List[np.ndarray] = []
+    fallback_frames = 0
+    for item in items:
+        points = item.get("points")
+        if points is None:
+            continue
+        ground_z = item.get("ground_z")
+        if ground_z is None:
+            ground_z = (float(item["det"]["box_lidar"][2])
+                        - float(item["det"]["box_lidar"][5]) / 2.0)
+            fallback_frames += 1
+        box = item["det"]["box_lidar"]
+        local = box_geometry._local_xy(points[:, :2], (box[0], box[1]), box[6])
+        above = points[:, 2] - float(ground_z)
+        keep = ((np.abs(local[:, 0]) <= float(box[3]) / 2.0
+                 + config.static_rigid_crop_pad_xy)
+                & (np.abs(local[:, 1]) <= float(box[4]) / 2.0
+                   + config.static_rigid_crop_pad_xy)
+                & (above >= config.static_rigid_body_bottom)
+                & (above <= config.static_rigid_body_top))
+        if int(np.count_nonzero(keep)) < config.static_rigid_min_frame_points:
+            continue
+        blocks.append(np.column_stack([local[keep], above[keep]]))
+    return blocks, fallback_frames
+
+
+def _points_inside_box(points: np.ndarray, box: Sequence[float]) -> int:
+    """Same rule as filtering.hard_filters.count_points_in_boxes (step5 gate)."""
+    x, y, z, dx, dy, dz, yaw = (float(value) for value in box[:7])
+    cosine, sine = math.cos(-yaw), math.sin(-yaw)
+    px = (points[:, 0] - x) * cosine - (points[:, 1] - y) * sine
+    py = (points[:, 0] - x) * sine + (points[:, 1] - y) * cosine
+    return int(np.count_nonzero((np.abs(px) <= dx / 2.0)
+                                & (np.abs(py) <= dy / 2.0)
+                                & (np.abs(points[:, 2] - z) <= dz / 2.0)))
+
+
+def _static_rigid_roof(stack: np.ndarray,
+                       config: CarBoxFitConfig) -> Tuple[float | None, Dict[str, Any]]:
+    """Roof height above ground from the dense stack, or None when unsupported."""
+    above = stack[:, 2]
+    top = float(np.percentile(above, 99.9))
+    if top - float(np.percentile(above, 50.0)) < 0.30:
+        return None, {"reason": "flat"}
+    band = (above >= top - config.static_rigid_roof_band) & (above <= top + 0.05)
+    count = int(np.count_nonzero(band))
+    need = max(config.static_rigid_roof_min_points,
+               int(config.static_rigid_roof_min_fraction * len(above)))
+    if count < need:
+        return None, {"reason": "top_not_supported", "count": count, "need": need}
+    roof = stack[band]
+    long_span = float(np.percentile(roof[:, 0], 95) - np.percentile(roof[:, 0], 5))
+    short_span = float(np.percentile(roof[:, 1], 95) - np.percentile(roof[:, 1], 5))
+    if max(long_span, short_span) < config.static_rigid_roof_min_long_span:
+        return None, {"reason": "roof_not_horizontal",
+                      "long_span": round(max(long_span, short_span), 4)}
+    return top, {"count": count, "need": need, "stack_points": int(len(above))}
+
+
+def _apply_static_rigid_boxes(tracks: Mapping[int, List[MutableMapping[str, Any]]],
+                              config: CarBoxFitConfig) -> Dict[str, Any]:
+    """Replace every static Car track by one rigid box fixed in the world frame."""
+    details: List[Dict[str, Any]] = []
+    stats: Counter[str] = Counter()
+    for track_id, items in sorted(tracks.items()):
+        if box_geometry._class_name(items) != "Car":
+            continue
+        if len(items) < config.static_rigid_min_observations:
+            stats["skipped_short"] += 1
+            continue
+        net, span, step = _static_rigid_motion(items)
+        if max(net, span, step) >= config.static_rigid_motion_max:
+            stats["skipped_moving"] += 1
+            continue
+        blocks, fallback_frames = _static_rigid_stack(items, config)
+        if len(blocks) < config.static_rigid_min_observations:
+            stats["skipped_no_points"] += 1
+            continue
+        stack = np.vstack(blocks)
+
+        # rigid XY from the stacked body, never longer than the fitted box + slack
+        low = config.static_rigid_xy_low_percentile
+        high = config.static_rigid_xy_high_percentile
+        long_axis = np.percentile(stack[:, 0], [low, high])
+        short_axis = np.percentile(stack[:, 1], [low, high])
+        det_long = float(np.median([float(item["det"]["box_lidar"][3])
+                                    for item in items]))
+        det_short = float(np.median([float(item["det"]["box_lidar"][4])
+                                     for item in items]))
+        fitted_height = float(np.median([float(item["det"]["box_lidar"][5])
+                                         for item in items]))
+        if long_axis[1] - long_axis[0] < config.static_rigid_min_extent_long:
+            # 车体证据太少（半遮挡 / 只有一小片点云），叠出来的"刚性尺寸"没有意义
+            stats["skipped_thin_stack"] += 1
+            continue
+        bounds = box_geometry._SIZE_BOUNDS.get("Car")
+        cap_long = max(config.min_extent_long,
+                       min(bounds[0][1] if bounds else 6.20,
+                           det_long + config.static_rigid_slack))
+        cap_short = max(config.min_extent_short,
+                        min(bounds[1][1] if bounds else 2.65,
+                            det_short + config.static_rigid_slack))
+        long_size = float(np.clip(
+            long_axis[1] - long_axis[0] + config.xy_padding_long,
+            config.min_extent_long, cap_long))
+        short_size = float(np.clip(
+            short_axis[1] - short_axis[0] + config.xy_padding_short,
+            config.min_extent_short, cap_short))
+        roof, roof_detail = (None, {"reason": "disabled"})
+        if config.static_rigid_height_from_roof:
+            roof, roof_detail = _static_rigid_roof(stack, config)
+        if roof is not None:
+            height = min(float(roof),
+                         fitted_height + config.static_rigid_height_max_gain)
+            height_source = ("stack_roof" if height == float(roof)
+                             else "stack_roof_capped")
+        else:
+            height = fitted_height
+            height_source = "fitted_median"
+        if bounds is not None:
+            height = float(np.clip(height, bounds[2][0], bounds[2][1]))
+        size_xy = ((long_size, short_size) if det_long >= det_short
+                   else (short_size, long_size))
+
+        # one world-frame centre for the whole track.
+        # z 必须一起带：世界系原点和车身差得很远（这里 z≈18.5 m、y≈-119 m），
+        # 反投影时若把 z 当 0，姿态里的俯仰/侧倾会把 ~18 m 的 z 差漏进 xy，
+        # 整条轨迹会被平移好几米（实测 3.5~4 m）。
+        centres = []
+        for item in items:
+            box = item["det"]["box_lidar"]
+            world = np.asarray(item["world_from_lidar"], dtype=np.float64)
+            centres.append((world @ np.array([float(box[0]), float(box[1]),
+                                              float(box[2]), 1.0]))[:3])
+        centre_world = np.median(np.asarray(centres, dtype=np.float64), axis=0)
+
+        restored_frames = 0
+        for item in items:
+            box = item["det"]["box_lidar"]
+            lidar_from_world = np.asarray(item["lidar_from_world"], dtype=np.float64)
+            point = lidar_from_world @ np.array([centre_world[0], centre_world[1],
+                                                 centre_world[2], 1.0])
+            ground_z = item.get("ground_z")
+            if ground_z is None:
+                ground_z = float(box[2]) - float(box[5]) / 2.0
+            original = [float(value) for value in box[:6]]
+            box[0], box[1] = float(point[0]), float(point[1])
+            box[2] = float(ground_z) + height / 2.0
+            box[3], box[4], box[5] = size_xy[0], size_xy[1], height
+            points = item.get("points")
+            if points is None:
+                continue
+            # 与 filtering.hard_filters.count_points_in_boxes / step5 终检同口径：
+            # 刚性框内点数不够就退回这一帧原来的框（宁可不动，也不制造空框）
+            inside = _points_inside_box(points, box)
+            if inside <= config.static_rigid_min_points_in_box:
+                box[:6] = original
+                restored_frames += 1
+        if restored_frames:
+            stats["restored_frames"] += restored_frames
+        stats["tracks"] += 1
+        stats["boxes"] += len(items)
+        details.append({
+            "track_id": int(track_id),
+            "observations": len(items),
+            "stack_frames": len(blocks),
+            "ground_fallback_frames": int(fallback_frames),
+            "restored_frames": int(restored_frames),
+            "stack_points": int(len(stack)),
+            "size": [round(float(value), 4) for value in size_xy],
+            "height": round(height, 4),
+            "height_source": height_source,
+            "roof_detail": roof_detail,
+            "motion": {"net": round(net, 4), "span": round(span, 4),
+                       "step": round(step, 4)},
+            "world_center": [round(float(value), 4) for value in centre_world[:3]],
+        })
+    return {"enabled": True, "stats": dict(stats), "details": details}
+
+
 
 def _car_height_ring_ground(points: np.ndarray, box: Sequence[float],
                             config: CarBoxFitConfig) -> float | None:
@@ -1254,6 +1493,28 @@ def apply_car_box_fit(
         config: CarBoxFitConfig = CarBoxFitConfig(),
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     output = copy.deepcopy(list(frames))
+    if not config.enabled:
+        # 关闭：不读点云、不建轨迹、不改任何 box_lidar —— 直接原样返回一份深拷贝，
+        # 诊断里如实标记 disabled，下游（step3/step4.5）照常按 box_lidar 走。
+        return output, {
+            "policy": {
+                "pipeline_position": "after_identity_class_and_yaw",
+                "geometry_version": "car_box_fit",
+                "coordinate_frame": "lidar_top local frame",
+                "mutated_fields": "none",
+                "frozen_fields": ["all"],
+                "no_interpolation": True,
+            },
+            "enabled": False,
+            "disabled_reason": "CarBoxFitConfig.enabled is False",
+            "tracks": 0,
+            "car_tracks": 0,
+            "car_boxes": 0,
+            "static_boxes": 0,
+            "dynamic_boxes": 0,
+            "final_detections": sum(
+                len(frame.get("detections", [])) for frame in output),
+        }
     tracks = box_geometry._build_tracks(output, coords)
     lidar = box_geometry._LidarCache(Path(clip))
     static_ids = {int(x["track_id"])
@@ -1465,6 +1726,10 @@ def apply_car_box_fit(
                               for x in _slots if x.get("track_id") is not None},
         cutoffs=cutoffs)
 
+    static_rigid: Dict[str, Any] = {"enabled": bool(config.static_rigid_enabled)}
+    if config.static_rigid_enabled:
+        static_rigid.update(_apply_static_rigid_boxes(tracks, config))
+
     invariant = box_geometry.verify_geometry_only(frames, output)
     final_detections = sum(len(f.get("detections", [])) for f in output)
     return output, {
@@ -1513,6 +1778,7 @@ def apply_car_box_fit(
         "ground_temporal_repaired_boxes": ground_temporal_repaired_boxes,
         "final_detections": final_detections,
         "car_height_policy": car_height,
+        "static_rigid": static_rigid,
         "invariant_check": invariant,
         "details": track_details,
     }

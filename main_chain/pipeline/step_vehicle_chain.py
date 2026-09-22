@@ -46,6 +46,7 @@ from classification.class_refinement import ClassRefinementConfig  # noqa: E402
 from filtering.car_size_filter import LargeCarFilterConfig         # noqa: E402
 from filtering.final_filter import FinalFilterConfig               # noqa: E402
 from filtering.hard_filters import HardFilterConfig                # noqa: E402
+from geometry.car_box_fit import CarBoxFitConfig                    # noqa: E402
 from tracking import tracker_conservative as tracking              # noqa: E402
 
 # 车链默认参数（Car / Truck 各自与单链行为对齐）
@@ -174,7 +175,10 @@ def run(raw_json: Path, clip: Path, work_root: Path, *,
         truck_length_min=(1e9 if not params["car_size_relabel"]
                           else float(params["car_size_truck_length_min"])))
     step3_result = step3.run(car_view_json, step2_diag, clip, step3_json, None,
-                             step3_diag)
+                             step3_diag,
+                             # 【改动】静态刚性框（OD-main-0909 同步）：默认关
+                             config=CarBoxFitConfig(static_rigid_enabled=bool(
+                                 params.get("static_rigid", False))))
     step4_json = work_root / f"{base}_car_step4.json"
     step4_diag = work_root / f"{base}_car_step4_diagnostics.json"
     step4_result = step4.run(step3_json, step4_json, step4_diag,
@@ -244,6 +248,8 @@ def main() -> None:
     parser.add_argument("--range-front", type=float, default=DEFAULTS["range_front"])
     parser.add_argument("--range-rear", type=float, default=DEFAULTS["range_rear"])
     parser.add_argument("--range-side", type=float, default=DEFAULTS["range_side"])
+    parser.add_argument("--static-rigid", action="store_true",
+                        help="【改动】静态 Car 轨迹叠帧拟一个刚性 box，固定在世界系（默认关）")
     parser.add_argument("--car-size-relabel", action="store_true",
                         help="按尺寸把大 Car 改写成 Truck（车链默认关，Truck 由 truck 头负责）")
     args = parser.parse_args()
@@ -255,7 +261,8 @@ def main() -> None:
         class_min_lifecycle=(("Car", args.short_car), ("Truck", args.short_truck)),
         range_front=args.range_front, range_rear=args.range_rear,
         range_side=args.range_side,
-        car_size_relabel=bool(args.car_size_relabel))
+        car_size_relabel=bool(args.car_size_relabel),
+        static_rigid=bool(args.static_rigid))
     print(json.dumps({k: v for k, v in result.items() if k != "params"},
                      ensure_ascii=False, indent=2))
 

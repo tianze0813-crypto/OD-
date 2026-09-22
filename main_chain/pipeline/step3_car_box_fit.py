@@ -17,13 +17,15 @@ from tracking import tracker_conservative as tracking
 
 
 def run(step2_json: Path, step2_diagnostics: Path, clip: Path,
-        out_json: Path, out_clip: Path | None, diagnostics_path: Path) -> dict:
+        out_json: Path, out_clip: Path | None, diagnostics_path: Path,
+        config: CarBoxFitConfig | None = None) -> dict:
     frames = json.loads(step2_json.read_text(encoding="utf-8"))
     diagnostics = json.loads(step2_diagnostics.read_text(encoding="utf-8"))
     coords = tracking.CoordinateProvider(Path(clip))
     output, result = apply_car_box_fit(
         frames, coords, Path(clip), diagnostics["tracking"],
-        diagnostics["static_yaw_stabilization"], CarBoxFitConfig())
+        diagnostics["static_yaw_stabilization"],
+        config if config is not None else CarBoxFitConfig())
     result.update({
         "source_step2_json": str(step2_json.resolve()),
         "source_step2_diagnostics": str(step2_diagnostics.resolve()),
@@ -49,13 +51,16 @@ def main() -> None:
     parser.add_argument("--out-json", type=Path, required=True)
     parser.add_argument("--out-clip", type=Path)
     parser.add_argument("--diagnostics", type=Path)
+    parser.add_argument("--static-rigid", action="store_true",
+                        help="【改动】静态 Car 轨迹叠帧拟一个刚性 box，固定在世界系")
     args = parser.parse_args()
     step2_diagnostics = args.step2_diagnostics or args.step2_json.with_name(
         args.step2_json.stem + "_diagnostics.json")
     diagnostics_path = args.diagnostics or args.out_json.with_name(
         args.out_json.stem + "_diagnostics.json")
     result = run(args.step2_json, step2_diagnostics, args.clip, args.out_json,
-                 args.out_clip, diagnostics_path)
+                 args.out_clip, diagnostics_path,
+                 config=CarBoxFitConfig(static_rigid_enabled=bool(args.static_rigid)))
     print(json.dumps({k: result.get(k) for k in (
         "tracks", "car_tracks", "car_boxes", "static_boxes", "dynamic_boxes",
         "both_side_boxes", "single_side_boxes", "unchanged_xy_boxes",
