@@ -7,6 +7,7 @@ import numpy as np
 
 from geometry.car_box_fit import (
     CarBoxFitConfig,
+    _car_height_ground_ok,
     _apply_car_height_policy,
     _car_height_longest_row,
     _car_height_ring_ground,
@@ -81,49 +82,40 @@ class PolicyTest(unittest.TestCase):
         stats = _apply_car_height_policy(tracks, FakeLidar(frames), self.config, static)
         return dets, stats
 
-    def test_box_top_sits_on_the_roof_and_height_is_within_priors(self):
+    def test_box_top_sits_on_the_roof_and_bottom_is_trimmed_to_the_ground(self):
         det = item("f0", BOX)
         dets, stats = self.run_policy([det], {"f0": cloud(GROUND + 1.60)}, static=[1])
 
         box = dets[0]["det"]["box_lidar"]
         self.assertAlmostEqual(box[2] + box[5] / 2.0, GROUND + 1.60, places=2)   # 顶钉在车顶
-        self.assertGreaterEqual(box[5], 1.45 - 1e-6)
+        self.assertGreaterEqual(box[5], 1.45 - 1e-6)       # 输出高度恒在 [1.45,1.70]
         self.assertLessEqual(box[5], 1.70 + 1e-6)
+        self.assertAlmostEqual(box[5], 1.60, places=2)      # 裁到地面后 = 车顶−地面
         self.assertAlmostEqual(box[2] - box[5] / 2.0, GROUND, places=2)          # 底贴地
         self.assertEqual(stats["static_tracks"], 1)
 
-    def test_high_ground_cannot_push_the_height_below_the_low_bound(self):
+    def test_missing_ground_falls_back_to_the_high_prior(self):
         det = item("f0", BOX)
-        # 地面离车顶只有 1.0 m → 高度被下限兜到 1.45（底会落到地面以下）
+        # 1.45~1.70 窗口里找不到地面 → 回退 1.70（输出高度恒在 [1.45,1.70]）
         dets, _stats = self.run_policy([det], {"f0": cloud(GROUND + 1.60, ground=GROUND + 0.60)}, static=[1])
         box = dets[0]["det"]["box_lidar"]
-        self.assertAlmostEqual(box[5], 1.45, places=3)
+        self.assertAlmostEqual(box[5], 1.70, places=3)
 
-    def test_moving_track_is_constrained_by_neighbour_frames(self):
-        # 同一辆动态车 5 帧，中间那帧被噪点抬高 0.5 m → 应被相邻帧拉回来
-        distances = (0.0, 20.0, 40.0, 60.0, 80.0)
-        dets = [item("f%d" % index, [0.0, y, -0.75, 4.6, 1.9, 1.90, 0.0])
-                for index, y in enumerate(distances)]
-        roofs = (1.60, 1.60, 2.10, 1.60, 1.60)
-        frames = {"f%d" % index: cloud(GROUND + roof, span=20.0, centre=(0.0, y))
-                  for index, (roof, y) in enumerate(zip(roofs, distances))}
+    def test_dynamic_track_keeps_its_own_roof_and_one_id_height(self):
+        # 车顶纯逐帧实测（滚动中位门控已去掉）；高度 = 本 ID 各帧最大深度 → 全 ID 统一
+        distances = (0.0, 20.0, 40.0, 60.0)
+        dets = [item("f%d" % i, [0.0, y, -0.75, 4.6, 1.9, 1.90, 0.0])
+                for i, y in enumerate(distances)]
+        roofs = (1.60, 1.60, 2.10, 1.60)          # 中间那帧被噪点抬高
+        frames = {"f%d" % i: cloud(GROUND + roof, span=20.0, centre=(0.0, y))
+                  for i, (roof, y) in enumerate(zip(roofs, distances))}
         dets, stats = self.run_policy(dets, frames)
         tops = [d["det"]["box_lidar"][2] + d["det"]["box_lidar"][5] / 2.0 for d in dets]
+        heights = [d["det"]["box_lidar"][5] for d in dets]
         self.assertEqual(stats["moving_tracks"], 1)
-        self.assertLess(tops[2], GROUND + 1.80)          # 被拉下来，不再飘到 2.10
-        for top in tops:
-            self.assertAlmostEqual(top, GROUND + 1.60, delta=0.12)
-
-    def test_small_deviation_keeps_the_frame_measurement(self):
-        # 两帧实测差 0.08 m（< 门控 0.15 m）→ 各自保留本帧实测，不被平滑掉
-        first = item("f0", [0.0, 0.0, -0.75, 4.6, 1.9, 1.90, 0.0])
-        second = item("f1", [0.0, 60.0, -0.75, 4.6, 1.9, 1.90, 0.0])
-        dets, _stats = self.run_policy([first, second],
-                                       {"f0": cloud(GROUND + 1.60),
-                                        "f1": cloud(GROUND + 1.68, centre=(0.0, 60.0))})
-        tops = [d["det"]["box_lidar"][2] + d["det"]["box_lidar"][5] / 2.0 for d in dets]
-        self.assertAlmostEqual(tops[0], GROUND + 1.60, places=2)
-        self.assertAlmostEqual(tops[1], GROUND + 1.68, places=2)
+        self.assertAlmostEqual(tops[2], GROUND + 2.10, places=2)   # 顶保留本帧实测（不再拉回）
+        self.assertEqual(len({round(h, 3) for h in heights}), 1)   # 整个 ID 一个高度
+        self.assertAlmostEqual(heights[0], 1.60, places=2)         # = 该 ID 各帧最大深度
 
     def test_static_row_shares_one_ground_when_a_frame_has_none(self):
         # 三辆并排的静止车（中心共线），其中第三辆自己那帧没有地面点
@@ -137,8 +129,7 @@ class PolicyTest(unittest.TestCase):
                   "f1": roof_only}
         tracks = {1: [first], 2: [second], 3: [third]}
         stats = _apply_car_height_policy(tracks, FakeLidar(frames), self.config, [1, 2, 3])
-        self.assertGreaterEqual(stats.get("row_shared_frames", 0)
-                                + stats.get("row_ground_frames", 0), 1)
+        self.assertGreaterEqual(stats.get("row_trimmed_boxes", 0), 1)
         for oid in (1, 2, 3):
             box = tracks[oid][0]["det"]["box_lidar"]
             self.assertAlmostEqual(box[2] - box[5] / 2.0, GROUND, places=2)   # 共底到真实地面
@@ -184,6 +175,47 @@ class RingGroundTest(unittest.TestCase):
     def test_no_ring_points_yields_none(self):
         roof_only = np.asarray([[-1.0, 0.0, GROUND + 1.6], [1.0, 0.0, GROUND + 1.6]])
         self.assertIsNone(_car_height_ring_ground(roof_only, BOX, self.config))
+
+
+class GroundPriorSlopeTest(unittest.TestCase):
+    """地面先验：绝对差 ≤0.3 m 或 坡度 ≤ tan(5°) 都算合理。"""
+
+    config = CarBoxFitConfig()
+
+    def _ok(self, ground, ego_ground, distance):
+        box = [distance, 0.0, 0.0, 4.6, 1.9, 1.6, 0.0]
+        return _car_height_ground_ok(ground, ego_ground, box, None, self.config)
+
+    def test_small_absolute_difference_is_accepted(self):
+        self.assertTrue(self._ok(GROUND + 0.2, GROUND, 30.0))
+
+    def test_far_target_on_a_mild_slope_is_accepted(self):
+        # 20 m 外差 0.6 m → 坡度 1.7° < 5°
+        self.assertTrue(self._ok(GROUND + 0.6, GROUND, 20.0))
+
+    def test_far_target_with_a_large_jump_is_rejected(self):
+        # 20 m 外差 3 m → 坡度 8.5° > 5°
+        self.assertFalse(self._ok(GROUND + 3.0, GROUND, 20.0))
+
+    def test_without_ego_reference_the_ground_is_accepted(self):
+        self.assertTrue(self._ok(GROUND + 5.0, None, 20.0))
+
+    def test_missing_ground_is_rejected(self):
+        self.assertFalse(self._ok(None, GROUND, 20.0))
+
+    def test_dynamic_car_does_not_get_the_curb_fallback(self):
+        # 动态：近处 2 m 有 0.25 m 突变 → 坡度 7° > 5° → 不接受；同样的差给静态车可接受
+        box = [2.0, 0.0, 0.0, 4.6, 1.9, 1.6, 0.0]
+        self.assertFalse(_car_height_ground_ok(GROUND + 0.25, GROUND, box, None, self.config,
+                                              is_static=False))
+        self.assertTrue(_car_height_ground_ok(GROUND + 0.25, GROUND, box, None, self.config,
+                                             is_static=True))
+
+    def test_dynamic_car_on_a_slope_is_accepted(self):
+        # 动态：30 m 外差 1.5 m → 坡度 2.9° < 5° → 接受
+        box = [30.0, 0.0, 0.0, 4.6, 1.9, 1.6, 0.0]
+        self.assertTrue(_car_height_ground_ok(GROUND + 1.5, GROUND, box, None, self.config,
+                                             is_static=False))
 
 
 if __name__ == "__main__":

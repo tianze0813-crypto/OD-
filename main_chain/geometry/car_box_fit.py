@@ -142,7 +142,20 @@ class CarBoxFitConfig:
     car_height_ground_percentile: float = 10.0
     car_height_ground_sanity_m: float = 2.50
     # 停车区"同排共底" + 地面高度先验（2026-09-22 定）
-    car_height_ground_prior_m: float = 0.30      # 地面相对参考路面的允许偏差（m）
+    # ---- 【最终版 2026-09-22】贴顶固定高 → 往下找地面 → 裁掉多出来的 ----
+    car_height_box_height_m: float = 1.80      # 所有 Car 统一的"贴顶框"高度
+    car_height_ground_band_below_m: float = 0.20   # 地面搜索带：预期框底再往下
+    car_height_ground_band_above_m: float = 0.15   # 地面搜索带：预期框底往上
+    car_height_ground_inflate_m: float = 0.60      # 搜索范围：框 footprint 外扩
+    car_height_ground_inflate_fallback_m: float = 1.30   # 兜底：放大到这么大再找
+    car_height_row_plane_max_slope_deg: float = 2.0
+    # ⑤.5 排内邻居一致性：相邻 5 辆（左右各 2）里，底面世界系高度激增 > 0.50 m 且坡度 > 2° → 只往下拉
+    car_height_row_neighbor_window: int = 2
+    car_height_row_neighbor_slope_deg: float = 2.0
+    car_height_row_neighbor_min_jump_m: float = 0.50      # 静态排虚拟地面允许坡度
+    car_height_ground_prior_m: float = 0.30
+    # 地面先验也可以按坡度判：目标地面与参考路面的坡度 ≤ 该角度就接受（tan 比较）
+    car_height_ground_prior_max_slope_deg: float = 5.0      # 地面相对参考路面的允许偏差（m）
     car_height_ground_prior_mode: str = "ego_local"   # ego_local（相对该帧自车附近路面）| absolute_zero
     car_height_ego_ring_inner_m: float = 3.0
     car_height_ego_ring_outer_m: float = 8.0
@@ -878,19 +891,33 @@ def _car_height_ground_ok(ground: float | None,
                           ego_ground: float | None,
                           box: Sequence[float],
                           base_from_lidar: np.ndarray | None,
-                          config: CarBoxFitConfig) -> bool:
-    """地面高度先验：相对参考路面（或 base_link 的 0）偏差不超过阈值才算可信地面。"""
+                          config: CarBoxFitConfig,
+                          is_static: bool = True) -> bool:
+    """地面高度先验：目标自己算出的地面，要能跟"参考路面"用坡度解释得通。
+
+    参考：ego_local = 自车附近路面（默认）；absolute_zero = base_link 的 0。
+    **动态车（在路上开）按【坡度】判**：坡度 ≤ tan(prior_max_slope_deg)（默认 5°）即接受；
+    **静态车（停车）除了坡度，还允许绝对差 ≤ prior_m（0.30 m）** —— 马路牙子/停车场那种
+    近处高度突变的兜底；这个底再作为同排共底的参考，避免整排车一起飘。
+    """
     if ground is None:
         return False
+    distance = math.hypot(float(box[0]), float(box[1]))
+    slope_limit = math.tan(math.radians(
+        float(getattr(config, "car_height_ground_prior_max_slope_deg", 5.0))))
     if str(config.car_height_ground_prior_mode).lower() == "absolute_zero":
         if base_from_lidar is None:
             return True
         base_z = float((base_from_lidar @ np.array(
             [float(box[0]), float(box[1]), float(ground), 1.0]))[2])
-        return abs(base_z) <= float(config.car_height_ground_prior_m)
-    if ego_ground is None:
-        return True
-    return abs(float(ground) - float(ego_ground)) <= float(config.car_height_ground_prior_m)
+        delta = abs(base_z)
+    else:
+        if ego_ground is None:
+            return True
+        delta = abs(float(ground) - float(ego_ground))
+    if delta <= float(config.car_height_ground_prior_m) and bool(is_static):
+        return True          # 马路牙子/停车场兜底：只给静态（停车）车
+    return distance > 1e-6 and (delta / distance) <= slope_limit
 
 
 # --------------------------------------------------------------------------- #
@@ -1125,6 +1152,29 @@ def _car_height_ring_ground(points: np.ndarray, box: Sequence[float],
     return estimate
 
 
+def _car_height_find_ground(points: np.ndarray, box: Sequence[float],
+                            roof_z: float,
+                            config: CarBoxFitConfig) -> float | None:
+    """在"车顶往下 low~high（默认 1.45~1.70 m）"这个深度窗口里找地面。
+
+    输入是贴顶的 1.80 m 框，但**地面只可能落在这个深度窗口内**，所以输出高度天然 ∈[1.45,1.70]；
+    找不到就回退 high（1.70）。水平范围先"框内+0.6 m"，失败放大到 1.3 m。
+    """
+    low_z = float(roof_z) - float(config.car_height_high_m)
+    high_z = float(roof_z) - float(config.car_height_low_m)
+    x, y, _z, dx, dy, _dz, yaw = (float(value) for value in box[:7])
+    local = box_geometry._local_xy(points[:, :2], (x, y), yaw)
+    for inflate in (float(config.car_height_ground_inflate_m),
+                    float(config.car_height_ground_inflate_fallback_m)):
+        half = np.asarray([dx / 2.0 + inflate, dy / 2.0 + inflate], dtype=np.float64)
+        mask = ((np.abs(local[:, 0]) <= half[0]) & (np.abs(local[:, 1]) <= half[1])
+                & (points[:, 2] >= low_z) & (points[:, 2] <= high_z))
+        values = points[mask, 2]
+        if values.size >= int(config.car_height_ground_min_points):
+            return float(np.percentile(values, float(config.car_height_ground_percentile)))
+    return None
+
+
 def _car_height_roof_frame(points: np.ndarray, box: Sequence[float],
                            config: CarBoxFitConfig,
                            low_z: float | None = None,
@@ -1188,296 +1238,200 @@ def _apply_car_height_policy(
         parking_observations: Mapping[int, int] | None = None,
         cutoffs: Mapping[int, int] | None = None,
         base_from_lidar: np.ndarray | None = None) -> Dict[str, Any]:
-    """车顶为主锚：框顶钉在 z_top_base，框底 = max(地面, z_top_base - 先验高度)。
+    """车顶为主锚【最终版】：贴顶固定高 → 往下找地面裁掉 → 静态排虚拟地面再裁。
 
-    只处理 Car、只写 box_lidar[2]/[5]。静止轨迹的 z_top_base 定死成世界系常数；
-    运动轨迹每帧跟自己的实测车顶。无地面 + 静态区域时尝试用"直线排"共底反推地面。
+    ① 每帧先把框顶贴到车顶（只依赖框本身，不看地面 → 断掉"地面偏高→高度变矮"的自反馈）
+    ② 框高固定 car_height_box_height_m（默认 1.80）→ 预期框底 = 车顶 − 1.80
+    ③ 从预期框底往下找地面（框内+外扩，z 带 −0.35~+0.15，先 0.6 m 失败放大 1.3 m）：
+       找到且通过坡度校验 → 框底 = 地面（多出来的裁掉）；没有 → 保持 1.80
+    ④ 静态（停车）排：同排拟合虚拟地面（沿排线性、≤2°），框底低于排地面一律裁到排地面；
+       并用高度先验夹住（排地面 ≤ 车顶 − 1.45），保证"一排大多数车在 1.45~1.7"
+    ⑤ 动态车：车顶 = 前后 N 帧滚动中位；地面保留坡度校验，防止一直下压
+
+    只处理 Car；只写 box_lidar[2]/[5]。
     """
     stats: Dict[str, Any] = {
         "enabled": bool(config.car_height_policy_enabled),
         "policy": {
-            "anchor": "roof (z_top_base) primary; bottom = max(ground, roof - prior)",
-            "roof": "p90 of the in-box z after outlier rejection",
-            "height_range_m": [config.car_height_low_m, config.car_height_high_m],
-            "static_tracks": "z_top_base fixed in the world frame",
-            "row_ground": "static region + no ground: longest straight row shares one ground",
+            "anchor": "roof-aligned fixed-height box, then trim to ground",
+            "box_height_m": config.car_height_box_height_m,
+            "ground_search": "band around expected bottom; inflate 0.6 then 1.3 m",
+            "static_row": "virtual ground per parking row + trim + height prior",
+            "dynamic": "rolling-median roof + slope gate",
             "scope": "Car only, writes box_lidar[2]/[5]",
         },
-        "tracks": 0, "boxes": 0,
-        "static_tracks": 0, "moving_tracks": 0,
-        "ground_frames": 0, "row_ground_frames": 0, "no_ground_frames": 0,
-        "tracks_without_roof": 0,
+        "tracks": 0, "boxes": 0, "static_tracks": 0, "moving_tracks": 0,
+        "frames_with_ground": 0, "frames_without_ground": 0,
+        "row_trimmed_boxes": 0, "row_capped_by_prior": 0, "tracks_without_roof": 0,
     }
     if not config.car_height_policy_enabled:
         return stats
-    low, high = float(config.car_height_low_m), float(config.car_height_high_m)
-    clearance = float(config.car_height_clearance_m)
+    box_height = float(config.car_height_box_height_m)
+    low_prior = float(config.car_height_low_m)
+    high_prior = float(config.car_height_high_m)
     static_set = {int(value) for value in static_ids}
     row_map = {int(k): int(v) for k, v in (row_of_track or {}).items() if v is not None}
-    parking_map = {int(k): int(v) for k, v in (parking_observations or {}).items()}
-    cutoff_map = {int(k): int(v) for k, v in (cutoffs or {}).items()}
-    min_parking = int(config.car_height_parking_min_observations)
-    priors = (low, high)
+    cutoff_map = {int(k): int(v) for k, v in (cutoffs or {}).items() if v is not None}
 
-    def _is_confirmed_parking(track_id: int) -> bool:
-        if track_id not in static_set:
-            return False
-        if parking_map and parking_map.get(track_id, 0) < min_parking:
-            return False
-        return True
-
-    def _is_parked_frame(track_id: int, frame_id: str) -> bool:
+    def _is_parked(track_id: int, frame_id: str) -> bool:
         cutoff = cutoff_map.get(track_id)
         return cutoff is None or int(frame_id) < int(cutoff)
 
     ego_grounds: Dict[str, float | None] = {}
-
     prepared: Dict[int, Dict[str, Any]] = {}
     for track_id, items in sorted(tracks.items()):
         if _class_name(items) != "Car":
             continue
         stats["tracks"] += 1
+        is_static = track_id in static_set
         per_frame: List[Dict[str, Any]] = []
         for item in items:
             box = item["det"]["box_lidar"]
             points = lidar.get(item["frame_id"])
-            roof = ground = None
+            roof = ground = expected = None
             if points is not None:
-                if item["frame_id"] not in ego_grounds:
-                    ego_grounds[item["frame_id"]] = _car_height_ego_ground(points, config)
-                ground = _car_height_ring_ground(points, box, config)
-                if not _car_height_ground_ok(ground, ego_grounds[item["frame_id"]], box,
-                                             base_from_lidar, config):
-                    ground = None
-                low_z = (ground + 0.30 if ground is not None
-                         else float(box[2]) - float(box[5]) / 2.0 + 0.10)
-                high_z = ((ground + float(config.car_height_high_m)
-                           + float(config.car_height_ceiling_slack_m))
-                          if ground is not None else None)
-                roof = _car_height_roof_frame(points, box, config, low_z, high_z)
-            per_frame.append({"item": item, "box": box, "roof": roof, "ground": ground,
-                              "parked": _is_parked_frame(track_id, item["frame_id"])})
-        roofs = [f["roof"] for f in per_frame if f["roof"] is not None]
-        if not roofs:
+                # ① 贴顶：只看框本身，不看地面
+                roof = _car_height_roof_frame(points, box, config)
+                if roof is not None:
+                    # ② 输入框 = 贴顶 1.80 m（只用于取点/搜索容器）
+                    expected = float(roof) - box_height
+                    if item["frame_id"] not in ego_grounds:
+                        ego_grounds[item["frame_id"]] = _car_height_ego_ground(points, config)
+                    # ③ 在"车顶往下 1.45~1.70 m"里找地面 + 坡度校验
+                    candidate = _car_height_find_ground(points, box, float(roof), config)
+                    if candidate is not None and _car_height_ground_ok(
+                            candidate, ego_grounds[item["frame_id"]], box,
+                            base_from_lidar, config, is_static=is_static):
+                        ground = candidate
+            per_frame.append({"item": item, "box": box, "roof": roof,
+                              "expected": expected, "ground": ground,
+                              "depth": (float(roof) - float(ground)
+                                        if (roof is not None and ground is not None) else None),
+                              "parked": _is_parked(track_id, item["frame_id"])})
+        if not any(frame["roof"] is not None for frame in per_frame):
             stats["tracks_without_roof"] += 1
             continue
-        is_static = track_id in static_set
         stats["static_tracks" if is_static else "moving_tracks"] += 1
-        # 各帧车顶的世界系 z（噪点帧会在这一步被时序约束拉回来）
-        roof_world: List[float | None] = []
         for frame in per_frame:
-            if frame["roof"] is None:
-                roof_world.append(None)
-                continue
-            box = frame["box"]
-            matrix = frame["item"]["world_from_lidar"]
-            roof_world.append(float((matrix @ np.array(
-                [float(box[0]), float(box[1]), float(frame["roof"]), 1.0]))[2]))
-        measured_world = [value for value in roof_world if value is not None]
-        # 参考序列：静止车 = 定死的世界系常数（先剔异常帧）；动态车 = 前后各 N 帧滚动中位
-        references: List[float | None] = [None] * len(per_frame)
-        if is_static:
-            base_world = None
-            if measured_world:
-                values = np.asarray(measured_world, dtype=np.float64)
-                median = float(np.median(values))
-                mad = float(np.median(np.abs(values - median)))
-                if mad > 1e-6:
-                    keep = np.abs(values - median) <= float(config.car_height_roof_outlier_sigma) * 1.4826 * mad
-                    if int(np.count_nonzero(keep)) >= 1:
-                        values = values[keep]
-                base_world = float(np.median(values))
-            references = [base_world] * len(per_frame)
-        else:
-            window = max(1, int(config.car_height_roof_window_frames))
-            fallback = float(np.median(measured_world)) if measured_world else None
-            for index in range(len(per_frame)):
-                local = [roof_world[other] for other in range(max(0, index - window),
-                                                              min(len(per_frame), index + window + 1))
-                         if roof_world[other] is not None]
-                references[index] = float(np.median(local)) if local else fallback
-            base_world = None
-        # 轨迹高度：实测(车顶-地面)的中位，连续夹到 [low, high]（先验只做上下限）
-        sampled = [f["roof"] - f["ground"] - clearance for f in per_frame
-                   if f["roof"] is not None and f["ground"] is not None]
-        if sampled:
-            track_height = float(np.clip(float(np.median(sampled)), low, high))
-        else:
-            # 全轨迹没有地面（只在静止直线排里可能反推出地面）→ 先按住框现有高度夹取
-            reference = [float(f["box"][5]) for f in per_frame if f["roof"] is not None]
-            track_height = float(np.clip(float(np.median(reference)) if reference else low, low, high))
-        prepared[track_id] = {"per_frame": per_frame, "is_static": is_static,
-                              "base_world": base_world, "references": references,
-                              "height": track_height}
-        for frame in per_frame:
-            if frame["ground"] is not None:
-                stats["ground_frames"] += 1
-            elif frame["roof"] is None:
-                stats["no_ground_frames"] += 1
+            stats["frames_with_ground" if frame["ground"] is not None
+                  else "frames_without_ground"] += 1
+        prepared[track_id] = {"per_frame": per_frame, "is_static": is_static}
 
-    # 停车区"同排共底"：确认停车的 Car 轨迹按排（优先用 slot 的 row_id）共用同一个底
-    row_shared: Dict[int, float] = {}
-    if bool(config.car_height_row_ground_enabled):
-        members: Dict[Any, List[int]] = {}
-        parked_tracks = [track_id for track_id, value in prepared.items()
-                         if _is_confirmed_parking(track_id)
-                         and any(f["parked"] for f in value["per_frame"])]
-        # 没有 slot 排号的，用"最长共线排"兜底（中心连成线、覆盖最多 box）
-        fallback_centres = {}
+    # ---- ④ 静态（停车）排：虚拟地面 ----
+    # ---- ID 高度 = 该 ID 各帧"找到的深度"里的最大值（夹到 [low, high]）----
+    id_height: Dict[int, float] = {}
+    for track_id, value in prepared.items():
+        found = [f["depth"] for f in value["per_frame"] if f["depth"] is not None]
+        if found:
+            id_height[track_id] = float(np.clip(max(found), low_prior, high_prior))
+
+    # ---- ⑤ 静态（停车）排：排高度 = 排内 ID 高度取底（夹 [low,high]）；⑤.5 邻居一致性 ----
+    row_height: Dict[int, float] = {}
+    parked_tracks = [track_id for track_id, value in prepared.items()
+                     if value["is_static"] and any(f["parked"] for f in value["per_frame"])]
+    axis: np.ndarray | None = None
+    if parked_tracks and bool(config.car_height_row_ground_enabled):
+        centres: Dict[int, np.ndarray] = {}
         for track_id in parked_tracks:
-            if row_map.get(track_id) is not None:
-                continue
             item = prepared[track_id]["per_frame"][0]["item"]
             if item.get("raw_world") is not None:
-                fallback_centres[track_id] = np.asarray(item["raw_world"][:2], dtype=np.float64)
-        fallback_row: List[int] = []
-        if len(fallback_centres) >= 2:
-            order = list(fallback_centres)
-            picked = _car_height_longest_row(
-                np.asarray([fallback_centres[t] for t in order]),
-                float(config.car_height_row_line_tolerance_m))
-            fallback_row = [order[k] for k in picked]
+                centres[track_id] = np.asarray(item["raw_world"][:2], dtype=np.float64)
+        groups: Dict[Any, List[int]] = {}
         for track_id in parked_tracks:
             key = row_map.get(track_id)
-            if key is None:
-                key = "collinear_row" if track_id in fallback_row else ("lonely", track_id)
-            members.setdefault(key, []).append(track_id)
-        for key, group in members.items():
-            if len(group) < 2:
+            groups.setdefault(key if key is not None else "collinear", []).append(track_id)
+        for key, group in groups.items():
+            members = [t for t in group if t in centres]
+            if len(members) < 2:
                 continue
-            # 间距上限：沿排 ≤ 两个车长，垂直排 ≤ 两个车宽
-            centres = {}
-            for track_id in group:
-                item = prepared[track_id]["per_frame"][0]["item"]
-                if item.get("raw_world") is None:
+            if key == "collinear":
+                order = list(members)
+                picked = _car_height_longest_row(
+                    np.asarray([centres[t] for t in order]),
+                    float(config.car_height_row_line_tolerance_m))
+                members = [order[k] for k in picked]
+                if len(members) < int(config.car_height_row_min_members):
                     continue
-                centres[track_id] = np.asarray(item["raw_world"][:2], dtype=np.float64)
-            # 间距上限：沿排 ≤ 两个车长、垂直排 ≤ 两个车宽（排轴用首尾中心连线近似）
-            ordered = [t for t in group if t in centres]
-            pooled: List[float] = []
-            for track_id in ordered:
-                near = []
-                for other in ordered:
-                    if other == track_id:
-                        near.append(other)
+            heights = [id_height[t] for t in members if t in id_height]
+            if not heights:
+                continue
+            # 取底：排内高度取高分位（= 地面最低/最高的那辆），保证整排不飘；再夹到 [low,high]
+            shared = float(np.clip(np.percentile(
+                heights, 100.0 - float(config.car_height_row_ground_percentile)),
+                low_prior, high_prior))
+            for t in members:
+                row_height[t] = shared
+            stats["row_shared_rows"] = stats.get("row_shared_rows", 0) + 1
+
+            # ---- ⑤.5 排内邻居一致性（底面世界系高度 / 线性趋势 / 只往下拉）----
+            first, last = centres[members[0]], centres[members[-1]]
+            length = float(np.linalg.norm(last - first))
+            if length < 1e-6:
+                continue
+            axis = (last - first) / length
+            ordered = sorted(members, key=lambda t: float((centres[t] - first) @ axis))
+            proj = {t: float((centres[t] - first) @ axis) for t in ordered}
+            world_bottom: Dict[int, float] = {}
+            world_roof: Dict[int, float] = {}
+            for t in ordered:
+                roof_world = []
+                for frame in prepared[t]["per_frame"]:
+                    if frame["roof"] is None:
                         continue
-                    axis = centres[ordered[-1]] - centres[ordered[0]]
-                    length = float(np.linalg.norm(axis))
-                    if length < 1e-6:
-                        near.append(other)
-                        continue
-                    axis = axis / length
-                    delta = centres[other] - centres[track_id]
-                    along = abs(float(delta @ axis))
-                    lateral = abs(float(delta[0] * axis[1] - delta[1] * axis[0]))
-                    if (along <= float(config.car_height_row_max_gap_long_m)
-                            and lateral <= float(config.car_height_row_max_gap_lat_m)):
-                        near.append(other)
-                if len(near) < 2:
+                    box = frame["box"]
+                    matrix = frame["item"]["world_from_lidar"]
+                    roof_world.append(float((matrix @ np.array(
+                        [float(box[0]), float(box[1]), float(frame["roof"]), 1.0]))[2]))
+                if not roof_world:
                     continue
-                pooled.extend(f["ground"] for t in near for f in prepared[t]["per_frame"]
-                              if f["ground"] is not None and f["parked"])
-            if len(pooled) >= 2:
-                shared = float(np.percentile(pooled, float(config.car_height_row_ground_percentile)))
-                for track_id in group:
-                    row_shared[track_id] = shared
-                stats["row_shared_bottoms"] = stats.get("row_shared_bottoms", 0) + 1
+                world_roof[t] = float(np.median(roof_world))
+                world_bottom[t] = world_roof[t] - row_height[t]
+            span = max(1, int(config.car_height_row_neighbor_window))
+            limit = math.tan(math.radians(float(config.car_height_row_neighbor_slope_deg)))
+            for index, t in enumerate(ordered):
+                if t not in world_bottom:
+                    continue
+                lo = max(0, index - span)
+                hi = min(len(ordered), index + span + 1)
+                near = [ordered[k] for k in range(lo, hi)
+                        if ordered[k] != t and ordered[k] in world_bottom]
+                if len(near) < 2 or float(np.ptp([proj[o] for o in near])) < 1e-6:
+                    continue
+                xs = np.asarray([proj[o] for o in near], dtype=np.float64)
+                zs = np.asarray([world_bottom[o] for o in near], dtype=np.float64)
+                slope, intercept = np.polyfit(xs, zs, 1)
+                if not math.isfinite(slope):
+                    continue
+                trend = float(slope) * proj[t] + float(intercept)
+                jump = world_bottom[t] - trend
+                if jump <= float(config.car_height_row_neighbor_min_jump_m):
+                    continue                     # 不是"高度激增"
+                distance = max(abs(proj[t] - float(np.mean(xs))), 1.0)
+                if (jump / distance) <= limit:
+                    continue                     # 坡度能解释
+                required = world_roof[t] - trend  # 把底面压到趋势 → 高度变大（只往下拉）
+                if required > row_height[t]:
+                    row_height[t] = float(np.clip(required, low_prior, high_prior))
+                    stats["row_neighbor_pulled_down"] = stats.get(
+                        "row_neighbor_pulled_down", 0) + 1
 
-    # 直线排共底（只在静态区域、且该车在本帧没有地面时用）
-    missing = [(tid, value) for tid, value in prepared.items()
-               if value["is_static"] and any(f["ground"] is None for f in value["per_frame"])]
-    row_ground: Dict[int, float] = {}
-    if missing:
-        centres = {}
-        for tid, value in prepared.items():
-            if not value["is_static"]:
-                continue
-            item = value["per_frame"][0]["item"]
-            if item.get("raw_world") is None:
-                continue
-            centres[tid] = np.asarray(item["raw_world"][:2], dtype=np.float64)
-        for tid, value in missing:
-            if tid not in centres:
-                continue
-            near = [other for other in centres
-                    if float(np.linalg.norm(centres[other] - centres[tid]))
-                    <= float(config.car_height_row_radius_m)]
-            row = _car_height_longest_row(np.asarray([centres[o] for o in near]),
-                                          float(config.car_height_row_line_tolerance_m))
-            members = [near[k] for k in row]
-            if len(members) < int(config.car_height_row_min_members) or tid not in members:
-                continue
-            grounds = [f["ground"] for o in members for f in prepared[o]["per_frame"]
-                       if f["ground"] is not None]
-            if grounds:
-                row_ground[tid] = float(np.median(grounds))
-            else:
-                # 整排都没有地面 → 用"车顶 − 先验高度(按下限)"反推这一排的地面
-                reverse = [f["roof"] - high
-                           for o in members for f in prepared[o]["per_frame"]
-                           if f["roof"] is not None]
-                if reverse:
-                    row_ground[tid] = float(np.median(reverse))
-
+    # ---- ⑦ 写回：顶 = 本帧实测车顶（纯逐帧）；高度 = 排高度 > ID 高度 > 1.70 ----
     for track_id, value in prepared.items():
-        per_frame, prior = value["per_frame"], value["height"]
-        tops: List[float] = []
-        for index, frame in enumerate(per_frame):
-            box, item = frame["box"], frame["item"]
-            matrix = item["world_from_lidar"]
-            centre = matrix @ np.array([float(box[0]), float(box[1]), float(box[2]), 1.0])
-            reference = value["references"][index]
-            top_reference = None
-            if reference is not None:
-                top_reference = float((item["lidar_from_world"] @ np.array(
-                    [centre[0], centre[1], float(reference), 1.0]))[2])
-            # 两遍一起作用：本帧实测为主；只有偏离时序参考超过阈值（噪点/异常帧）才用参考拉回来
-            if frame["roof"] is not None:
-                top = float(frame["roof"])
-                if (top_reference is not None
-                        and abs(top - top_reference) > float(config.car_height_roof_gate_m)):
-                    top = top_reference
-            elif top_reference is not None:
-                top = top_reference
-            else:
-                tops.append(0.0)
+        is_static = value["is_static"]
+        for frame in value["per_frame"]:
+            if frame["roof"] is None:
                 continue
-            tops.append(top)
-        if not any(tops):
-            continue
-        # 高度：底 = max(地面, 顶 - 先验)；再夹到 [low, high]
-        heights: List[float] = []
-        grounds: List[float | None] = []
-        for frame, top in zip(per_frame, tops):
-            ground = frame["ground"]
-            if track_id in row_shared and _is_confirmed_parking(track_id) and frame["parked"]:
-                ground = row_shared[track_id]          # 停车排：全员服从同一个底
-                stats["row_shared_frames"] = stats.get("row_shared_frames", 0) + 1
-            elif ground is None and track_id in row_ground:
-                ground = row_ground[track_id]
-                stats["row_ground_frames"] += 1
-            grounds.append(ground)
-            bottom = top - prior
-            if ground is not None:
-                bottom = max(float(ground), bottom)
-            height = top - bottom
-            height = min(max(height, low), high)
-            if not config.car_height_buffer_split:
-                heights.append(height)
-                continue
-            buffer = 0.0
-            if frame["roof"] is not None:
-                buffer = max(0.0, top - float(frame["roof"]))
-            if buffer > float(config.car_height_buffer_threshold_m):
-                height = min(max(height + buffer / 2.0, low), high)
-            heights.append(height)
-        # ID 内 3 帧中位平滑
-        smoothed = []
-        for index in range(len(heights)):
-            window = heights[max(0, index - 1): index + 2]
-            smoothed.append(float(np.median(window)))
-        for frame, top, height in zip(per_frame, tops, smoothed):
             box = frame["box"]
+            top = float(frame["roof"])
+            if is_static and track_id in row_height and frame["parked"]:
+                height = row_height[track_id]
+                stats["row_trimmed_boxes"] += 1
+            elif track_id in id_height:
+                height = id_height[track_id]
+            else:
+                height = high_prior
+                stats["frames_fallback_high"] = stats.get("frames_fallback_high", 0) + 1
+            height = float(np.clip(height, low_prior, high_prior))
             box[2] = float(top - height / 2.0)
             box[5] = float(height)
             stats["boxes"] += 1
