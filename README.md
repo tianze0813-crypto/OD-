@@ -95,17 +95,20 @@ done
 3. 旧的「Car 被 Truck 覆盖 >= 阈值就删整条 Car 轨迹」规则**已停用**（车链内部按 Car 优先
    裁决冲突），代码保留在 `_drop_cars_covered_by_trucks`，需要时恢复。
 4. **行人 / 非机动车完全不动**：VoxelNeXt 单头两类推理 + 原来的 VRU 后处理。
-5. 想要旧的「Car / Truck 两条独立链」做 A/B：加 `--no-car-truck-merged`。
+> **【2026-09-22 变更】旧单 Car 链已删除**：Car 一律走合并车链（BEVFusion Car+Truck 一次推理
+> + 共享跟踪 + Car 专属 step3/4/4.5/5）。随之删除：`--car-detector`、`--car-pipeline`、
+> `--no-car-truck-merged`、`pipeline/hybrid_main_car.py`、`pipeline/hybrid_expD_car.py`、
+> `run_end_to_end.py`（两份）、`scripts/run_five_class.py`、`scripts/run_bevfusion_test_chains.py`、
+> Waymo Car 头权重（`main_chain/models/voxelnext_v2_waymo_infer.yaml` + `.pth`）、
+> `main_chain/pipeline/step1_{lidar_inference,bevfusion}.py`。
 
 > 探测范围（2026-09-21 起）对齐标注 ROI：`point_cloud_range = [-54.0, -80.4, -5.0, 54.0, 20.4, 3.0]`、
 > `BEV_GRID = [1440, 1344, 41]`。数据 `lidar_top` 系里 **前进 = -y、侧向 = ±x**，原来是 ±54 对称，
 > 所以前方只能看到 54 m；现在前 80.4 / 后 20.4 / 侧 ±54。单一真源在两个
 > `bevfusion/configs/police_bevfusion_mmdet3d*.py`，`tests/test_bevfusion_range.py` 守一致性。
 
-> 单链调试入口仍保留：`pipeline/hybrid_expD_car.py`（Car 只做通用后处理）、
-> `pipeline/hybrid_expD_truck.py`（Truck 单链），以及 main_chain 自己的
-> `run_end_to_end.py`（Waymo 检测器 + Car 专属精修）。
-> 旧的两链模式（main Car + VOD 五类非车）也还在：`--chains car,noncar`。
+> 仍保留的单链调试入口：`pipeline/hybrid_expD_truck.py`（Truck 单链）、
+> `pipeline/hybrid_expD_noncar.py`（VOD 五类非车）。Car 没有单链了（见上方变更说明）。
 
 入口是 `hybrid_run.sh`，会自动探测本机 OpenPCDet 环境（默认
 `~/miniconda3/envs/openpcdet`），不需要手动激活 conda。
@@ -133,7 +136,7 @@ done
 ## 车链（Car + Truck 合并后处理）
 
 入口：`pipeline/vehicle_pass.py`（编排）+ `main_chain/pipeline/step_vehicle_chain.py`（共享阶段驱动）。
-默认开启；`--no-car-truck-merged` 回退到原来的 Car / Truck 两条独立链。
+Car+Truck 合并成一条；Car 不再有单链（旧单链与相关开关已于 2026-09-22 删除）。
 
 | # | 阶段 | 在哪 | 共享 / 分叉 |
 | --- | --- | --- | --- |
@@ -319,7 +322,7 @@ face-visibility 拟合把可见点簇边缘当成了"面"）。需要时改 `Tru
 | Truck yaw | v2（保留 detector yaw，关静态方向投票/静态 yaw 锁） | `vehicle_pass.DEFAULTS["truck_yaw_*"]` |
 | VRU | Ped/NMV 0.2、范围 60/20/40、短轨 4、行人 15 m + 20 帧、NMV 静止 15 m、yaw legacy | `pipeline/hybrid_expD_vru.py::DEFAULTS`（未改动） |
 
-回退路径（`--no-car-truck-merged`、`--chains car,noncar`、单链调试入口）的参数表见文末《附录 A.6》。
+单链调试入口（Truck / 非车）的参数表见文末《附录 A.6》。
 
 ### 入口参数
 
@@ -328,7 +331,6 @@ face-visibility 拟合把可见点簇边缘当成了"面"）。需要时改 `Tru
 | `<input_root>` | 必填 | 单个 clip 目录，或包含多个 clip 的父目录 |
 | `<output_root>` | `~/SUSTechPOINTS/data` | 导出模式的输出根目录；`--in-place` 时忽略 |
 | `--chains` | `car,truck,vru` | 要跑的后处理，逗号分隔；默认 `car`+`truck` 合成**一条车链**跑完再跑 `vru`。可选 `car` / `truck` / `vru` / `noncar`（旧五类单链） |
-| `--no-car-truck-merged` | 关（即默认合并） | 回退到 Car / Truck 两条独立链，A/B 用 |
 | `--car-truck-cover-threshold` | `0.5` | **已停用**：Car/Truck 冲突改由车链内部的 Car 优先裁决（函数体保留） |
 | `--keep-chain-labels` | 关 | 额外把 `label_car/` `label_truck/` `label_vru/` 写进输出 clip |
 | `--in-place` | 关 | 原地端到端：输入 clip 改名 `<clip>_pre` |
@@ -426,8 +428,6 @@ pipeline/               各链主体：
                         hybrid_expD_vru.py            VRU 链（VoxelNeXt 单头两类，原样不动）
                         hybrid_expD_noncar.py         非车后处理主体（step2_5 / step3 等阶段）
                         hybrid_expD_truck.py          Truck 单链（调试/回退）+ Truck 分支阶段
-                        hybrid_expD_car.py            Car 通用后处理单链（调试/回退）
-                        hybrid_main_car.py            main_chain Car 链调用
                         hybrid_merge.py               标签合并
 bevfusion/              Truck 链的 BEVFusion 工具箱（配置 + prep/infer/评测脚本，见其 README）
 geometry/truck_trailer_rules.py  货车/挂车类别合并（去重 / 并集 / 轨迹级类别统一）
@@ -439,8 +439,7 @@ tracking/               跟踪、坐标变换、SUST label 映射
 geometry/               yaw、Car 几何、Truck/NMV 精修
 inference/              OpenPCDet LiDAR 推理
 models/                 各链的配置与 checkpoint
-scripts/                入口脚本、merge_two_chains（旧两链合成）、remerge_truck_car（只重跑 Truck）、
-                        run_bevfusion_test_chains.py（BEV 原始检测 → 测试三支标签合成）
+scripts/                入口脚本、merge_two_chains（旧两链合成）、remerge_truck_car（只重跑 Truck）
 tests/                  单元测试
 ```
 
@@ -570,15 +569,9 @@ cd main_chain && ~/miniconda3/envs/openpcdet/bin/python -m unittest discover -s 
 ### C.1 回退跑法
 
 ```bash
-bash hybrid_run.sh <input_root> <output_root> --no-car-truck-merged --overwrite
-#   车链拆回 Car / Truck 两条独立链：Car 走 main_chain（Waymo Car 头 + Step4.5），
-#   Truck 走 BEVFusion 单链；两条链各自独立跟踪，动静态区域各算一份
-
-bash hybrid_run.sh <input_root> <output_root> --chains car,noncar --overwrite
-#   更旧的「main Car + VOD 五类非车」两链（见附录 B）
-
---car-detector waymo             # 显式指定 Waymo car 头（默认 auto：车链可用就用 BEVFusion，否则 Waymo）
---car-pipeline hybrid            # Car 走通用后处理单链（pipeline/hybrid_expD_car.py）
+# 【2026-09-22】旧回退跑法已删除：
+#   --no-car-truck-merged / --car-detector / --car-pipeline / --chains car,noncar 都不再支持。
+#   Car 只能走合并车链；Truck 单链用 --chains truck；非车五类用 --chains noncar。
 --car-truck-cover-threshold 0.5  # 已停用：Car 被 Truck 覆盖就删整条 Car 轨迹（函数体保留）
 ```
 
@@ -601,12 +594,8 @@ python scripts/run_hybrid_prelabel.py <input_root> <output_root> --chains truck
 
 ### C.3 只改了 Truck 时：复用 Car/VRU 标签重跑
 
-> 仅回退路径适用：默认路径下 Truck 的 id 来自与 Car 共享的那一遍跟踪与动态区域，
-> 单独重跑 Truck 链对不上号（要么整条车链重跑，要么 `--no-car-truck-merged`）。
-
-> 【2026-09-21】默认路径下 Truck 的 id 来自与 Car 共享的那一遍跟踪与动态区域，
-> **单独重跑 Truck 链已经对不上号**：要么整条车链重跑（默认），要么加
-> `--no-car-truck-merged` 回到两条独立链再用本脚本。
+> Truck 的 id 来自与 Car 共享的那一遍跟踪与动态区域，**单独重跑 Truck 链对不上号**：
+> 要么整条车链重跑（默认）。【2026-09-22】旧的两条独立链回退已删除。
 
 ```bash
 python scripts/remerge_truck_car.py --output-root <含 <clip>_pre 的目录> [--write]
@@ -660,8 +649,6 @@ python scripts/run_hybrid_prelabel.py <input_root> <output_root> --chains car,tr
 main_chain 的硬过滤用**原始类别字符串**比对白名单、且分数/点数门限是给 Waymo 头调的，
 换成 BEVFusion 的 car 头会削掉 90%+；`hybrid` 这条链走 `canonical_class_name` 归一，
 分数阈值 0.2，保留率 85~90%。
-
-> 测试用的一键脚本：`scripts/run_bevfusion_test_chains.py`（原始检测 → Car(hybrid)+Truck+VRU 合成一份标签）。
 
 ### C.5 回退路径的参数表
 
@@ -727,3 +714,10 @@ Car/Truck/Bus 头，只训练 Pedestrian / Nonmotorized_vehicle 头。
 只删该帧的 Car（三链模式下换成"删整条 Car 轨迹"，见《合并规则》）。
 
 ---
+
+> **【2026-09-22 变更】旧单 Car 链已删除**：Car 一律走合并车链（BEVFusion Car+Truck 一次推理
+> + 共享跟踪 + Car 专属 step3/4/4.5/5）。随之删除：`--car-detector`、`--car-pipeline`、
+> `--no-car-truck-merged`、`pipeline/hybrid_main_car.py`、`pipeline/hybrid_expD_car.py`、
+> `run_end_to_end.py`（两份）、`scripts/run_five_class.py`、`scripts/run_bevfusion_test_chains.py`、
+> Waymo Car 头权重（`main_chain/models/voxelnext_v2_waymo_infer.yaml` + `.pth`）、
+> `main_chain/pipeline/step1_{lidar_inference,bevfusion}.py`。

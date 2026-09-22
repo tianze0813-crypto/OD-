@@ -209,11 +209,20 @@ class HybridPipelineTest(unittest.TestCase):
             (source / "lidar" / "lidar_top" / "1.bin").write_bytes(b"")
             output_root = root / "out"
 
-            def fake_main(_python, _clip, _work_root, **_kwargs):
-                events.append("main")
-                return ({"1": [{
-                    "obj_id": "1", "obj_type": "Car", "score": 0.9,
-                }]}, {"final_detections": 1})
+            def fake_vehicle(_raw, _clip, _work_root, _python, **_kwargs):
+                events.append("vehicle")
+                return {"car_frames": [{"frame_id": "1", "detections": [{
+                    "track_id": 1, "class_name": "Car", "score": 0.9,
+                    "box_lidar": [0, 0, 0, 4, 2, 1.5, 0]}]}],
+                    "truck_frames": [],
+                    "diagnostics": {"car_detections": 1, "truck_detections": 0}}
+
+            def fake_bev(_python, _clip, work_root, _threshold, _mode):
+                events.append("bev_raw")
+                work_root.mkdir(parents=True, exist_ok=True)
+                raw = work_root / "bev_raw.json"
+                raw.write_text("[]", encoding="utf-8")
+                return raw
 
             def fake_raw(_python, _clip, _cfg, _ckpt, work_root, name, _threshold):
                 events.append("expd_inference")
@@ -231,7 +240,8 @@ class HybridPipelineTest(unittest.TestCase):
                 out_json.write_text(json.dumps(frames), encoding="utf-8")
                 return {"final_detections": 1}
 
-            with patch.object(hybrid_launcher, "run_main_car", fake_main), \
+            with patch.object(hybrid_launcher, "run_vehicle_pass", fake_vehicle), \
+                    patch.object(hybrid_launcher, "_run_raw_bevfusion", fake_bev), \
                     patch.object(hybrid_launcher, "_run_raw", fake_raw), \
                     patch.object(hybrid_launcher, "run_expd_noncar", fake_expd):
                 result = hybrid_launcher.run_clip(
@@ -240,9 +250,9 @@ class HybridPipelineTest(unittest.TestCase):
                     short_track_max_frames=4,
                     # 只跑 car+noncar 两条假链：不让默认 truck_detector=bevfusion
                     # 触发真实 BEVFusion 推理（否则测试会去跑子进程）。
-                    chains=("car", "noncar"), truck_detector="voxelnext")
+                    chains=("car", "truck", "noncar"), truck_detector="bevfusion")
 
-            self.assertEqual(events, ["main", "expd_inference", "expd_postprocess"])
+            self.assertEqual(events, ["bev_raw", "vehicle", "expd_inference", "expd_postprocess"])
             labels = json.loads(
                 (output_root / "scene_pre" / "label" / "1.json").read_text())
             self.assertEqual([label["obj_type"] for label in labels],
@@ -258,10 +268,18 @@ class HybridPipelineTest(unittest.TestCase):
             (source / "lidar" / "lidar_top" / "1.bin").write_bytes(b"")
             output_root = root / "out"
 
-            def fake_main(_python, _clip, _work_root, **_kwargs):
-                return ({"1": [{
-                    "obj_id": "1", "obj_type": "Car", "score": 0.9,
-                }]}, {"final_detections": 1})
+            def fake_vehicle(_raw, _clip, _work_root, _python, **_kwargs):
+                return {"car_frames": [{"frame_id": "1", "detections": [{
+                    "track_id": 1, "class_name": "Car", "score": 0.9,
+                    "box_lidar": [0, 0, 0, 4, 2, 1.5, 0]}]}],
+                    "truck_frames": [],
+                    "diagnostics": {"car_detections": 1, "truck_detections": 0}}
+
+            def fake_bev(_python, _clip, work_root, _threshold, _mode):
+                work_root.mkdir(parents=True, exist_ok=True)
+                raw = work_root / "bev_raw.json"
+                raw.write_text("[]", encoding="utf-8")
+                return raw
 
             def fake_raw(_python, _clip, _cfg, _ckpt, work_root, name, _threshold):
                 work_root.mkdir(parents=True, exist_ok=True)
@@ -277,14 +295,15 @@ class HybridPipelineTest(unittest.TestCase):
                 out_json.write_text(json.dumps(frames), encoding="utf-8")
                 return {"final_detections": 1}
 
-            with patch.object(hybrid_launcher, "run_main_car", fake_main), \
+            with patch.object(hybrid_launcher, "run_vehicle_pass", fake_vehicle), \
+                    patch.object(hybrid_launcher, "_run_raw_bevfusion", fake_bev), \
                     patch.object(hybrid_launcher, "_run_raw", fake_raw), \
                     patch.object(hybrid_launcher, "run_expd_noncar", fake_expd):
                 result = hybrid_launcher.run_clip(
                     Path("python"), source, output_root, overwrite=False,
                     export_sust=False, drop_vis_below=0.05,
                     score_threshold=None, short_track_max_frames=4,
-                    chains=("car", "noncar"), truck_detector="voxelnext")
+                    chains=("car", "truck", "noncar"), truck_detector="bevfusion")
 
             self.assertIsNone(result["final_clip"])
             self.assertFalse((output_root / "scene_pre").exists())
@@ -298,10 +317,18 @@ class HybridPipelineTest(unittest.TestCase):
             (source / "lidar" / "lidar_top" / "1.bin").write_bytes(b"")
             output_root = root / "out"
 
-            def fake_main(_python, _clip, _work_root, **_kwargs):
-                return ({"1": [{
-                    "obj_id": "1", "obj_type": "Car", "score": 0.9,
-                }]}, {"final_detections": 1})
+            def fake_vehicle(_raw, _clip, _work_root, _python, **_kwargs):
+                return {"car_frames": [{"frame_id": "1", "detections": [{
+                    "track_id": 1, "class_name": "Car", "score": 0.9,
+                    "box_lidar": [0, 0, 0, 4, 2, 1.5, 0]}]}],
+                    "truck_frames": [],
+                    "diagnostics": {"car_detections": 1, "truck_detections": 0}}
+
+            def fake_bev(_python, _clip, work_root, _threshold, _mode):
+                work_root.mkdir(parents=True, exist_ok=True)
+                raw = work_root / "bev_raw.json"
+                raw.write_text("[]", encoding="utf-8")
+                return raw
 
             def fake_raw(_python, _clip, _cfg, _ckpt, work_root, name, _threshold):
                 work_root.mkdir(parents=True, exist_ok=True)
@@ -317,14 +344,15 @@ class HybridPipelineTest(unittest.TestCase):
                 out_json.write_text(json.dumps(frames), encoding="utf-8")
                 return {"final_detections": 1}
 
-            with patch.object(hybrid_launcher, "run_main_car", fake_main), \
+            with patch.object(hybrid_launcher, "run_vehicle_pass", fake_vehicle), \
+                    patch.object(hybrid_launcher, "_run_raw_bevfusion", fake_bev), \
                     patch.object(hybrid_launcher, "_run_raw", fake_raw), \
                     patch.object(hybrid_launcher, "run_expd_noncar", fake_expd):
                 result = hybrid_launcher.run_clip(
                     Path("python"), source, output_root, overwrite=False,
                     in_place=True, drop_vis_below=0.05,
                     score_threshold=None, short_track_max_frames=4,
-                    chains=("car", "noncar"), truck_detector="voxelnext")
+                    chains=("car", "truck", "noncar"), truck_detector="bevfusion")
 
             destination = root / "scene_pre"
             self.assertFalse(source.exists())
@@ -358,17 +386,26 @@ class HybridPipelineTest(unittest.TestCase):
             (source / "label" / "stale.json").write_text("[]", encoding="utf-8")
             output_root = root / "out"
 
-            def fake_main(_python, _clip, _work_root, **_kwargs):
-                return ({"1": [{
-                    "obj_id": "1", "obj_type": "Car", "score": 0.9,
-                }]}, {"final_detections": 1})
+            def fake_vehicle(_raw, _clip, _work_root, _python, **_kwargs):
+                return {"car_frames": [{"frame_id": "1", "detections": [{
+                    "track_id": 1, "class_name": "Car", "score": 0.9,
+                    "box_lidar": [0, 0, 0, 4, 2, 1.5, 0]}]}],
+                    "truck_frames": [],
+                    "diagnostics": {"car_detections": 1, "truck_detections": 1}}
 
-            with patch.object(hybrid_launcher, "run_main_car", fake_main):
+            def fake_bev(_python, _clip, work_root, _threshold, _mode):
+                work_root.mkdir(parents=True, exist_ok=True)
+                raw = work_root / "bev_raw.json"
+                raw.write_text("[]", encoding="utf-8")
+                return raw
+
+            with patch.object(hybrid_launcher, "run_vehicle_pass", fake_vehicle), \
+                    patch.object(hybrid_launcher, "_run_raw_bevfusion", fake_bev):
                 result = hybrid_launcher.run_clip(
                     Path("python"), source, output_root, overwrite=True,
                     in_place=True, drop_vis_below=0.05,
                     score_threshold=None, short_track_max_frames=4,
-                    chains=("car",), truck_detector="voxelnext")
+                    chains=("car", "truck"), truck_detector="bevfusion")
 
             self.assertTrue(source.is_dir())
             self.assertFalse((root / "scene_pre_pre").exists())
