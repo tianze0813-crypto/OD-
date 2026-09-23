@@ -80,6 +80,12 @@ DEFAULTS: Dict[str, Any] = dict(
     trailer_policy="to-truck",       # 标注侧没有 Trailer -> 一律并成 Truck
     # ---- Car 几何：静态刚性框（OD-main-0909 同步；默认关）----
     static_rigid=False,
+    # ---- Car 静态 yaw 落定位置（2026-09-23 定为 step45 = B1）----
+    # step45      : static_yaw 只算/导出，几何跑 detector 原生局部系；轴+方向由 step4.5
+    #               settle 在几何之后写入（几何与 yaw 修正解耦）
+    # step45-axis : 几何按修正后的轴拟合，settle 只做 π 等价翻转（备选口径）
+    # step2       : 旧行为（static_yaw 写轴 + 方向投票都在 step2）
+    car_yaw_settle="step45",
     # ---- Truck 分支（复用原 Truck 单链参数）----
     truck_sparsity_max_points=10,
     truck_visibility_min_ratio=0.05,
@@ -425,7 +431,8 @@ def run(raw_json: Path, clip: Path, work_root: Path,
     steps_root.mkdir(parents=True, exist_ok=True)
     command = [python, STEP_VEHICLE_CHAIN,
                "--raw-json", vehicle_raw, "--clip", clip,
-               "--work-root", steps_root]
+               "--work-root", steps_root,
+               "--car-yaw-settle", str(params["car_yaw_settle"])]
     if params.get("static_rigid"):
         command.append("--static-rigid")
     print("[vehicle-pass] $ " + " ".join(str(value) for value in command),
@@ -531,9 +538,14 @@ def main() -> None:
                         help="把 Car/Truck 分别写到 <clip>/label_car、label_truck")
     parser.add_argument("--trailer-policy", choices=["keep", "to-truck"],
                         default=DEFAULTS["trailer_policy"])
+    parser.add_argument("--car-yaw-settle",
+                        choices=["step2", "step45", "step45-axis"],
+                        default=DEFAULTS["car_yaw_settle"],
+                        help="Car 静态 yaw 落定位置（默认 step45 = B1）")
     args = parser.parse_args()
     result = run(args.raw_json, args.clip, args.work_root, args.python,
-                 args.diagnostics, trailer_policy=args.trailer_policy)
+                 args.diagnostics, trailer_policy=args.trailer_policy,
+                 car_yaw_settle=args.car_yaw_settle)
     if args.export:
         car = export_labels(result["car_frames"], args.clip, LABEL_SUBDIR_CAR,
                             CAR_ID_OFFSET)

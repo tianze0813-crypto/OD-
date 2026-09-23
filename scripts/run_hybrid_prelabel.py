@@ -475,7 +475,8 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
              # --no-car-truck-merged 可回退到原来的两条链，方便 A/B。
              # 【改动】车链过程诊断（槽位/动态区域/…）默认不落盘；调试时才写进输出目录
              keep_vehicle_diagnostics: bool = False,
-             static_rigid: bool = False) -> Dict[str, Any]:
+             static_rigid: bool = False,
+             car_yaw_settle: str = "step45") -> Dict[str, Any]:
     base = clip.name
     tag = output_tag.strip("_-")
     # 【改动】已经是 <clip>_pre 的输入 -> output_name == base：重跑就地覆盖，
@@ -565,6 +566,7 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
                 trailer_merge_iou=float(trailer_merge_iou),
                 trailer_policy=str(trailer_policy),
                 static_rigid=bool(static_rigid),
+                car_yaw_settle=str(car_yaw_settle),
                 class_score_thresholds={
                     "Car": 0.2,
                     "Truck": 0.2,
@@ -836,6 +838,10 @@ def main() -> int:
     parser.add_argument("--trailer-dup-iom", type=float, default=0.70)
     parser.add_argument("--trailer-dup-iou", type=float, default=0.50)
     parser.add_argument("--trailer-merge-iou", type=float, default=0.05)
+    parser.add_argument("--car-yaw-settle",
+                        choices=["step2", "step45", "step45-axis"],
+                        default="step45",
+                        help="Car 静态 yaw 落定位置：step45（默认，B1）；step45-axis；step2（旧行为）")
     parser.add_argument("--static-rigid", action="store_true",
                         help="【改动】静态 Car 轨迹叠帧拟一个刚性 box 固定在世界系（默认关）")
     parser.add_argument("--keep-vehicle-diagnostics", action="store_true",
@@ -950,6 +956,7 @@ def main() -> int:
         _print(f"chains={chains} | 车链 Car+Truck: detector=BEVFusion "
                f"mode={args.truck_detector_mode} weights={weights} "
                f"(trailer_rules={not args.no_trailer_rules}, policy={args.trailer_policy}) "
+               f"| Car yaw settle={args.car_yaw_settle} "
                f"| VRU: detector={args.vru_detector} weights={vru_ckpt.name}")
     else:
         _print(f"chains={chains}  truck={truck_ckpt.name}  vru={vru_ckpt.name}")
@@ -993,6 +1000,7 @@ def main() -> int:
             noncar_cfg=noncar_cfg,
             noncar_ckpt=noncar_ckpt,
             output_tag=output_tag,
+            car_yaw_settle=args.car_yaw_settle,
             raw_score_threshold=noncar_raw_threshold,
             class_score_thresholds=class_thresholds,
             pedestrian_max_distance=args.pedestrian_max_distance,

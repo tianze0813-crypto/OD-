@@ -70,8 +70,14 @@ DEFAULTS: Dict[str, Any] = dict(
 )
 
 
-def car_yaw_settle_mode() -> str:
-    """Car 静态 yaw 落定的位置（临时环境变量，默认 = 原行为）。
+CAR_YAW_SETTLE_DEFAULT = "step45"
+
+
+def car_yaw_settle_mode(cli_value: str = None) -> str:
+    """Car 静态 yaw 落定的位置。
+
+    优先级：CLI(--car-yaw-settle) > 环境变量 HYBRID_CAR_YAW_SETTLE > 默认
+    ``CAR_YAW_SETTLE_DEFAULT``（= step45，即 B1）。
 
     ``step2``       = 原行为：static_yaw 写轴 + 方向投票都在 step2 里做完
     ``step45``      = B1 原味：static_yaw 只算/导出（不写轴），几何在 detector 原生
@@ -79,7 +85,9 @@ def car_yaw_settle_mode() -> str:
     ``step45-axis`` = B1' 备选：static_yaw 照旧写轴（几何按修正轴拟合），只把方向
                       （±π）挪到 step4.5；settle 只做 π 等价翻转
     """
-    return os.environ.get("HYBRID_CAR_YAW_SETTLE", "step2").strip().lower()
+    value = cli_value if cli_value else os.environ.get(
+        "HYBRID_CAR_YAW_SETTLE", CAR_YAW_SETTLE_DEFAULT)
+    return str(value).strip().lower()
 
 
 def _count(frames: Sequence[Dict[str, Any]]) -> int:
@@ -169,7 +177,7 @@ def run(raw_json: Path, clip: Path, work_root: Path, *,
         visibility_min_ratio=float(params["visibility_min_ratio"]),
         keep_classes=tuple(str(c) for c in keep_classes),
     )
-    settle_mode = car_yaw_settle_mode()
+    settle_mode = car_yaw_settle_mode(params.get("car_yaw_settle"))
     # 【改动 2026-09-23】静止多帧点云主轴规则：按用户要求对 Car 关闭（Truck 侧的同类
     # 规则已于 7fdce6d 删除：会用一条 track 级的 PCA 轴覆盖整条轨迹，且不看 dwell）。
     if settle_mode in ("step45", "step45-axis"):
@@ -288,6 +296,11 @@ def main() -> None:
     parser.add_argument("--range-side", type=float, default=DEFAULTS["range_side"])
     parser.add_argument("--static-rigid", action="store_true",
                         help="【改动】静态 Car 轨迹叠帧拟一个刚性 box，固定在世界系（默认关）")
+    parser.add_argument("--car-yaw-settle", choices=["step2", "step45", "step45-axis"],
+                        default=None,
+                        help="Car 静态 yaw 落定位置：step45（默认，B1：几何跑 detector 原生系、"
+                             "轴+方向由 step4.5 settle 在几何之后写）；step45-axis（几何按修正轴拟合，"
+                             "settle 只做 π）；step2（旧行为：static_yaw 写轴 + 方向投票都在 step2）")
     parser.add_argument("--car-size-relabel", action="store_true",
                         help="按尺寸把大 Car 改写成 Truck（车链默认关，Truck 由 truck 头负责）")
     args = parser.parse_args()
@@ -300,7 +313,8 @@ def main() -> None:
         range_front=args.range_front, range_rear=args.range_rear,
         range_side=args.range_side,
         car_size_relabel=bool(args.car_size_relabel),
-        static_rigid=bool(args.static_rigid))
+        static_rigid=bool(args.static_rigid),
+        car_yaw_settle=args.car_yaw_settle)
     print(json.dumps({k: v for k, v in result.items() if k != "params"},
                      ensure_ascii=False, indent=2))
 

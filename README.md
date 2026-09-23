@@ -152,11 +152,11 @@ bak/                             已归档（**gitignore**，见 bak/README.md�
 | 短轨迹 | Car ≤3 / Truck ≤4 帧 | ≤4 帧（行人另加 <20 帧整条删）|
 | 挂车 | `--trailer-policy to-truck`（默认并成 Truck，标注侧无 Trailer 类）| — |
 | 静态刚性框 | `--static-rigid`（默认关）| — |
-| yaw | Car：main_chain 整合 yaw（动态段保留 detector yaw）；Truck：`geometry_yaw_v2` | `legacy` |
+| yaw | Car：`--car-yaw-settle step45`（默认，B1：static_yaw 只算不写 + 几何跑 detector 原生系 + step4.5 settle 在几何之后写轴和方向）；Truck：`geometry_yaw_v2` | `legacy` |
 
 常用开关：`--chains car,truck,vru`（默认）｜`--truck-detector-mode lidar|fusion`（默认 lidar）
 ｜`--vru-detector voxelnext|bevfusion`（默认 voxelnext）｜`--bev-raw-dir`（复用已生成的 raw，不重跑推理）
-｜`--keep-vehicle-diagnostics`｜`--keep-chain-labels`｜`--link-only`｜`--output-tag`
+｜`--car-yaw-settle step45\|step45-axis\|step2`（默认 step45 = B1）｜`--keep-vehicle-diagnostics`｜`--keep-chain-labels`｜`--link-only`｜`--output-tag`
 
 ---
 
@@ -166,7 +166,8 @@ bak/                             已归档（**gitignore**，见 bak/README.md�
 
 | 链 | 动态段 | 静止/停车段 | 开关 |
 | --- | --- | --- | --- |
-| **Car**（main_chain step2） | 保留 **detector 原始 yaw**（`apply_motion_yaw=False` 写死） | `static_yaw` 把确认近零速的帧**锁到 slot / 停车排的圆中位 yaw**；另有静止多帧点云 PCA 主轴覆盖 | **没有开关**（见「已知问题」） |
+| **Car**（step2 只算/导出，不写） | 保留 **detector 原始 yaw**（`apply_motion_yaw=False` 写死）；几何（step3 的 box fit）也跑在 detector 原生局部系里 | `static_yaw` 只计算「确认近零速 run」的目标轴 + dwell 帧 + 方向投票，**不写回** | `--car-yaw-settle step45`（默认，B1）|
+| **Car**（step4.5 settle，2026-09-23 新增） | `settle_static_yaw`：只对 `dwell ∩ region=='static' ∩ 未重跟踪` 的帧写「目标轴 + 方向」 | 同左（**几何之后**才写，几何与 yaw 修正解耦）| `Step45Config.settle_static_yaw_enabled` / `settle_write_axis`（入口 `--car-yaw-settle`）|
 | Car（step4.5） | `yaw_reversal`：每帧与「首→末轨迹方向」差 >90° 就 `+π`（`Step45Config.yaw_reversal_enabled=True`） | 无 | 有开关，但入口没透出 |
 | **Truck**（geometry_yaw_v2） | 直线段用运动方向（`apply_straight_motion_yaw=True`）；转弯/遮挡保留 detector yaw | **不做静态锁**（`apply_static_direction_vote=False` + `truck_static_yaw_enabled=False`）；点云主轴规则已删 | 有（`truck_*`） |
 | Truck 后处理 | ①与局部运动方向差 ≥15° 的帧改成运动方向；①b 静止 Truck 的 yaw 5° 分箱众数平滑；④π 翻转 | 同左 | `TruckPostConfig` |
@@ -212,23 +213,36 @@ pytest tests/root
 
 ## 已知问题 / 待办
 
-1. **Car 的静态 yaw 锁没有开关**（已定位 + 量化）。链路：`StaticFirstTracker` 把车绑到静态 slot
-   → `main_chain/geometry/static_yaw.py::stabilize_static_yaw` 把「近零速 run + departure 之前」
-   的帧 yaw 改成该 slot 的圆中位（世界系）→ `yaw_static_direction._static_direction_targets`
-   再把这些帧统一成「轴 ± 0/π」（决定朝向正反）→ 少量静止轨迹还会被
-   `_stationary_pointcloud_targets` 用多帧点云 PCA 主轴覆盖。目标是**世界系固定值**，
-   所以同一辆车每帧在世界系里 yaw 完全相同（= 整条轨迹朝向被冻住）。
+1. **Car 静态 yaw 已按 B1 固定（2026-09-23 实施）**。原缺陷：`static_yaw` 写轴 +
+   `yaw_static_direction._static_direction_targets` 对「`t < departure_cutoff`」的**每一帧**写同一个
+   track 级轴 + `±π`；而 cutoff 来自 step2 的 departure 判定，漏检率高（实测 clip2 21 个 slot 只 7 个有、
+   clip3 5 个全没有）→ **运动中的末尾帧 / 整条轨迹被写成停车轴**。
 
-   实测（`/media/moga/police/1111` 两条 clip，2026-09-23，关掉 static_yaw + 方向投票前后对比）：
+   现在（`--car-yaw-settle step45`，默认）：
+   * step2 的 `static_yaw` **只算不写**（`StaticYawConfig.apply_axis=False`）：输出目标轴、
+     dwell 帧集合、方向投票结果；逐帧静止门控由 `min(邻居)` 改成 `max(邻居)`
+     （`stationary_gate_requires_both=True`，起步/停车的边缘帧不再被误锁）；
+   * **几何跑在 detector 原生局部系**里（step3 的 box fit 不受 yaw 修正影响，两者解耦）；
+   * step4.5 新增 `settle_static_yaw`：只对 `dwell ∩ region=='static' ∩ 未 _step45_retracked`
+     的帧写「目标轴 + 方向」，只改 `box_lidar[6]`，并把这些帧并入 `verify_static_freeze` 的豁免集；
+   * 方向投票原本的 `_static_direction_targets` 调用在 Car 链关闭
+     （`apply_static_direction_vote=False`），"静止多帧点云主轴"规则也关闭
+     （`apply_stationary_pointcloud_axis=False`，该规则会用一条 track 级 PCA 轴覆盖整条轨迹；
+     Truck 侧同类规则已于 `7fdce6d` 删除）。
 
-   | clip | Car 框 | static_yaw 改写框数（最大角度）| 方向投票覆盖 | 关掉后轴向变化（平均/最大）| 朝向被翻 180° |
-   | --- | --- | --- | --- | --- | --- |
-   | `..._095943_clip3_pre` | 455 | 253（13.7°）| 311 | 1.05° / 13.7° | 2 |
-   | `..._110928_clip2_pre` | 1398 | 929（31.5°）| 1027 | 1.25° / 34.0° | **69**（对照 detector 原始 yaw：68/1176 框 >90°）|
+   实测（clip2，Car 1242 框，vs 旧口径）：轴变 221（max 34°）、翻 180° 43、几何变>1mm 840；
+   `obj 21` 这类"停车后驶离"的车与自身运动方向的夹角从 39.9° 降到 **5.9°**；
+   默认模式重跑与固定下来的 B1 产物**逐帧逐框一致**（yaw/位置差 0）。
 
-   Truck 那侧有 `truck_static_yaw_enabled=False` / `apply_static_direction_vote=False` 可关，**Car 侧没有**。
-   需求：给 `main_chain` step2 加 `static_yaw_enabled` + yaw 配置入参，从 `step_vehicle_chain`
-   透出 CLI（`--no-car-static-yaw`），再用上面两条 clip 做 A/B。
+   **遗留（已知取舍）**：
+   * settle 的写入门槛用 `region == 'static'`，而 `region` 是**空间区域**——停车位落在动态区域内时，
+     那些「还停着 / 刚慢速起步」的帧会被整段跳过（实测 `obj 14`：与运动方向夹角由 1.3° 变 22.5°）。
+     若要修，把候选帧改成"static_yaw 的 dwell 集合"（不叠加 region 条件）即可，目前按 B1 口径固定。
+   * `obj 21` 有 1 帧 Δz 0.866 m：来自 step3「找不到地面 → 回退」分支翻转（clip2 有 43% 的帧走回退），
+     与 yaw 解耦无关，需要额外的 z 分支时序护栏（B2）。
+   * 三个口径的 SUST 对照数据集在 `/media/moga/police/1111/*_A_today|_B1_detframe|_B1p_axisframe`
+     （说明见同目录 `_yaw_AB_README.txt`）。
+
 2. `README`/`main_chain/README.md` 里仍有少量指向 `bak/` 的旧描述（回退路径、已删的旧单链）。
 3. `bevfusion/data/`（约 16 GB）是预处理缓存，里面混着旧实验的 `*_pre` / `*_pre_pre` 条目，可清。
 4. `bevfusion/work/infos/` 与 `bevfusion/data/` 是**共享缓存：同一时间只跑一个批跑**，否则互相抢。
@@ -241,6 +255,8 @@ pytest tests/root
 | --- | --- |
 | Truck 用旧 VoxelNeXt 权重 | `--truck-detector voxelnext --truck-ckpt models/voxelnext_truckB_epoch15.pth`（Car 会因此不可用：Car 只走合并车链）|
 | 旧五类单链 | `--chains noncar`（`models/vod_2cls_ft_e12.pth`）|
+| Car 回到旧 yaw 口径（A+B 都在 step2） | `--car-yaw-settle step2` |
+| Car 用"几何按修正轴 / settle 只做 π"的口径 | `--car-yaw-settle step45-axis` |
 | 打开静态刚性框 | `--static-rigid` |
 | 留分链标签 / 诊断 | `--keep-chain-labels` / `--keep-vehicle-diagnostics` |
 | 不落盘只跑链路 | `--no-export-sust` |
