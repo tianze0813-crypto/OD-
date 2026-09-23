@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Tuple
@@ -47,6 +48,9 @@ from filtering.car_size_filter import LargeCarFilterConfig         # noqa: E402
 from filtering.final_filter import FinalFilterConfig               # noqa: E402
 from filtering.hard_filters import HardFilterConfig                # noqa: E402
 from geometry.car_box_fit import CarBoxFitConfig                    # noqa: E402
+from geometry.static_yaw import StaticYawConfig                     # noqa: E402
+from geometry.yaw_vehicle_dynamic import YawVehicleDynamicConfig    # noqa: E402
+from region.retrack import Step45Config                             # noqa: E402
 from tracking import tracker_conservative as tracking              # noqa: E402
 
 # 车链默认参数（Car / Truck 各自与单链行为对齐）
@@ -64,6 +68,16 @@ DEFAULTS: Dict[str, Any] = dict(
     car_sparsity_max_points=5,
     car_short_track_max_frames=3,
 )
+
+
+def car_yaw_settle_mode() -> str:
+    """Car 静态 yaw 落定的位置（临时环境变量，默认 = 原行为）。
+
+    ``step2``  = 原行为：static_yaw 写轴 + 方向投票都在 step2 里做完
+    ``step45`` = 新方案：static_yaw 只写轴（并导出 dwell 帧 + 方向投票结果），
+                 方向投票挪到 step4.5 的 settle 阶段，只对 dwell 帧应用
+    """
+    return os.environ.get("HYBRID_CAR_YAW_SETTLE", "step2").strip().lower()
 
 
 def _count(frames: Sequence[Dict[str, Any]]) -> int:
@@ -153,13 +167,32 @@ def run(raw_json: Path, clip: Path, work_root: Path, *,
         visibility_min_ratio=float(params["visibility_min_ratio"]),
         keep_classes=tuple(str(c) for c in keep_classes),
     )
+    settle_mode = car_yaw_settle_mode()
+    # 【改动 2026-09-23】静止多帧点云主轴规则：按用户要求对 Car 关闭（Truck 侧的同类
+    # 规则已于 7fdce6d 删除：会用一条 track 级的 PCA 轴覆盖整条轨迹，且不看 dwell）。
+    if settle_mode == "step45":
+        # B1：几何阶段不写 yaw（apply_axis=False），只导出目标轴/dwell/方向投票；
+        # 门控改成"前后邻居都不能明显动"；step2 不再应用方向投票 ——
+        # 修正统一由 step4.5 的 settle 阶段在几何之后写入。
+        static_yaw_config = StaticYawConfig(stationary_gate_requires_both=True,
+                                            export_dwell=True,
+                                            apply_axis=False)
+        yaw_vehicle_config = YawVehicleDynamicConfig(
+            apply_static_direction_vote=False,
+            apply_stationary_pointcloud_axis=False)
+    else:
+        static_yaw_config = None
+        yaw_vehicle_config = YawVehicleDynamicConfig(
+            apply_stationary_pointcloud_axis=False)
     step2_diagnostics = step2.run(
         raw_json, clip, step2_json, None, step2_diag,
         hard_filter_config=hard_config,
         class_config=class_config or ClassRefinementConfig(),
         min_lifecycle=min(int(v) for _c, v in params["class_min_lifecycle"]),
         class_min_lifecycle={str(c): int(v)
-                             for c, v in params["class_min_lifecycle"]})
+                             for c, v in params["class_min_lifecycle"]},
+        static_yaw_config=static_yaw_config,
+        yaw_vehicle_config=yaw_vehicle_config)
 
     frames = json.loads(step2_json.read_text(encoding="utf-8"))
     union_count = _count(frames)
@@ -192,8 +225,10 @@ def run(raw_json: Path, clip: Path, work_root: Path, *,
     # ---- step4.5：共享动态区域 / 重跟踪 / ID 继承（并集上跑一次）----
     step45_json = work_root / f"{base}_step45.json"
     step45_diag = work_root / f"{base}_step45_diagnostics.json"
-    step45_diagnostics = step45.run(union_step4_json, clip, step2_diag,
-                                    step45_json, step45_diag)
+    step45_diagnostics = step45.run(
+        union_step4_json, clip, step2_diag, step45_json, step45_diag,
+        config=Step45Config(settle_static_yaw_enabled=(settle_mode == "step45"),
+                            settle_write_axis=(settle_mode == "step45")))
 
     # ---- step5：Car 终检 + base_link ----
     tracked = json.loads(step45_json.read_text(encoding="utf-8"))
@@ -219,6 +254,7 @@ def run(raw_json: Path, clip: Path, work_root: Path, *,
         "step45_diagnostics": str(step45_diag),
         "car_json": str(car_json),
         "car_diagnostics": str(car_diag),
+        "car_yaw_settle_mode": settle_mode,
         "union_detections": union_count,
         "car_boxes_merged": replaced,
         "car_step5": {

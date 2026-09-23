@@ -24,8 +24,9 @@ from filtering.hard_filters import (
     apply_hard_filters,
     deduplicate_same_center,
 )
-from geometry.static_yaw import stabilize_static_yaw
+from geometry.static_yaw import StaticYawConfig, stabilize_static_yaw
 from geometry.yaw_integrated import apply_yaw_integrated
+from geometry.yaw_vehicle_dynamic import YawVehicleDynamicConfig
 from tracking import tracker_conservative as tracking
 from tracking import tracker_static_first as static_first
 
@@ -67,7 +68,10 @@ def run(
         min_lifecycle: int = 4,
         same_center_gate: float = 0.35,
         # 【改动】2026-09-21 车链：按类别的短轨迹门槛（Car 3 / Truck 4）
-        class_min_lifecycle: Optional[Mapping[str, int]] = None) -> Dict[str, Any]:
+        class_min_lifecycle: Optional[Mapping[str, int]] = None,
+        # 【改动 2026-09-23】yaw 配置入参（车链从 driver 透传；默认 = 原行为）
+        static_yaw_config: Optional[StaticYawConfig] = None,
+        yaw_vehicle_config: Optional[YawVehicleDynamicConfig] = None) -> Dict[str, Any]:
     source = json.loads(Path(in_json).read_text(encoding="utf-8"))
     if not isinstance(source, list):
         raise ValueError(f"input must be a list of frames: {in_json}")
@@ -140,10 +144,12 @@ def run(
     pre_static_yaw = copy.deepcopy(tracked)
     diagnostics["static_yaw_stabilization"] = stabilize_static_yaw(
         tracked, coords, tracker.slots,
-        tracking_diagnostics.get("slot_motion_coordination", {}))
+        tracking_diagnostics.get("slot_motion_coordination", {}),
+        config=static_yaw_config or StaticYawConfig())
     tracked, diagnostics["yaw_integrated"] = apply_yaw_integrated(
         tracked, pre_static_yaw, coords, Path(clip),
-        tracking_diagnostics, diagnostics["static_yaw_stabilization"])
+        tracking_diagnostics, diagnostics["static_yaw_stabilization"],
+        vehicle_config=yaw_vehicle_config or YawVehicleDynamicConfig())
     before_final_class = copy.deepcopy(tracked)
     diagnostics["class_finalization"] = finalize_track_classes(
         tracked, class_config)

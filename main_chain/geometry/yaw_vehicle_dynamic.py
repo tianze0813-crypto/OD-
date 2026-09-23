@@ -57,6 +57,14 @@ class YawVehicleDynamicConfig:
     # computed for diagnostics and for excluding moving tracks from the
     # stationary point-cloud branch.
     apply_motion_yaw: bool = False
+    # 【改动 2026-09-23】False = 不执行"静止多帧点云主轴"规则（Car 侧按用户要求关闭；
+    # 该规则会用一个 track 级的 PCA 轴覆盖整条轨迹的 yaw，Truck 侧的同类规则已于
+    # 7fdce6d 删除：0914 clip17 的卡车被它拉歪 16.4°）。
+    apply_stationary_pointcloud_axis: bool = True
+    # 【改动 2026-09-23】False = 不在 step2 应用"静态方向投票"（写轴 + 定 ±π）。
+    # 决策改由 static_yaw 的 direction_flip 记录、step4.5 的 settle 阶段只对
+    # dwell 帧应用 —— 因为 step2 时还不知道哪些帧是动的。
+    apply_static_direction_vote: bool = True
 
 
 def _track_items(
@@ -507,15 +515,21 @@ def apply_yaw_vehicle_dynamic(
     output = copy.deepcopy(list(final_frames))
     # Reuse only V1's reviewed static direction vote. Its config fields are
     # structurally compatible with the static helper.
-    static_targets, static_details = _static_direction_targets(
-        output, pre_yaw_frames, coords, static_yaw_diagnostics, config)
+    if bool(getattr(config, "apply_static_direction_vote", True)):
+        static_targets, static_details = _static_direction_targets(
+            output, pre_yaw_frames, coords, static_yaw_diagnostics, config)
+    else:
+        static_targets, static_details = {}, []
     tracks = _track_items(
         output, coords, tracking_diagnostics, static_yaw_diagnostics)
     motion_targets, moving_ids, motion_details = _motion_targets(tracks, config)
-    point_targets, point_details, point_rejections = (
-        _stationary_pointcloud_targets(
-        tracks, moving_ids, pre_yaw_frames, Path(clip), config)
-    )
+    if bool(getattr(config, "apply_stationary_pointcloud_axis", True)):
+        point_targets, point_details, point_rejections = (
+            _stationary_pointcloud_targets(
+            tracks, moving_ids, pre_yaw_frames, Path(clip), config)
+        )
+    else:
+        point_targets, point_details, point_rejections = {}, [], []
     cutoffs = _departure_cutoffs(static_yaw_diagnostics)
 
     counts = Counter()
@@ -558,6 +572,10 @@ def apply_yaw_vehicle_dynamic(
             "tracking_feedback": False,
             "mutated_field": "box_lidar[6]",
             "apply_motion_yaw": bool(config.apply_motion_yaw),
+            "apply_static_direction_vote": bool(
+                getattr(config, "apply_static_direction_vote", True)),
+            "apply_stationary_pointcloud_axis": bool(
+                getattr(config, "apply_stationary_pointcloud_axis", True)),
             "priority": (
                 ["static_direction_vote"]
                 + (["confirmed_motion_heading"] if config.apply_motion_yaw

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import math
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Sequence
 
@@ -30,6 +31,23 @@ class StaticYawConfig:
     # This keeps the reviewed pure-static behaviour byte-for-byte stable.
     stationary_whole_track_speed_gate: float = 0.80
     stationary_whole_track_step_gate: float = 0.35
+    # 【改动 2026-09-23】逐帧静止判定改为"前后邻居都不能明显动"。
+    # False（默认）= 原行为：任一边慢就算静止帧（起步/停车的边缘帧会被卷进来）。
+    stationary_gate_requires_both: bool = False
+    # 【改动 2026-09-23】把"允许写的帧"和"方向投票结果"导出到 slots[]，供 step4.5 的
+    # static yaw settle 使用（B 从 step2 挪到 step4.5 后需要这两个字段）。
+    export_dwell: bool = False
+    # 方向投票门槛（与 yaw_static_direction 的默认一致）
+    direction_min_votes: int = 4
+    direction_min_margin: float = 0.15
+    # 【改动 2026-09-23 · B1】False = 只计算/导出目标轴，**不写 box_lidar[6]**。
+    # 目的：让 step3 的几何拟合跑在 detector 自己的局部系里（几何不受 yaw 修正影响），
+    # yaw 的修正由 step4.5 的 settle 阶段在几何之后一次性写入。
+    apply_axis: bool = True
+
+
+def _wrap2pi(angle: float) -> float:
+    return (float(angle) + math.pi) % (2.0 * math.pi) - math.pi
 
 
 def _world_yaw_to_local_yaw(
@@ -116,9 +134,16 @@ def _stationary_detection_ids(
         if not local_speeds:
             flags.append(False)
             continue
-        flags.append(
-            min(local_speeds) <= float(config.stationary_speed_gate)
-            and min(local_steps) <= float(config.stationary_step_gate))
+        # 【改动 2026-09-23】requires_both=True 时改成"所有可用邻居都必须慢"，
+        # 这样起步/停车的那一两帧不会被误判成静止帧。
+        if bool(getattr(config, "stationary_gate_requires_both", False)):
+            flags.append(
+                max(local_speeds) <= float(config.stationary_speed_gate)
+                and max(local_steps) <= float(config.stationary_step_gate))
+        else:
+            flags.append(
+                min(local_speeds) <= float(config.stationary_speed_gate)
+                and min(local_steps) <= float(config.stationary_step_gate))
 
     accepted = [False] * len(flags)
     run_start = None
@@ -161,6 +186,7 @@ def stabilize_static_yaw(
         int, List[tuple[int, Dict[str, Any], float, np.ndarray]]] = {
         track_id: [] for track_id in slot_by_track
     }
+    timestamp_by_det_id: Dict[int, int] = {}
 
     for frame in frames:
         timestamp = int(frame["frame_id"])
@@ -182,6 +208,7 @@ def stabilize_static_yaw(
                 det["box_lidar"], world_from_lidar)
             observations[track_id].append(
                 (timestamp, det, world_yaw, world_center))
+            timestamp_by_det_id[id(det)] = timestamp
 
     targets = {}
     slot_details = []
@@ -209,7 +236,17 @@ def stabilize_static_yaw(
             target = row_prior
             row_corrected = True
         targets[track_id] = target
-        slot_details.append({
+        # 【改动 2026-09-23】方向投票：样本 = cutoff 之前的全部观测（与旧 B 一致），
+        # 但这里只**记录**结果，不写回；由 step4.5 的 settle 阶段只对 dwell 帧应用。
+        side_votes = Counter()
+        for _t, _d, raw_world_yaw, _c in items:
+            side_votes[0 if abs(_wrap2pi(raw_world_yaw - target)) <= math.pi / 2.0
+                       else 1] += 1
+        total_votes = side_votes[0] + side_votes[1]
+        vote_margin = (abs(side_votes[0] - side_votes[1]) / max(total_votes, 1))
+        vote_accepted = (total_votes >= int(config.direction_min_votes)
+                         and vote_margin >= float(config.direction_min_margin))
+        detail = {
             "track_id": track_id,
             "slot_id": int(slot.slot_id),
             "parking_observations": len(items),
@@ -218,7 +255,16 @@ def stabilize_static_yaw(
             "row_id": slot.row_id,
             "row_corrected": row_corrected,
             "departure_start_timestamp": departure_start.get(track_id),
-        })
+        }
+        if bool(getattr(config, "export_dwell", False)):
+            detail.update({
+                "direction_votes_axis": int(side_votes[0]),
+                "direction_votes_opposite": int(side_votes[1]),
+                "direction_margin": round(float(vote_margin), 4),
+                "direction_accepted": bool(vote_accepted),
+                "direction_flip": bool(vote_accepted and side_votes[1] > side_votes[0]),
+            })
+        slot_details.append(detail)
 
     stationary_by_track: Dict[int, set[int]] = {}
     stationary_details = []
@@ -227,34 +273,23 @@ def stabilize_static_yaw(
             observations[track_id], config)
         stationary_by_track[track_id] = keys
         stationary_details.append({"track_id": track_id, **detail})
+        if bool(getattr(config, "export_dwell", False)):
+            detail["dwell_timestamps"] = sorted(
+                int(timestamp_by_det_id[key]) for key in keys
+                if key in timestamp_by_det_id)
+            for entry in slot_details:
+                if int(entry["track_id"]) == int(track_id):
+                    entry["dwell_timestamps"] = detail["dwell_timestamps"]
+                    entry["stationary_reason"] = detail.get("reason")
 
     changed = 0
     moving_excluded = 0
     absolute_delta = []
-    for frame in frames:
-        timestamp = int(frame["frame_id"])
-        world_from_lidar = coords.world_from_lidar(timestamp)
-        if world_from_lidar is None:
-            continue
-        for det in frame.get("detections", []):
-            track_id = det.get("track_id")
-            if track_id is None:
-                continue
-            track_id = int(track_id)
-            target = targets.get(track_id)
-            if target is None or timestamp >= departure_start.get(track_id, math.inf):
-                continue
-            if id(det) not in stationary_by_track.get(track_id, set()):
-                moving_excluded += 1
-                continue
-            old_yaw = float(det["box_lidar"][6])
-            new_yaw = _world_yaw_to_local_yaw(target, world_from_lidar)
-            delta = tracking.angle_distance(old_yaw, new_yaw, modulo_pi=True)
-            det["box_lidar"][6] = float(new_yaw)
-            absolute_delta.append(delta)
-            if delta > 1e-9:
-                changed += 1
-
+    if bool(getattr(config, "apply_axis", True)):
+        moving_excluded = _write_static_axis(
+            frames, coords, targets, departure_start,
+            stationary_by_track, absolute_delta)
+        changed = sum(1 for value in absolute_delta if value > 1e-9)
     _verify_yaw_only(before, frames)
     return {
         "policy": {
@@ -282,6 +317,40 @@ def stabilize_static_yaw(
         "stationary_gate_details": stationary_details,
         "slots": slot_details,
     }
+
+
+def _write_static_axis(
+        frames: List[Dict[str, Any]],
+        coords: tracking.CoordinateProvider,
+        targets: Mapping[int, float],
+        departure_start: Mapping[int, int],
+        stationary_by_track: Mapping[int, set],
+        absolute_delta: List[float],
+) -> int:
+    """原来的写回逻辑（抽成函数，供 apply_axis 开关调用）。返回被排除的运动帧数。"""
+    moving_excluded = 0
+    for frame in frames:
+        timestamp = int(frame["frame_id"])
+        world_from_lidar = coords.world_from_lidar(timestamp)
+        if world_from_lidar is None:
+            continue
+        for det in frame.get("detections", []):
+            track_id = det.get("track_id")
+            if track_id is None:
+                continue
+            track_id = int(track_id)
+            target = targets.get(track_id)
+            if target is None or timestamp >= departure_start.get(track_id, math.inf):
+                continue
+            if id(det) not in stationary_by_track.get(track_id, set()):
+                moving_excluded += 1
+                continue
+            old_yaw = float(det["box_lidar"][6])
+            new_yaw = _world_yaw_to_local_yaw(target, world_from_lidar)
+            absolute_delta.append(
+                tracking.angle_distance(old_yaw, new_yaw, modulo_pi=True))
+            det["box_lidar"][6] = float(new_yaw)
+    return moving_excluded
 
 
 def _verify_yaw_only(before: Sequence[Dict[str, Any]],

@@ -73,6 +73,13 @@ class Step45Config:
     # or whole-track voting is used.
     yaw_reversal_enabled: bool = True
     yaw_reversal_threshold_deg: float = 90.0
+    # 【改动 2026-09-23】静态 yaw 落定：把 step2 算好的 direction_flip 只应用到
+    # 「static_yaw 允许写的 dwell 帧 ∩ region=='static' ∩ 未被重跟踪」上。
+    # 这样运动帧再也不会被写（旧实现按 `t < cutoff` 写，cutoff 缺失=整条）。
+    settle_static_yaw_enabled: bool = False
+    # True（B1）= settle 阶段写"目标轴 + 方向"（几何阶段不再写 yaw）；
+    # False = 只做 π 等价翻转（几何阶段仍由 static_yaw 写轴）。
+    settle_write_axis: bool = True
     # Moving seed / pure static classification (PLAN section 19).
     moving_seed_net_min_m: float = 8.0
     moving_seed_concentration_min: float = 0.5
@@ -2033,6 +2040,89 @@ def align_dynamic_yaw(
         "tracks": len(details),
         "details": details,
     }
+
+
+def settle_static_yaw(
+        frames: List[Dict[str, Any]],
+        coords: Any,
+        step2_diagnostics: Mapping[str, Any],
+        config: Step45Config,
+) -> Tuple[Dict[str, Any], set]:
+    """把 step2 算好的静态 yaw（轴 + 方向）落到"真正停着的帧"上。
+
+    这是 B1 的落点：几何阶段（step2 的 static_yaw 写轴 / step3 的 box fit）不再被
+    yaw 修正影响 —— ``static_yaw`` 只导出 ``target_world_yaw`` / ``dwell_timestamps`` /
+    ``direction_flip``，修正在这里、在几何之后一次性写入。
+
+    输入（step2 的 static_yaw 诊断，需要 export_dwell=True）：
+      * ``slots[].dwell_timestamps``：允许写的帧（确认近零速 run，且已按 departure 截断）
+      * ``slots[].target_world_yaw``：目标轴（世界系）
+      * ``slots[].direction_flip``：方向投票结果（样本 = cutoff 之前全部观测）
+    只改 ``box_lidar[6]``，返回 ``(diagnostics, 被写过的 (frame_index, det_index))``。
+    """
+    diagnostics: Dict[str, Any] = {
+        "enabled": bool(config.settle_static_yaw_enabled),
+        "mode": "axis+direction" if bool(getattr(config, "settle_write_axis", True))
+                else "direction_only",
+        "tracks": 0,
+        "candidate_frames": 0,
+        "written_detections": 0,
+        "flipped_detections": 0,
+        "details": [],
+    }
+    if not bool(config.settle_static_yaw_enabled):
+        return diagnostics, set()
+    write_axis = bool(getattr(config, "settle_write_axis", True))
+    slots = step2_diagnostics.get("static_yaw_stabilization", {}).get("slots", [])
+    dwell: Dict[int, set] = {}
+    axis: Dict[int, float] = {}
+    flip: Dict[int, bool] = {}
+    for entry in slots:
+        track_id = entry.get("track_id")
+        stamps = entry.get("dwell_timestamps")
+        if track_id is None or not stamps:
+            continue
+        dwell[int(track_id)] = {int(value) for value in stamps}
+        flip[int(track_id)] = bool(entry.get("direction_flip"))
+        value = entry.get("target_world_yaw")
+        if value is not None:
+            axis[int(track_id)] = float(value)
+    settled_keys: set = set()
+    for frame_index, frame in enumerate(frames):
+        timestamp = int(frame["frame_id"])
+        world_from_lidar = coords.world_from_lidar(timestamp)
+        if world_from_lidar is None:
+            continue
+        for detection_index, det in enumerate(frame.get("detections", [])):
+            track_id = det.get("track_id")
+            if track_id is None:
+                continue
+            track_id = int(track_id)
+            if timestamp not in dwell.get(track_id, ()):
+                continue
+            if det.get("region") != "static" or det.get("_step45_retracked"):
+                continue
+            box = det.get("box_lidar")
+            if not isinstance(box, list) or len(box) < 7:
+                continue
+            diagnostics["candidate_frames"] += 1
+            settled_keys.add((frame_index, detection_index))
+            target = axis.get(track_id)
+            if write_axis and target is not None:
+                world_yaw = target + (math.pi if flip.get(track_id) else 0.0)
+                box[6] = float(_world_yaw_to_local(_wrap_angle(world_yaw),
+                                                   world_from_lidar))
+                diagnostics["written_detections"] += 1
+                if flip.get(track_id):
+                    diagnostics["flipped_detections"] += 1
+                det["_step45_yaw_settled"] = True
+            elif flip.get(track_id):
+                box[6] = float(_wrap_angle(float(box[6]) + math.pi))
+                diagnostics["written_detections"] += 1
+                diagnostics["flipped_detections"] += 1
+                det["_step45_yaw_settled"] = True
+    diagnostics["tracks"] = sum(1 for value in flip.values() if value)
+    return diagnostics, settled_keys
 
 
 def _final_trajectory_heading(

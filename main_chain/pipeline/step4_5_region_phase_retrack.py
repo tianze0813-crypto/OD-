@@ -35,6 +35,7 @@ from region.retrack import (
     region_mask,
     retrack_dynamic,
     revert_dynamic_yaw,
+    settle_static_yaw,
     seed_track_ids,
     select_retrackable,
     single_frame_overlap_filter,
@@ -116,6 +117,12 @@ def run(step4_json: Path, clip: Path, step2_diagnostics: Path,
 
     tracking_diagnostics = step2.get("tracking", {})
     static_yaw_diagnostics = step2.get("static_yaw_stabilization", {})
+
+    # 【改动 2026-09-23】静态 yaw 落定：只对 step2 允许写的 dwell 帧
+    # （且 region=='static'、未被重跟踪）应用方向投票结果。
+    static_yaw_settle, settled_keys = settle_static_yaw(frames, coords, step2, config)
+    if settled_keys:
+        exempt_keys = set(exempt_keys) | set(settled_keys)
     _fitted_frames, box_fit_diagnostics = dynamic_box_fit(
         frames, Path(clip), coords, tracking_diagnostics,
         static_yaw_diagnostics,
@@ -192,6 +199,7 @@ def run(step4_json: Path, clip: Path, step2_diagnostics: Path,
         },
         "phase_stitching": phase,
         "unique_frame_ids": unique_ids,
+        "static_yaw_settle": static_yaw_settle,
         "box_fit": box_fit_diagnostics,
         "dynamic_yaw_alignment": yaw_diagnostics,
         "yaw_reversal": yaw_reversal_diag,
