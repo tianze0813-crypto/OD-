@@ -16,6 +16,7 @@ from region.retrack import (
     _lateral_jump_ok,
     _movement_compatible,
     align_dynamic_yaw,
+    apply_slot_static_yaw_vote,
     build_region,
     candidate_track_ids,
     collect_world_tracks,
@@ -237,6 +238,35 @@ class Step45RetrackTest(unittest.TestCase):
         self.assertFalse(is_moving_seed(parked_stats, config))
         self.assertTrue(is_pure_static(parked_stats, config))
         self.assertFalse(is_pure_static(moving_stats, config))
+
+    def test_slot_static_yaw_vote_flips_minority_outside_dynamic_region(self):
+        source = frames([
+            [det("Car", 0.0, 0.0, 1), det("Car", 100.0, 100.0, 2)]
+            for _ in range(5)
+        ])
+        for index, frame in enumerate(source):
+            parked = frame["detections"][0]
+            parked["region"] = "static"
+            parked["box_lidar"][6] = math.pi if index == 4 else 0.0
+            dynamic = frame["detections"][1]
+            dynamic["region"] = "dynamic"
+            dynamic["box_lidar"][6] = 0.0
+        step2 = {"tracking": {"slot_details": [
+            {"track_id": 1, "class_name": "Car"}]}}
+        with TemporaryDirectory() as directory:
+            coords = make_coords(Path(directory))
+            diagnostics, changed = apply_slot_static_yaw_vote(
+                source, coords, step2, Step45Config())
+        self.assertEqual(diagnostics["candidate_tracks"], 1)
+        self.assertEqual(diagnostics["candidate_detections"], 5)
+        self.assertEqual(diagnostics["flipped_detections"], 1)
+        self.assertEqual(len(changed), 1)
+        self.assertAlmostEqual(
+            source[4]["detections"][0]["box_lidar"][6], 0.0, places=6)
+        # dynamic-region detection is not a candidate
+        self.assertTrue(all(
+            frame["detections"][1]["box_lidar"][6] == 0.0
+            for frame in source))
 
     def test_weak_moving_seed_accepts_short_start(self):
         config = Step45Config()

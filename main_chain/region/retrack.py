@@ -80,6 +80,12 @@ class Step45Config:
     # True（B1）= settle 阶段写"目标轴 + 方向"（几何阶段不再写 yaw）；
     # False = 只做 π 等价翻转（几何阶段仍由 static_yaw 写轴）。
     settle_write_axis: bool = True
+    # 【改动 2026-09-23】step4.5 末尾额外 pass：对「step2 绑定了 slot 的 Car
+    # 且不在动态区域内」的检测重新做一次纯静态方向投票，只把反向帧 +π。
+    # 不保留 dwell 条件；existing settle_static_yaw 先跑，本 pass 作为兜底/扩展。
+    slot_yaw_vote_enabled: bool = True
+    slot_yaw_vote_min_votes: int = 4
+    slot_yaw_vote_min_margin: float = 0.15
     # Moving seed / pure static classification (PLAN section 19).
     moving_seed_net_min_m: float = 8.0
     moving_seed_concentration_min: float = 0.5
@@ -2123,6 +2129,131 @@ def settle_static_yaw(
                 det["_step45_yaw_settled"] = True
     diagnostics["tracks"] = sum(1 for value in flip.values() if value)
     return diagnostics, settled_keys
+
+
+def apply_slot_static_yaw_vote(
+        frames: List[Dict[str, Any]],
+        coords: Any,
+        step2_diagnostics: Mapping[str, Any],
+        config: Step45Config,
+) -> Tuple[Dict[str, Any], set]:
+    """对「step2 绑定 slot 的 Car 且不在动态区域内」的检测做一次纯静态 yaw 投票。
+
+    这是 step4.5 末尾额外跑的一遍：
+      * 候选 = step2 ``tracking.slot_details`` 里 class_name == Car 的 track_id，
+        且最终 detection 的 ``region != "dynamic"``、未被 ``_step45_retracked``；
+      * 不保留现有 settle_static_yaw 的 dwell 条件；
+      * 每条候选 track 用候选帧的世界系 directed yaw 投票出目标方向；
+      * 只对与目标方向反向的 detection 做 ``box_lidar[6] += pi``。
+
+    不改几何 / 尺寸 / track_id，只改 yaw。返回 (diagnostics, changed_keys)，
+    调用方需要把 changed_keys 并入 verify_static_freeze 的豁免集。
+    """
+    diagnostics: Dict[str, Any] = {
+        "enabled": bool(getattr(config, "slot_yaw_vote_enabled", True)),
+        "policy": "slot_bound_car_outside_dynamic_region_pi_vote_only",
+        "candidate_tracks": 0,
+        "candidate_detections": 0,
+        "accepted_tracks": 0,
+        "voted_tracks": 0,
+        "ambiguous_tracks": 0,
+        "flipped_detections": 0,
+        "details": [],
+    }
+    if not diagnostics["enabled"]:
+        return diagnostics, set()
+
+    slot_details = step2_diagnostics.get("tracking", {}).get(
+        "slot_details", [])
+    slot_car_ids = {
+        int(item["track_id"])
+        for item in slot_details
+        if str(item.get("class_name", "")) == "Car"
+        and item.get("track_id") is not None
+    }
+    if not slot_car_ids:
+        return diagnostics, set()
+
+    by_track: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for frame_index, frame in enumerate(frames):
+        timestamp = int(frame["frame_id"])
+        world_from_lidar = coords.world_from_lidar(timestamp)
+        if world_from_lidar is None:
+            continue
+        for detection_index, det in enumerate(frame.get("detections", [])):
+            track_id = det.get("track_id")
+            if (track_id is None
+                    or str(det.get("class_name", "")) != "Car"
+                    or int(track_id) not in slot_car_ids):
+                continue
+            if (det.get("region") == "dynamic"
+                    or det.get("_step45_retracked")):
+                continue
+            box = det.get("box_lidar")
+            if not isinstance(box, list) or len(box) < 7:
+                continue
+            by_track[int(track_id)].append({
+                "frame_index": frame_index,
+                "detection_index": detection_index,
+                "det": det,
+                "world_yaw": tracking.yaw_world(
+                    float(box[6]), world_from_lidar),
+            })
+
+    from tracking import tracker_static_first as static_first
+    min_votes = int(getattr(config, "slot_yaw_vote_min_votes", 4))
+    min_margin = float(getattr(config, "slot_yaw_vote_min_margin", 0.15))
+    changed_keys: set = set()
+    diagnostics["candidate_tracks"] = len(by_track)
+    diagnostics["candidate_detections"] = sum(
+        len(items) for items in by_track.values())
+
+    for track_id, items in by_track.items():
+        if not items:
+            continue
+        yaws = [float(item["world_yaw"]) for item in items]
+        axis = float(static_first.circular_median_pi(yaws))
+        side_votes = Counter(
+            0 if abs(_wrap_angle(yaw - axis)) <= math.pi / 2.0 else 1
+            for yaw in yaws)
+        total_votes = side_votes[0] + side_votes[1]
+        margin = (abs(side_votes[0] - side_votes[1])
+                  / max(total_votes, 1))
+        if total_votes < min_votes or margin < min_margin:
+            diagnostics["ambiguous_tracks"] += 1
+            continue
+        diagnostics["accepted_tracks"] += 1
+        winner = 0 if side_votes[0] >= side_votes[1] else 1
+        target = _wrap_angle(axis + (math.pi if winner else 0.0))
+        track_flipped = 0
+        for item in items:
+            if (abs(_wrap_angle(float(item["world_yaw"]) - target))
+                    <= math.pi / 2.0):
+                continue
+            det = item["det"]
+            box = det.get("box_lidar")
+            if not isinstance(box, list) or len(box) < 7:
+                continue
+            box[6] = float(_wrap_angle(float(box[6]) + math.pi))
+            det["_step45_slot_yaw_voted"] = True
+            changed_keys.add((int(item["frame_index"]),
+                              int(item["detection_index"])))
+            track_flipped += 1
+        if track_flipped:
+            diagnostics["voted_tracks"] += 1
+            diagnostics["flipped_detections"] += track_flipped
+            if len(diagnostics["details"]) < 200:
+                diagnostics["details"].append({
+                    "track_id": int(track_id),
+                    "observations": len(items),
+                    "axis_world_yaw": round(axis, 6),
+                    "votes_axis": int(side_votes[0]),
+                    "votes_opposite": int(side_votes[1]),
+                    "direction_margin": round(float(margin), 4),
+                    "winner": "axis" if winner == 0 else "opposite",
+                    "flipped_observations": int(track_flipped),
+                })
+    return diagnostics, changed_keys
 
 
 def _final_trajectory_heading(

@@ -261,6 +261,13 @@ def _summarize_shared_stage(step2_diag: Path, step45_diag: Path) -> Dict[str, An
                                        "lateral_jump_triggered")},
             "queue_merges": (d45.get("queue_stitching", {}).get("merges")),
             "phase_merges": len(d45.get("phase_stitching", {}).get("applied", [])),
+            "slot_static_yaw_vote": {
+                key: d45.get("slot_static_yaw_vote", {}).get(key)
+                for key in ("enabled", "candidate_tracks",
+                            "candidate_detections", "accepted_tracks",
+                            "voted_tracks", "ambiguous_tracks",
+                            "flipped_detections")
+            },
         })
     return summary
 

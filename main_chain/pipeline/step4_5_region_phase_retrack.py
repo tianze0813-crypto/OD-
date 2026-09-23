@@ -24,6 +24,7 @@ from region.dynamic_region import DynamicRegionConfig
 from region.retrack import (
     Step45Config,
     align_dynamic_yaw,
+    apply_slot_static_yaw_vote,
     build_region,
     collect_world_tracks,
     direction_filter,
@@ -154,6 +155,13 @@ def run(step4_json: Path, clip: Path, step2_diagnostics: Path,
             "reversed_tracks": 0,
             "details": [],
         }
+    # 【改动 2026-09-23】末尾额外 pass：对 step2 绑定 slot 的 Car、且不在
+    # 动态区域内（未被重跟踪）的检测重新做一次纯静态 yaw 投票，只把反向
+    # 帧 +pi。不保留 dwell 条件；已先跑过的 settle_static_yaw 作为第一层。
+    slot_yaw_vote_diag, slot_yaw_vote_keys = apply_slot_static_yaw_vote(
+        frames, coords, step2, config)
+    if slot_yaw_vote_keys:
+        exempt_keys = set(exempt_keys) | set(slot_yaw_vote_keys)
     static_freeze = verify_static_freeze(
         before_step45, frames, exempt_keys)
 
@@ -203,6 +211,7 @@ def run(step4_json: Path, clip: Path, step2_diagnostics: Path,
         "box_fit": box_fit_diagnostics,
         "dynamic_yaw_alignment": yaw_diagnostics,
         "yaw_reversal": yaw_reversal_diag,
+        "slot_static_yaw_vote": slot_yaw_vote_diag,
         "static_freeze": static_freeze,
         "final_detections": sum(
             len(frame.get("detections", [])) for frame in frames),
