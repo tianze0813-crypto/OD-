@@ -88,11 +88,11 @@ class Step45Config:
     slot_yaw_vote_min_margin: float = 0.15
     # 【改动 2026-09-23】step4.5 末尾：对高度约等于高先验 1.70m 的 Car，
     # 复刻 SUST 双击侧视图下边界 auto-shrink：车顶不动，框底贴到框内最低点；
-    # 只有底边上移量 0 < gap <= 0.20m 才动，没有点 / fit 不动就 no-op。
+    # 只要 fit 后高度不缩到 1.40m 以下就动；没有点 / fit 不动就 no-op。
     height_prior_bottom_fit_enabled: bool = True
     height_prior_bottom_fit_height_m: float = 1.70
     height_prior_bottom_fit_tol_m: float = 0.02
-    height_prior_bottom_fit_max_m: float = 0.20
+    height_prior_bottom_fit_min_height_m: float = 1.40
     # Moving seed / pure static classification (PLAN section 19).
     moving_seed_net_min_m: float = 8.0
     moving_seed_concentration_min: float = 0.5
@@ -2283,7 +2283,7 @@ def apply_height_prior_bottom_fit(
     SUST 参考实现：``public/js/side_view_op.js`` 的 ``on_y_auto_shrink`` /
     ``on_x_auto_shrink`` -> ``auto_shrink(extreme, {z:-1})``；仅取
     ``lidar/lidar_top/<frame>.bin`` 中落在当前 box 内的点，车顶保持不动，
-    下边界贴到框内最低点。只有底边上移量 ``0 < gap <= 0.20m`` 才动。
+    下边界贴到框内最低点。只要底边上移量 > 0 且 fit 后高度 >= 1.40m 就动。
     """
     diagnostics: Dict[str, Any] = {
         "enabled": bool(getattr(config, "height_prior_bottom_fit_enabled", True)),
@@ -2292,12 +2292,13 @@ def apply_height_prior_bottom_fit(
             config, "height_prior_bottom_fit_height_m", 1.70)),
         "height_tolerance_m": float(getattr(
             config, "height_prior_bottom_fit_tol_m", 0.02)),
-        "max_bottom_gap_m": float(getattr(
-            config, "height_prior_bottom_fit_max_m", 0.20)),
+        "min_height_m": float(getattr(
+            config, "height_prior_bottom_fit_min_height_m", 1.40)),
         "candidate_boxes": 0,
         "fitted_boxes": 0,
         "skipped_no_points": 0,
-        "skipped_gap_out_of_range": 0,
+        "skipped_not_fittable": 0,
+        "skipped_height_floor": 0,
         "missing_lidar_frames": 0,
         "details": [],
     }
@@ -2306,7 +2307,7 @@ def apply_height_prior_bottom_fit(
 
     target_height = diagnostics["reference_height_m"]
     tolerance = diagnostics["height_tolerance_m"]
-    max_gap = diagnostics["max_bottom_gap_m"]
+    min_height = diagnostics["min_height_m"]
     clip = Path(clip)
     point_cache: Dict[str, Optional[np.ndarray]] = {}
     fitted_keys: set = set()
@@ -2348,14 +2349,14 @@ def apply_height_prior_bottom_fit(
                 diagnostics["skipped_no_points"] += 1
                 continue
             bottom_gap = float(np.min(inside_z)) + dz / 2.0
-            if not (1e-6 < bottom_gap <= max_gap):
-                diagnostics["skipped_gap_out_of_range"] += 1
+            if bottom_gap <= 1e-6:
+                diagnostics["skipped_not_fittable"] += 1
                 continue
             top = z + dz / 2.0
             new_bottom = z + float(np.min(inside_z))
             new_height = top - new_bottom
-            if new_height <= 0.0:
-                diagnostics["skipped_gap_out_of_range"] += 1
+            if new_height < min_height:
+                diagnostics["skipped_height_floor"] += 1
                 continue
             box[2] = float((top + new_bottom) / 2.0)
             box[5] = float(new_height)

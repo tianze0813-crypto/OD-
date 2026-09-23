@@ -293,7 +293,7 @@ class Step45RetrackTest(unittest.TestCase):
         self.assertTrue(frames_input[0]["detections"][0].get(
             "_step45_height_prior_bottom_fitted"))
 
-    def test_height_prior_bottom_fit_skips_gap_over_limit(self):
+    def test_height_prior_bottom_fit_skips_height_floor(self):
         frames_input = frames([[det("Car", 0.0, 0.0, 1)]])
         box = frames_input[0]["detections"][0]["box_lidar"]
         box[2] = 1.0
@@ -301,15 +301,33 @@ class Step45RetrackTest(unittest.TestCase):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "lidar" / "lidar_top").mkdir(parents=True)
-            points = np.asarray([[0.0, 0.0, 0.40, 1.0]], dtype=np.float32)
+            points = np.asarray([[0.0, 0.0, 0.50, 1.0]], dtype=np.float32)
             points.tofile(root / "lidar" / "lidar_top" /
                          f"{frames_input[0]['frame_id']}.bin")
             diagnostics, changed = apply_height_prior_bottom_fit(
                 frames_input, root, Step45Config())
         self.assertEqual(diagnostics["fitted_boxes"], 0)
-        self.assertEqual(diagnostics["skipped_gap_out_of_range"], 1)
+        self.assertEqual(diagnostics["skipped_height_floor"], 1)
         self.assertEqual(len(changed), 0)
         self.assertAlmostEqual(box[5], 1.70, places=6)
+
+    def test_height_prior_bottom_fit_allows_exact_min_height(self):
+        frames_input = frames([[det("Car", 0.0, 0.0, 1)]])
+        box = frames_input[0]["detections"][0]["box_lidar"]
+        box[2] = 1.0
+        box[5] = 1.70
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "lidar" / "lidar_top").mkdir(parents=True)
+            points = np.asarray([[0.0, 0.0, 0.45, 1.0]], dtype=np.float32)
+            points.tofile(root / "lidar" / "lidar_top" /
+                         f"{frames_input[0]['frame_id']}.bin")
+            diagnostics, changed = apply_height_prior_bottom_fit(
+                frames_input, root, Step45Config())
+        self.assertEqual(diagnostics["fitted_boxes"], 1)
+        self.assertEqual(len(changed), 1)
+        self.assertAlmostEqual(box[5], 1.40, places=6)
+        self.assertAlmostEqual(box[2], 1.15, places=6)
 
     def test_weak_moving_seed_accepts_short_start(self):
         config = Step45Config()
