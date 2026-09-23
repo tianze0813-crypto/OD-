@@ -268,6 +268,14 @@ def _summarize_shared_stage(step2_diag: Path, step45_diag: Path) -> Dict[str, An
                             "voted_tracks", "ambiguous_tracks",
                             "flipped_detections")
             },
+            "height_prior_bottom_fit": {
+                key: d45.get("height_prior_bottom_fit", {}).get(key)
+                for key in ("enabled", "reference_height_m",
+                            "height_tolerance_m", "max_bottom_gap_m",
+                            "candidate_boxes", "fitted_boxes",
+                            "skipped_no_points",
+                            "skipped_gap_out_of_range")
+            },
         })
     return summary
 

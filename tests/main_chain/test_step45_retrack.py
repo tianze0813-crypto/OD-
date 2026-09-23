@@ -16,6 +16,7 @@ from region.retrack import (
     _lateral_jump_ok,
     _movement_compatible,
     align_dynamic_yaw,
+    apply_height_prior_bottom_fit,
     apply_slot_static_yaw_vote,
     build_region,
     candidate_track_ids,
@@ -267,6 +268,48 @@ class Step45RetrackTest(unittest.TestCase):
         self.assertTrue(all(
             frame["detections"][1]["box_lidar"][6] == 0.0
             for frame in source))
+
+    def test_height_prior_bottom_fit_keeps_top_and_shrinks_bottom(self):
+        frames_input = frames([[det("Car", 0.0, 0.0, 1)]])
+        box = frames_input[0]["detections"][0]["box_lidar"]
+        box[2] = 1.0
+        box[5] = 1.70
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "lidar" / "lidar_top").mkdir(parents=True)
+            points = np.asarray([
+                [0.0, 0.0, 0.30, 1.0],
+                [0.5, 0.5, 0.50, 1.0],
+            ], dtype=np.float32)
+            points.tofile(root / "lidar" / "lidar_top" /
+                         f"{frames_input[0]['frame_id']}.bin")
+            diagnostics, changed = apply_height_prior_bottom_fit(
+                frames_input, root, Step45Config())
+        self.assertEqual(diagnostics["candidate_boxes"], 1)
+        self.assertEqual(diagnostics["fitted_boxes"], 1)
+        self.assertEqual(len(changed), 1)
+        self.assertAlmostEqual(box[5], 1.55, places=6)
+        self.assertAlmostEqual(box[2], 1.075, places=6)
+        self.assertTrue(frames_input[0]["detections"][0].get(
+            "_step45_height_prior_bottom_fitted"))
+
+    def test_height_prior_bottom_fit_skips_gap_over_limit(self):
+        frames_input = frames([[det("Car", 0.0, 0.0, 1)]])
+        box = frames_input[0]["detections"][0]["box_lidar"]
+        box[2] = 1.0
+        box[5] = 1.70
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "lidar" / "lidar_top").mkdir(parents=True)
+            points = np.asarray([[0.0, 0.0, 0.40, 1.0]], dtype=np.float32)
+            points.tofile(root / "lidar" / "lidar_top" /
+                         f"{frames_input[0]['frame_id']}.bin")
+            diagnostics, changed = apply_height_prior_bottom_fit(
+                frames_input, root, Step45Config())
+        self.assertEqual(diagnostics["fitted_boxes"], 0)
+        self.assertEqual(diagnostics["skipped_gap_out_of_range"], 1)
+        self.assertEqual(len(changed), 0)
+        self.assertAlmostEqual(box[5], 1.70, places=6)
 
     def test_weak_moving_seed_accepts_short_start(self):
         config = Step45Config()

@@ -24,6 +24,7 @@ from region.dynamic_region import DynamicRegionConfig
 from region.retrack import (
     Step45Config,
     align_dynamic_yaw,
+    apply_height_prior_bottom_fit,
     apply_slot_static_yaw_vote,
     build_region,
     collect_world_tracks,
@@ -162,6 +163,13 @@ def run(step4_json: Path, clip: Path, step2_diagnostics: Path,
         frames, coords, step2, config)
     if slot_yaw_vote_keys:
         exempt_keys = set(exempt_keys) | set(slot_yaw_vote_keys)
+    # 【改动 2026-09-23】step4.5 末尾：高度约等于 1.70m 的 Car，复刻 SUST
+    # 双击侧视图下边界的 auto-shrink（车顶固定、框底贴框内最低点）；
+    # 只处理 lidar_top 点云，0 < 底边上移量 <= 0.20m 才动。
+    bottom_fit_diag, bottom_fit_keys = apply_height_prior_bottom_fit(
+        frames, Path(clip), config)
+    if bottom_fit_keys:
+        exempt_keys = set(exempt_keys) | set(bottom_fit_keys)
     static_freeze = verify_static_freeze(
         before_step45, frames, exempt_keys)
 
@@ -212,6 +220,7 @@ def run(step4_json: Path, clip: Path, step2_diagnostics: Path,
         "dynamic_yaw_alignment": yaw_diagnostics,
         "yaw_reversal": yaw_reversal_diag,
         "slot_static_yaw_vote": slot_yaw_vote_diag,
+        "height_prior_bottom_fit": bottom_fit_diag,
         "static_freeze": static_freeze,
         "final_detections": sum(
             len(frame.get("detections", [])) for frame in frames),

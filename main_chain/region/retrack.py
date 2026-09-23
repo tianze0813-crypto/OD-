@@ -86,6 +86,13 @@ class Step45Config:
     slot_yaw_vote_enabled: bool = True
     slot_yaw_vote_min_votes: int = 4
     slot_yaw_vote_min_margin: float = 0.15
+    # 【改动 2026-09-23】step4.5 末尾：对高度约等于高先验 1.70m 的 Car，
+    # 复刻 SUST 双击侧视图下边界 auto-shrink：车顶不动，框底贴到框内最低点；
+    # 只有底边上移量 0 < gap <= 0.20m 才动，没有点 / fit 不动就 no-op。
+    height_prior_bottom_fit_enabled: bool = True
+    height_prior_bottom_fit_height_m: float = 1.70
+    height_prior_bottom_fit_tol_m: float = 0.02
+    height_prior_bottom_fit_max_m: float = 0.20
     # Moving seed / pure static classification (PLAN section 19).
     moving_seed_net_min_m: float = 8.0
     moving_seed_concentration_min: float = 0.5
@@ -2254,6 +2261,116 @@ def apply_slot_static_yaw_vote(
                     "flipped_observations": int(track_flipped),
                 })
     return diagnostics, changed_keys
+
+
+def _load_lidar_top_xyz(clip: Path, frame_id: str) -> Optional[np.ndarray]:
+    path = Path(clip) / "lidar" / "lidar_top" / f"{frame_id}.bin"
+    if not path.is_file():
+        return None
+    values = np.fromfile(path, dtype=np.float32)
+    if values.size % 4 != 0:
+        return None
+    return values.reshape(-1, 4)[:, :3]
+
+
+def apply_height_prior_bottom_fit(
+        frames: List[Dict[str, Any]],
+        clip: Path,
+        config: Step45Config,
+) -> Tuple[Dict[str, Any], set]:
+    """对高度约等于高先验 1.70m 的 Car 复刻 SUST 双击侧视图下边界的 fit。
+
+    SUST 参考实现：``public/js/side_view_op.js`` 的 ``on_y_auto_shrink`` /
+    ``on_x_auto_shrink`` -> ``auto_shrink(extreme, {z:-1})``；仅取
+    ``lidar/lidar_top/<frame>.bin`` 中落在当前 box 内的点，车顶保持不动，
+    下边界贴到框内最低点。只有底边上移量 ``0 < gap <= 0.20m`` 才动。
+    """
+    diagnostics: Dict[str, Any] = {
+        "enabled": bool(getattr(config, "height_prior_bottom_fit_enabled", True)),
+        "policy": "sust_double_click_bottom_auto_shrink_top_fixed",
+        "reference_height_m": float(getattr(
+            config, "height_prior_bottom_fit_height_m", 1.70)),
+        "height_tolerance_m": float(getattr(
+            config, "height_prior_bottom_fit_tol_m", 0.02)),
+        "max_bottom_gap_m": float(getattr(
+            config, "height_prior_bottom_fit_max_m", 0.20)),
+        "candidate_boxes": 0,
+        "fitted_boxes": 0,
+        "skipped_no_points": 0,
+        "skipped_gap_out_of_range": 0,
+        "missing_lidar_frames": 0,
+        "details": [],
+    }
+    if not diagnostics["enabled"]:
+        return diagnostics, set()
+
+    target_height = diagnostics["reference_height_m"]
+    tolerance = diagnostics["height_tolerance_m"]
+    max_gap = diagnostics["max_bottom_gap_m"]
+    clip = Path(clip)
+    point_cache: Dict[str, Optional[np.ndarray]] = {}
+    fitted_keys: set = set()
+
+    for frame_index, frame in enumerate(frames):
+        frame_id = str(frame["frame_id"])
+        if frame_id not in point_cache:
+            point_cache[frame_id] = _load_lidar_top_xyz(clip, frame_id)
+        points = point_cache[frame_id]
+        if points is None:
+            diagnostics["missing_lidar_frames"] += 1
+            continue
+        for detection_index, det in enumerate(frame.get("detections", [])):
+            if str(det.get("class_name", "")) != "Car":
+                continue
+            box = det.get("box_lidar")
+            if not isinstance(box, list) or len(box) < 7:
+                continue
+            dz = float(box[5])
+            if abs(dz - target_height) > tolerance:
+                continue
+            diagnostics["candidate_boxes"] += 1
+            x, y, z, dx, dy, _dz, yaw = (float(value) for value in box[:7])
+            if dx <= 0.0 or dy <= 0.0 or dz <= 0.0:
+                diagnostics["skipped_no_points"] += 1
+                continue
+            # 世界/雷达 z 轴就是 box 竖轴；yaw-only 下只做 2D 旋转到 box local。
+            cosine, sine = math.cos(yaw), math.sin(yaw)
+            px = points[:, 0] - x
+            py = points[:, 1] - y
+            local_x = cosine * px + sine * py
+            local_y = -sine * px + cosine * py
+            local_z = points[:, 2] - z
+            mask = ((np.abs(local_x) <= dx / 2.0 + 0.01)
+                    & (np.abs(local_y) <= dy / 2.0 + 0.01)
+                    & (np.abs(local_z) <= dz / 2.0 + 0.01))
+            inside_z = local_z[mask]
+            if inside_z.size == 0:
+                diagnostics["skipped_no_points"] += 1
+                continue
+            bottom_gap = float(np.min(inside_z)) + dz / 2.0
+            if not (1e-6 < bottom_gap <= max_gap):
+                diagnostics["skipped_gap_out_of_range"] += 1
+                continue
+            top = z + dz / 2.0
+            new_bottom = z + float(np.min(inside_z))
+            new_height = top - new_bottom
+            if new_height <= 0.0:
+                diagnostics["skipped_gap_out_of_range"] += 1
+                continue
+            box[2] = float((top + new_bottom) / 2.0)
+            box[5] = float(new_height)
+            det["_step45_height_prior_bottom_fitted"] = True
+            fitted_keys.add((frame_index, detection_index))
+            diagnostics["fitted_boxes"] += 1
+            if len(diagnostics["details"]) < 200:
+                diagnostics["details"].append({
+                    "track_id": det.get("track_id"),
+                    "frame_id": frame_id,
+                    "old_height_m": round(float(dz), 4),
+                    "new_height_m": round(float(new_height), 4),
+                    "bottom_gap_m": round(float(bottom_gap), 4),
+                })
+    return diagnostics, fitted_keys
 
 
 def _final_trajectory_heading(
