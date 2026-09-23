@@ -41,8 +41,9 @@ from pipeline.hybrid_merge import merge_label_frames
 DEFAULT_OUTPUT_ROOT = Path.home() / "SUSTechPOINTS" / "data"
 NONCAR_CFG = ROOT / "models" / "voxelnext_fiveclass_nuscenes_infer.yaml"
 # Final production non-Car weight: VOD 2-class fine-tune, epoch 12
-# (checkpoint stores epoch 6).  The older expD_e8.pth remains available via
-# --noncar-ckpt but is no longer the default.
+# (checkpoint stores epoch 6).  The older expD_e8.pth is no longer the default
+# and was archived to bak/models-unused/ (2026-09-23 cleanup); pass an explicit
+# path via --noncar-ckpt if you need it back.
 NONCAR_CKPT = ROOT / "models" / "vod_2cls_ft_e12.pth"
 # 【改动】三条链各自的权重/配置
 TRUCK_CFG = ROOT / "models" / "voxelnext_truck_infer.yaml"
@@ -799,7 +800,7 @@ def main() -> int:
     parser.add_argument("--noncar-cfg", type=Path, default=NONCAR_CFG,
                         help="non-Car inference config (default: expD config)")
     parser.add_argument("--noncar-ckpt", type=Path, default=NONCAR_CKPT,
-                        help="non-Car checkpoint (default: expD_e8.pth)")
+                        help="non-Car checkpoint (default: models/vod_2cls_ft_e12.pth)")
     parser.add_argument("--chains", type=str, default=",".join(DEFAULT_CHAINS),
                         help="要跑的链，逗号分隔；默认 car+truck 合成一条车链跑完再跑 vru；"
                              "可选 car,truck,vru,noncar（noncar=旧五类单链）。"
