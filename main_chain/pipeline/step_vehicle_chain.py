@@ -13,6 +13,7 @@ Car 与 Truck 都改用同一份 BEVFusion 原始检测，**动静态区域（�
     step4（Car）       轿车尺寸闸门（车链里由 truck 头出 Truck，这里关掉 Car→Truck 改写）
     step4.5（共享）    动态区域（高速证据）+ 区域 mask + 运动-only 重跟踪 + ID 继承 +
                        队列/相位拼接 —— 并集上跑一次
+    step5a（Car）      静态 slot Car 的内部空洞补帧（世界系叠框，只新增检测）
     step5（Car）       终检（点数/短链）+ Car-only + box 转 base_link
 
 Truck 的几何由 BEVFusion 原值交给自己那条链（step2_5 / step3_refinement / truck_postprocess）
@@ -22,6 +23,7 @@ Truck 的几何由 BEVFusion 原值交给自己那条链（step2_5 / step3_refin
 输出（work_root 下）：
     <clip>_step2.json / _step2_diagnostics.json
     <clip>_step45.json / _step45_diagnostics.json     ← 共用 id 的并集（Truck 几何待还原）
+    <clip>_step5a.json / _step5a_diagnostics.json     ← 并集 + 补出来的静态 slot Car 框
     <clip>_car.json / _car_diagnostics.json           ← Car-only，base_link，可直接写 label
 """
 from __future__ import annotations
@@ -41,6 +43,7 @@ from pipeline import step2_identity_class_filter_yaw as step2      # noqa: E402
 from pipeline import step3_car_box_fit as step3                    # noqa: E402
 from pipeline import step4_car_size_filter as step4                # noqa: E402
 from pipeline import step4_5_region_phase_retrack as step45        # noqa: E402
+from pipeline import step5a_slot_gap_fill as step5a                # noqa: E402
 from pipeline import step5_class_motion_filter as step5            # noqa: E402
 
 from classification.class_refinement import ClassRefinementConfig  # noqa: E402
@@ -50,6 +53,7 @@ from filtering.hard_filters import HardFilterConfig                # noqa: E402
 from geometry.car_box_fit import CarBoxFitConfig                    # noqa: E402
 from geometry.static_yaw import StaticYawConfig                     # noqa: E402
 from geometry.yaw_vehicle_dynamic import YawVehicleDynamicConfig    # noqa: E402
+from pipeline.step5a_slot_gap_fill import Step5aConfig             # noqa: E402
 from region.retrack import Step45Config                             # noqa: E402
 from tracking import tracker_conservative as tracking              # noqa: E402
 
@@ -67,6 +71,11 @@ DEFAULTS: Dict[str, Any] = dict(
     car_size_truck_length_min=6.0,
     car_sparsity_max_points=5,
     car_short_track_max_frames=3,
+    # ---- step5a：静态 slot Car 内部空洞补帧（默认开；上限默认不限 = "全补"）----
+    step5a_enabled=True,
+    step5a_min_points_in_box=6,
+    step5a_max_hole_frames=None,
+    step5a_max_fills_per_track=None,
 )
 
 
@@ -240,8 +249,21 @@ def run(raw_json: Path, clip: Path, work_root: Path, *,
         config=Step45Config(settle_static_yaw_enabled=(settle_mode in ("step45", "step45-axis")),
                             settle_write_axis=(settle_mode == "step45")))
 
+    # ---- step5a：静态 slot Car 的内部空洞补帧（并集上跑一次，只新增 Car 检测）----
+    step5a_json = work_root / f"{base}_step5a.json"
+    step5a_diag = work_root / f"{base}_step5a_diagnostics.json"
+    step5a_diagnostics = step5a.run(
+        step45_json, clip, step2_diag, step5a_json, step5a_diag,
+        config=Step5aConfig(
+            enabled=bool(params["step5a_enabled"]),
+            min_points_in_box=int(params["step5a_min_points_in_box"]),
+            max_hole_frames=(None if params["step5a_max_hole_frames"] is None
+                             else int(params["step5a_max_hole_frames"])),
+            max_fills_per_track=(None if params["step5a_max_fills_per_track"] is None
+                                 else int(params["step5a_max_fills_per_track"]))))
+
     # ---- step5：Car 终检 + base_link ----
-    tracked = json.loads(step45_json.read_text(encoding="utf-8"))
+    tracked = json.loads(step5a_json.read_text(encoding="utf-8"))
     car_tracked_json = work_root / f"{base}_car_tracked.json"
     car_tracked_json.write_text(
         json.dumps(_select_class(tracked, "Car"), ensure_ascii=False) + "\n",
@@ -262,11 +284,24 @@ def run(raw_json: Path, clip: Path, work_root: Path, *,
         "union_step4_json": str(union_step4_json),
         "step45_json": str(step45_json),
         "step45_diagnostics": str(step45_diag),
+        "step5a_json": str(step5a_json),
+        "step5a_diagnostics": str(step5a_diag),
         "car_json": str(car_json),
         "car_diagnostics": str(car_diag),
         "car_yaw_settle_mode": settle_mode,
         "union_detections": union_count,
         "car_boxes_merged": replaced,
+        "car_step5a": {
+            "candidate_slots": step5a_diagnostics.get("candidate_slots"),
+            "inserted_detections": step5a_diagnostics.get(
+                "inserted_detections"),
+            "before_detections": step5a_diagnostics.get("before_detections"),
+            "after_detections": step5a_diagnostics.get("after_detections"),
+            "skip_reason_counts": step5a_diagnostics.get(
+                "skip_reason_counts"),
+            "append_only_passed": step5a_diagnostics.get(
+                "append_only_check", {}).get("passed"),
+        },
         "car_step5": {
             "before": step5_result.get("before_detections"),
             "after": step5_result.get("after_detections"),
@@ -303,6 +338,14 @@ def main() -> None:
                              "settle 只做 π）；step2（旧行为：static_yaw 写轴 + 方向投票都在 step2）")
     parser.add_argument("--car-size-relabel", action="store_true",
                         help="按尺寸把大 Car 改写成 Truck（车链默认关，Truck 由 truck 头负责）")
+    parser.add_argument("--no-step5a", action="store_true",
+                        help="关闭 step5a 静态 slot Car 补帧（默认开）")
+    parser.add_argument("--step5a-min-points-in-box", type=int, default=6,
+                        help="step5a 返还门槛：补框内点数需 >= 该值（默认 6，与 step5 口径对齐）")
+    parser.add_argument("--step5a-max-hole-frames", type=int, default=None,
+                        help="step5a 单洞长度上限（默认不限 = 全补）")
+    parser.add_argument("--step5a-max-fills-per-track", type=int, default=None,
+                        help="step5a 每条轨迹补帧总量上限（默认不限 = 全补）")
     args = parser.parse_args()
     result = run(
         args.raw_json, args.clip, args.work_root,
@@ -314,7 +357,11 @@ def main() -> None:
         range_side=args.range_side,
         car_size_relabel=bool(args.car_size_relabel),
         static_rigid=bool(args.static_rigid),
-        car_yaw_settle=args.car_yaw_settle)
+        car_yaw_settle=args.car_yaw_settle,
+        step5a_enabled=not bool(args.no_step5a),
+        step5a_min_points_in_box=args.step5a_min_points_in_box,
+        step5a_max_hole_frames=args.step5a_max_hole_frames,
+        step5a_max_fills_per_track=args.step5a_max_fills_per_track)
     print(json.dumps({k: v for k, v in result.items() if k != "params"},
                      ensure_ascii=False, indent=2))
 

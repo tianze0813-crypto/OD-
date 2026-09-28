@@ -29,7 +29,8 @@
 可把它们保留在 `--work-root`（默认 `work/end_to_end`）下，便于逐步归因。
 
 端到端脚本的有效链路如下，Step4 已完成 Car-only，Step4.5 只在动态区域内
-重做 only-car 跟踪 / ID 继承 / 方向级相位拼接，Step5 做最终过滤与导出：
+重做 only-car 跟踪 / ID 继承 / 方向级相位拼接，Step5a 给静态 slot 上的 Car
+补内部空洞，Step5 做最终过滤与导出：
 
 ```text
 原始 clip
@@ -43,9 +44,43 @@
               -> ID 继承 + 槽位释放检查
               -> 方向级四相位感知拼接
               -> 动态段第二遍 box fit
+  -> step5a 静态 slot Car 的内部空洞补帧（世界系叠框，只新增检测）
   -> step5 最终点数/短链过滤 + Car-only 兜底 + box 转换到 base_link
   -> SUST clip
 ```
+
+## Step 5A：静态 slot Car 的内部空洞补帧
+
+`pipeline/step5a_slot_gap_fill.py`，跑在 step4.5 之后、step5 之前，输入是 step4.5 的
+**并集**帧表，输出 `<clip>_step5a.json`（并集 + 补出来的 Car 框）与诊断。
+
+口径（用户 2026-09-23 定稿）：
+
+| 项 | 口径 |
+| --- | --- |
+| 候选 | step2 `tracking.slot_details` 里 `class_name == "Car"` 的轨迹，且全部检测 `region=='static'`、无 `_step45_retracked` |
+| 候选帧 | 该轨迹首末观测**之间**的缺口（内部洞）；端点外不外延；默认**全补**（不限单洞长度 / 每轨迹补帧数） |
+| 出框 | **纯框叠**：世界中心 = 观测帧世界中心中位；尺寸/高度 = 逐帧拟合框中位；yaw = step2 `target_world_yaw`（`direction_flip` +π），缺失回退该轨迹 world yaw 环中位 |
+| 返还门槛 | 该帧有 `lidar_top` bin，且世界框投回该帧 lidar 系后框内点数 **≥ 6**（与 step5 `count <= 5` 删除口径对齐） |
+| 守卫 | ① 洞两侧邻居世界中心差 < 1.0 m 且轴一致（30°）；② 同帧已有 Car/Truck 与补框 BEV IoU > 0.02 → 跳过 |
+| 写入 | 只新增：`_step5a_filled=true`、`region="static"`、`score=0.0`、`visibility` 取相邻帧该目标的深拷贝；不写 `velocity` |
+| 自检 | `append_only_check`：已有检测/框一字不改、新增项必须带标记、同帧 `track_id` 唯一 |
+
+阈值都在 `Step5aConfig`；命令行（单独跑）：
+
+```bash
+/home/moga/miniconda3/envs/openpcdet/bin/python pipeline/step5a_slot_gap_fill.py \
+  --step45-json work/.../<clip>_step45.json \
+  --clip /path/to/<clip> \
+  --step2-diagnostics work/.../<clip>_step2_diagnostics.json \
+  --out-json work/.../<clip>_step5a.json \
+  --min-points-in-box 6
+```
+
+开关：车链默认开；`pipeline/vehicle_pass.py --no-step5a` /
+`main_chain/pipeline/step_vehicle_chain.py --no-step5a` 关闭；
+`--step5a-min-points-in-box` / `--step5a-max-hole-frames` /
+`--step5a-max-fills-per-track` 可调。
 
 ## 坐标系与 base_link 约定
 
@@ -399,7 +434,7 @@ tracking/        保守跟踪器 + 静态优先跟踪器
 geometry/        Step2 yaw，Step3 Car box 与地面/车顶拟合
 region/          动态区域、区域 mask、方向级四相位、step4.5 重跟踪/ID 继承
 inference/       Step1 OpenPCDet 推理脚本
-pipeline/        step1、step2、step3、step4、step4.5、step5 主链路；step6 为兼容入口
+pipeline/        step1、step2、step3、step4、step4.5、step5a、step5 主链路；step6 为兼容入口
 archive/         不再参与当前链路的旧版本/旧预览文件
 tests/           当前链路的单元测试
 models/          推理配置与模型权重

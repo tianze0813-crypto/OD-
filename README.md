@@ -90,6 +90,7 @@ hybrid_run.sh                                   挑 openpcdet 环境的 python�
    │   │     step4（Car）   轿车尺寸闸门
    │   │     step4.5（共享）动态区域 + 区域 mask + 运动-only 重跟踪 + ID 继承
    │   │                  + 队列/相位拼接 + 动态段第二遍 box fit + π 等价翻转
+   │   │     step5a（Car）  静态 slot Car 的内部空洞补帧（世界系叠框，只新增检测）
    │   │     step5（Car）   终检（点数/短链）+ 转 base_link
    │   ├─ Truck 几何还原      vehicle_pass.restore_geometry（只还原 Truck/Trailer 的 box）
    │   └─ Truck 分支         step2_5 -> step3_refinement（yaw v2 + Truck 几何）
@@ -101,7 +102,7 @@ hybrid_run.sh                                   挑 openpcdet 环境的 python�
    └─ scripts/run_hybrid_prelabel.py::_merge_chain_labels  三条链按 frame_id 合成一份 label/
 ```
 
-> ⚠️ `main_chain/` 不是历史残留：Car 的 step2~step5 就是那份代码（子进程、独立 `sys.path`）。
+> ⚠️ `main_chain/` 不是历史残留：Car 的 step2~step5（含 step5a）就是那份代码（子进程、独立 `sys.path`）。
 > 它和仓库根目录下的 `geometry / filtering / tracking / classification` **已经分叉**，两棵都要留。
 > 详见 `main_chain/README.md`。
 
@@ -208,6 +209,35 @@ pytest tests/root
 
 依赖：`/home/moga/miniconda3/envs/openpcdet/bin/python -m pytest`（环境里装了 ROS 的 pytest
 插件，`pytest.ini` 里已经把它们关掉了，否则收集阶段就会报错）。
+
+---
+
+## Car step5a：静态 slot 内部空洞补帧（2026-09-23 新增，默认开）
+
+缺陷：停在 slot 上的车偶尔会被检测器漏掉一两帧，轨迹中间出现空洞 → 标注残缺
+（实测 clip9 的 `track 1` 观测 78/80 帧，恰好缺第 65/66 帧）。
+step5a 在 **step4.5 与 step5 之间**、在**并集帧表**上跑一次：
+
+* 只补 **Car**，且只补「step2 绑定了静态 slot（`tracking.slot_details.class_name == "Car"`）、
+  全部检测 `region=='static'`、未被 `_step45_retracked`」的轨迹；
+* 只补该轨迹**首末观测之间**的内部洞（端点外不外延）；默认**全补**（单洞长度 / 每轨迹
+  补帧总量都不限，`Step5aConfig.max_hole_frames` / `max_fills_per_track` 可收）；
+* 出一个 box 的方式是**纯框叠**（不做点云叠帧拟合，保证与相邻帧一致）：
+  世界中心 = 观测帧世界中心中位数（z 一起带）、尺寸/高度 = 逐帧拟合框 dx/dy/dz 中位数、
+  yaw = step2 `static_yaw_stabilization.slots[].target_world_yaw`（`direction_flip` 则 +π，
+  缺失时回退该轨迹 world yaw 的环中位）；
+* 返还门槛：该帧必须有 `lidar/lidar_top/<frame_id>.bin`，且世界框投回该帧 lidar 系后
+  **框内点数 ≥ 6**（与 step5 的 `count <= 5` 删除口径对齐，补了不会被删）；
+* 守卫：洞两侧邻居世界中心一致（<1.0 m）且轴一致；该帧已有别的 Car/Truck 与补框
+  BEV IoU > 0.02 则跳过；
+* **只新增**检测（`_step5a_filled: true`、`region="static"`、`score=0.0`、
+  `visibility` 取相邻帧该目标的深拷贝），step4.5 已定稿的检测一字不改
+  （自检 `append_only_check`）；
+* 开关：入口默认开，`--no-step5a` 关；`--step5a-min-points-in-box` /
+  `--step5a-max-hole-frames` / `--step5a-max-fills-per-track` 可调。
+* 实测 clip9：候选 slot 5 个（3 个因 `region=='dynamic'` 排除），补 38 框
+  （`track 1` +2、`track 5` +36；8 帧因点数不足跳过），step5 一点没删；
+  关掉 step5a 重跑同一 clip，`car.json` 逐帧逐框比对 = 只多出这 38 框、已有框零改动。
 
 ---
 

@@ -476,7 +476,12 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
              # 【改动】车链过程诊断（槽位/动态区域/…）默认不落盘；调试时才写进输出目录
              keep_vehicle_diagnostics: bool = False,
              static_rigid: bool = False,
-             car_yaw_settle: str = "step45") -> Dict[str, Any]:
+             car_yaw_settle: str = "step45",
+             # 【改动】2026-09-23 step5a：静态 slot Car 内部空洞补帧（默认开）
+             step5a_enabled: bool = True,
+             step5a_min_points_in_box: int = 6,
+             step5a_max_hole_frames: int | None = None,
+             step5a_max_fills_per_track: int | None = None) -> Dict[str, Any]:
     base = clip.name
     tag = output_tag.strip("_-")
     # 【改动】已经是 <clip>_pre 的输入 -> output_name == base：重跑就地覆盖，
@@ -567,6 +572,10 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
                 trailer_policy=str(trailer_policy),
                 static_rigid=bool(static_rigid),
                 car_yaw_settle=str(car_yaw_settle),
+                step5a_enabled=bool(step5a_enabled),
+                step5a_min_points_in_box=int(step5a_min_points_in_box),
+                step5a_max_hole_frames=step5a_max_hole_frames,
+                step5a_max_fills_per_track=step5a_max_fills_per_track,
                 class_score_thresholds={
                     "Car": 0.2,
                     "Truck": 0.2,
@@ -844,6 +853,14 @@ def main() -> int:
                         help="Car 静态 yaw 落定位置：step45（默认，B1）；step45-axis；step2（旧行为）")
     parser.add_argument("--static-rigid", action="store_true",
                         help="【改动】静态 Car 轨迹叠帧拟一个刚性 box 固定在世界系（默认关）")
+    parser.add_argument("--no-step5a", action="store_true",
+                        help="【改动】关掉 step5a 静态 slot Car 内部空洞补帧（默认开）")
+    parser.add_argument("--step5a-min-points-in-box", type=int, default=6,
+                        help="step5a 补框内点数门槛（默认 6，与 step5 的 count<=5 删除口径对齐）")
+    parser.add_argument("--step5a-max-hole-frames", type=int, default=None,
+                        help="step5a 单洞长度上限（默认不限 = 全补）")
+    parser.add_argument("--step5a-max-fills-per-track", type=int, default=None,
+                        help="step5a 每条轨迹补帧总量上限（默认不限 = 全补）")
     parser.add_argument("--keep-vehicle-diagnostics", action="store_true",
                         help="【改动】把车链过程诊断 vehicle_pass_diagnostics.json 写进输出 clip"
                              "（默认不写，只调试用）")
@@ -1026,6 +1043,10 @@ def main() -> int:
             trailer_merge_iou=args.trailer_merge_iou,
             trailer_policy=args.trailer_policy,
             static_rigid=bool(args.static_rigid),
+            step5a_enabled=not bool(args.no_step5a),
+            step5a_min_points_in_box=int(args.step5a_min_points_in_box),
+            step5a_max_hole_frames=args.step5a_max_hole_frames,
+            step5a_max_fills_per_track=args.step5a_max_fills_per_track,
             keep_vehicle_diagnostics=bool(args.keep_vehicle_diagnostics),
             vru_cfg=vru_cfg,
             vru_ckpt=vru_ckpt,

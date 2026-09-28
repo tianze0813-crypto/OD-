@@ -80,6 +80,11 @@ DEFAULTS: Dict[str, Any] = dict(
     trailer_policy="to-truck",       # 标注侧没有 Trailer -> 一律并成 Truck
     # ---- Car 几何：静态刚性框（OD-main-0909 同步；默认关）----
     static_rigid=False,
+    # ---- Car step5a：静态 slot 内部空洞补帧（默认开；上限默认不限 = "全补"）----
+    step5a_enabled=True,
+    step5a_min_points_in_box=6,
+    step5a_max_hole_frames=None,
+    step5a_max_fills_per_track=None,
     # ---- Car 静态 yaw 落定位置（2026-09-23 定为 step45 = B1）----
     # step45      : static_yaw 只算/导出，几何跑 detector 原生局部系；轴+方向由 step4.5
     #               settle 在几何之后写入（几何与 yaw 修正解耦）
@@ -450,6 +455,17 @@ def run(raw_json: Path, clip: Path, work_root: Path,
                "--car-yaw-settle", str(params["car_yaw_settle"])]
     if params.get("static_rigid"):
         command.append("--static-rigid")
+    if not params.get("step5a_enabled", True):
+        command.append("--no-step5a")
+    else:
+        command += ["--step5a-min-points-in-box",
+                    str(int(params["step5a_min_points_in_box"]))]
+        if params.get("step5a_max_hole_frames") is not None:
+            command += ["--step5a-max-hole-frames",
+                        str(int(params["step5a_max_hole_frames"]))]
+        if params.get("step5a_max_fills_per_track") is not None:
+            command += ["--step5a-max-fills-per-track",
+                        str(int(params["step5a_max_fills_per_track"]))]
     print("[vehicle-pass] $ " + " ".join(str(value) for value in command),
           flush=True)
     subprocess.run([str(value) for value in command], check=True)
@@ -466,6 +482,20 @@ def run(raw_json: Path, clip: Path, work_root: Path,
         if key in ("before_detections", "after_detections",
                    "point_filter_removed", "short_track_removed",
                    "car_only_removed")}
+
+    step5a_diag = steps_root / f"{base}_step5a_diagnostics.json"
+    if step5a_diag.is_file():
+        d5a = json.loads(step5a_diag.read_text(encoding="utf-8"))
+        diagnostics["car_step5a"] = {
+            key: d5a.get(key) for key in
+            ("candidate_slots", "inserted_detections", "before_detections",
+             "after_detections", "skip_reason_counts")}
+        diagnostics["car_step5a"]["tracks"] = [{
+            "track_id": entry["track_id"],
+            "observations": entry["observations"],
+            "holes": len(entry["hole_frames"]),
+            "fills": len(entry["fills"]),
+        } for entry in d5a.get("tracks", [])]
 
     # ---- 3b) 共享阶段的关键指标（槽位 / 动态区域只算一次，落进诊断便于核对）----
     diagnostics["shared_region"] = _summarize_shared_stage(
@@ -557,10 +587,23 @@ def main() -> None:
                         choices=["step2", "step45", "step45-axis"],
                         default=DEFAULTS["car_yaw_settle"],
                         help="Car 静态 yaw 落定位置（默认 step45 = B1）")
+    parser.add_argument("--no-step5a", action="store_true",
+                        help="关闭 step5a 静态 slot Car 补帧（默认开）")
+    parser.add_argument("--step5a-min-points-in-box", type=int,
+                        default=DEFAULTS["step5a_min_points_in_box"],
+                        help="step5a 补框内点数门槛（默认 6，与 step5 口径对齐）")
+    parser.add_argument("--step5a-max-hole-frames", type=int, default=None,
+                        help="step5a 单洞长度上限（默认不限 = 全补）")
+    parser.add_argument("--step5a-max-fills-per-track", type=int, default=None,
+                        help="step5a 每条轨迹补帧总量上限（默认不限 = 全补）")
     args = parser.parse_args()
     result = run(args.raw_json, args.clip, args.work_root, args.python,
                  args.diagnostics, trailer_policy=args.trailer_policy,
-                 car_yaw_settle=args.car_yaw_settle)
+                 car_yaw_settle=args.car_yaw_settle,
+                 step5a_enabled=not bool(args.no_step5a),
+                 step5a_min_points_in_box=args.step5a_min_points_in_box,
+                 step5a_max_hole_frames=args.step5a_max_hole_frames,
+                 step5a_max_fills_per_track=args.step5a_max_fills_per_track)
     if args.export:
         car = export_labels(result["car_frames"], args.clip, LABEL_SUBDIR_CAR,
                             CAR_ID_OFFSET)
@@ -569,7 +612,8 @@ def main() -> None:
         print(f"exported car={car} truck={truck}")
     print(json.dumps({k: v for k, v in result["diagnostics"].items()
                       if k in ("car_detections", "truck_detections",
-                               "final_detections", "output_classes")},
+                               "final_detections", "output_classes",
+                               "car_step5a")},
                      ensure_ascii=False, indent=2))
 
 
