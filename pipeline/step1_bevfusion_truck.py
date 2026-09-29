@@ -18,7 +18,9 @@
     BEVFUSION_ROOT    默认 <project>/bevfusion（配置/脚本/缓存都随项目走）
     BEVFUSION_PYTHON  默认 ~/miniconda3/envs/mmdet3d/bin/python（mmdet3d 环境）
     BEVFUSION_TRUCK_CFG / BEVFUSION_TRUCK_CKPT         C+L 配置/权重（默认 models/bevfusion_mmdet3d_lidarcam.pth）
-    BEVFUSION_TRUCK_LIDAR_CFG / ..._LIDAR_CKPT         纯雷达配置/权重（mode=lidar，默认）
+    BEVFUSION_TRUCK_LIDAR_CFG / ..._LIDAR_CKPT         纯雷达配置/权重（mode=lidar，默认）：
+        默认 = 交警域微调 ct2-A —— configs/police_bevfusion_mmdet3d_lidaronly_ct2roi.py +
+        models/ft_ct2_A_fulllr_epoch8.pth（可用环境变量指回官方 lidaronly 那套）
     MMDET3D_ROOT      mmdetection3d 源码位置（默认 ~/MMDetection/mmdetection3d 等常见位置）
 """
 from __future__ import annotations
@@ -45,11 +47,16 @@ BEVFUSION_CFG = os.environ.get("BEVFUSION_TRUCK_CFG",
 BEVFUSION_CKPT = os.environ.get(
     "BEVFUSION_TRUCK_CKPT", str(PROJECT_ROOT / "models" / "bevfusion_mmdet3d_lidarcam.pth"))
 BEVFUSION_Z = os.environ.get("BEVFUSION_TRUCK_Z", "center")
-# 纯雷达（lidar-only）权重：46MB，9.1 FPS，相机分支不参与 -> 不去畸变、不读图
+# 【改动·2026-09-29】纯雷达（lidar-only）默认换成交警域微调权重 ct2-A（epoch 8）：
+#   权重 models/ft_ct2_A_fulllr_epoch8.pth（car/truck 两类微调，5.7 万帧自动+人工数据）；
+#   配置 configs/police_bevfusion_mmdet3d_lidaronly_ct2roi.py（训练几何：侧向 ±50.4 /
+#   前进 80.4 / 后退 20.4，1344×1344 正方网格；与权重必须成对使用）。
+#   旧官方权重（bevfusion_mmdet3d_lidaronly.pth + 对称 ±54 配置）仍可用环境变量或
+#   --bev-cfg/--bev-ckpt 显式指回。
 BEVFUSION_LIDAR_CFG = os.environ.get(
-    "BEVFUSION_TRUCK_LIDAR_CFG", "configs/police_bevfusion_mmdet3d_lidaronly.py")
+    "BEVFUSION_TRUCK_LIDAR_CFG", "configs/police_bevfusion_mmdet3d_lidaronly_ct2roi.py")
 BEVFUSION_LIDAR_CKPT = os.environ.get(
-    "BEVFUSION_TRUCK_LIDAR_CKPT", str(PROJECT_ROOT / "models" / "bevfusion_mmdet3d_lidaronly.pth"))
+    "BEVFUSION_TRUCK_LIDAR_CKPT", str(PROJECT_ROOT / "models" / "ft_ct2_A_fulllr_epoch8.pth"))
 
 
 def validate_clip(clip: Path) -> None:

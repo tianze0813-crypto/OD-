@@ -68,7 +68,9 @@ DEFAULTS: Dict[str, Any] = dict(
     # ---- 车链共用（Car / Truck）----
     # 标注侧没有 Trailer：类别合并（跟踪前）之后，剩余纯挂车框在下一阶段直接并成 Truck
     keep_classes=("Car", "Truck"),
-    class_score_thresholds={"Car": 0.2, "Truck": 0.2, "Trailer": 0.25},
+    # 【改动·2026-09-29】默认按分类别分数门槛（用户拍板）：Car 0.1 / Truck 0.05。
+    # 这个值同时用于车链前段过滤 + 透传给 main_chain step2 的 --class-score-thresholds。
+    class_score_thresholds={"Car": 0.1, "Truck": 0.05, "Trailer": 0.25},
     range_front=80.0,
     range_rear=20.0,
     range_side=40.0,

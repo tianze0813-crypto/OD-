@@ -873,10 +873,10 @@ def main() -> int:
     parser.add_argument("--bev-ckpt", type=Path, default=None,
                         help="车链 BEVFusion lidar 权重（默认 models/bevfusion_mmdet3d_lidaronly.pth）")
     # 【改动】2026-09-29：车链 BEV 阶段分类别分数门槛（Car/Truck）
-    parser.add_argument("--vehicle-car-score-threshold", type=float, default=None,
-                        help="车链 Car 的 BEV 阶段分数门槛（默认 0.2）")
-    parser.add_argument("--vehicle-truck-score-threshold", type=float, default=None,
-                        help="车链 Truck 的 BEV 阶段分数门槛（默认 0.2）")
+    parser.add_argument("--vehicle-car-score-threshold", type=float, default=0.1,
+                        help="车链 Car 的分数门槛（BEV 阶段 + step2 硬过滤，默认 0.1）")
+    parser.add_argument("--vehicle-truck-score-threshold", type=float, default=0.05,
+                        help="车链 Truck 的分数门槛（BEV 阶段 + step2 硬过滤，默认 0.05）")
     # 【改动】2026-09-29：保留中间过程数据
     parser.add_argument("--keep-work-dir", type=Path, default=None,
                         help="非空则每个 clip 的全部中间过程数据落到 <该目录>/<clip名>/"
@@ -1024,10 +1024,11 @@ def main() -> int:
     if vehicle_chain:
         weights = ("models/bevfusion_mmdet3d_lidarcam.pth"
                    if args.truck_detector_mode == "fusion"
-                   else "models/bevfusion_mmdet3d_lidaronly.pth")
+                   else "models/ft_ct2_A_fulllr_epoch8.pth")   # 【改动】默认微调权重 ct2-A
         if args.bev_ckpt is not None:
             weights = str(args.bev_ckpt)
-        cfg_note = (f" cfg={args.bev_cfg}" if args.bev_cfg is not None else "")
+        cfg_note = (f" cfg={args.bev_cfg}" if args.bev_cfg is not None
+                    else " cfg=bevfusion/configs/police_bevfusion_mmdet3d_lidaronly_ct2roi.py")
         _print(f"chains={chains} | 车链 Car+Truck: detector=BEVFusion "
                f"mode={args.truck_detector_mode} weights={weights}{cfg_note} "
                f"(trailer_rules={not args.no_trailer_rules}, policy={args.trailer_policy}) "

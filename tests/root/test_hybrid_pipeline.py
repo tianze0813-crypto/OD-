@@ -217,7 +217,7 @@ class HybridPipelineTest(unittest.TestCase):
                     "truck_frames": [],
                     "diagnostics": {"car_detections": 1, "truck_detections": 0}}
 
-            def fake_bev(_python, _clip, work_root, _threshold, _mode):
+            def fake_bev(_python, _clip, work_root, _threshold, _mode, _cfg=None, _ckpt=None):
                 events.append("bev_raw")
                 work_root.mkdir(parents=True, exist_ok=True)
                 raw = work_root / "bev_raw.json"
@@ -275,7 +275,7 @@ class HybridPipelineTest(unittest.TestCase):
                     "truck_frames": [],
                     "diagnostics": {"car_detections": 1, "truck_detections": 0}}
 
-            def fake_bev(_python, _clip, work_root, _threshold, _mode):
+            def fake_bev(_python, _clip, work_root, _threshold, _mode, _cfg=None, _ckpt=None):
                 work_root.mkdir(parents=True, exist_ok=True)
                 raw = work_root / "bev_raw.json"
                 raw.write_text("[]", encoding="utf-8")
@@ -324,7 +324,7 @@ class HybridPipelineTest(unittest.TestCase):
                     "truck_frames": [],
                     "diagnostics": {"car_detections": 1, "truck_detections": 0}}
 
-            def fake_bev(_python, _clip, work_root, _threshold, _mode):
+            def fake_bev(_python, _clip, work_root, _threshold, _mode, _cfg=None, _ckpt=None):
                 work_root.mkdir(parents=True, exist_ok=True)
                 raw = work_root / "bev_raw.json"
                 raw.write_text("[]", encoding="utf-8")
@@ -393,7 +393,7 @@ class HybridPipelineTest(unittest.TestCase):
                     "truck_frames": [],
                     "diagnostics": {"car_detections": 1, "truck_detections": 1}}
 
-            def fake_bev(_python, _clip, work_root, _threshold, _mode):
+            def fake_bev(_python, _clip, work_root, _threshold, _mode, _cfg=None, _ckpt=None):
                 work_root.mkdir(parents=True, exist_ok=True)
                 raw = work_root / "bev_raw.json"
                 raw.write_text("[]", encoding="utf-8")

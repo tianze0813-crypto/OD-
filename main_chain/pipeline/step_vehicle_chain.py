@@ -59,11 +59,11 @@ from tracking import tracker_conservative as tracking              # noqa: E402
 
 # 车链默认参数（Car / Truck 各自与单链行为对齐）
 DEFAULTS: Dict[str, Any] = dict(
-    class_score_threshold=0.2,                 # 未登记类别的回落门槛（旧行为：Car/Truck 都用它）
+    class_score_threshold=0.2,                 # 未登记类别的回落门槛
     # 【改动】2026-09-29 分类别分数门槛：step2 硬过滤直接按类过滤（Car/Truck 可不同）。
-    # 为空 = 全部用 class_score_threshold（旧行为）。入口 --class-score-thresholds 传入，
-    # 未显式给 --class-score-threshold 时，回落值自动取分类别里的最小值（避免低阈值那类被截断）。
-    class_score_thresholds=(),
+    # 【改动·2026-09-29 定为默认】Car 0.1 / Truck 0.05（与 pipeline/vehicle_pass.py 一致）。
+    # 置空 () = 全部用 class_score_threshold（旧行为）。
+    class_score_thresholds=(("Car", 0.1), ("Truck", 0.05)),
     class_sparsity=(("Car", 5), ("Truck", 10)),
     class_min_lifecycle=(("Car", 3), ("Truck", 4)),
     range_front=80.0,
@@ -329,9 +329,9 @@ def main() -> None:
     parser.add_argument("--class-score-threshold", type=float, default=None,
                         help="未登记类别的回落分数门槛；不显式给时，若给了 "
                              "--class-score-thresholds 则自动取其中最小值，否则 0.2")
-    parser.add_argument("--class-score-thresholds", default="",
+    parser.add_argument("--class-score-thresholds", default=None,
                         help="【改动】分类别分数门槛，形如 \"Car=0.1,Truck=0.05\"（键用规范类别名）；"
-                             "空 = 按旧行为全部用 --class-score-threshold")
+                             "默认 Car 0.1 / Truck 0.05；传空串 \"\" = 按旧行为全部用 --class-score-threshold")
     parser.add_argument("--sparsity-car", type=int, default=5)
     parser.add_argument("--sparsity-truck", type=int, default=10)
     parser.add_argument("--short-car", type=int, default=3)
@@ -357,16 +357,23 @@ def main() -> None:
     parser.add_argument("--step5a-max-fills-per-track", type=int, default=None,
                         help="step5a 每条轨迹补帧总量上限（默认不限 = 全补）")
     args = parser.parse_args()
-    class_score_thresholds = []
-    for item in str(args.class_score_thresholds).split(","):
-        item = item.strip()
-        if not item:
-            continue
-        if "=" not in item:
-            raise SystemExit(f"--class-score-thresholds 项缺少 '='：{item!r}")
-        name, value = item.split("=", 1)
-        class_score_thresholds.append((name.strip(), float(value)))
-    class_score_thresholds = tuple(class_score_thresholds)
+    # 未显式给 --class-score-thresholds -> 用 DEFAULTS（Car 0.1 / Truck 0.05，2026-09-29 定为默认）；
+    # 显式给空串 "" -> 退回全局单值（旧行为）。
+    if args.class_score_thresholds is None:
+        class_score_thresholds = tuple(
+            (str(name), float(value))
+            for name, value in DEFAULTS["class_score_thresholds"])
+    else:
+        parsed = []
+        for item in str(args.class_score_thresholds).split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if "=" not in item:
+                raise SystemExit(f"--class-score-thresholds 项缺少 '='：{item!r}")
+            name, value = item.split("=", 1)
+            parsed.append((name.strip(), float(value)))
+        class_score_thresholds = tuple(parsed)
     if args.class_score_threshold is not None:
         fallback = float(args.class_score_threshold)
     elif class_score_thresholds:

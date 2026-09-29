@@ -2,7 +2,7 @@
 
 > 【2026-09-29 改动】step2 硬过滤支持**分类别分数门槛**：`HardFilterConfig.class_score_thresholds`
 > （`filtering/hard_filters.py`）按 `canonical_class_name` 归一后逐类取阈值，未登记类别回落 `score_threshold`。
-> 驱动侧新增 `--class-score-thresholds "Car=0.1,Truck=0.05"`；未显式给 `--class-score-threshold` 时回落值自动取
+> 驱动侧 `--class-score-thresholds` **默认为 `Car=0.1,Truck=0.05`**（2026-09-29 定为默认）；未显式给 `--class-score-threshold` 时回落值自动取
 > 分类别里的最小值（避免低阈值那类被截断）。`pipeline/vehicle_pass.py` 已把车链的 class_score_thresholds 透传进来。
 
 输入：未标注的 SUST 原始 clip（含 `lidar/lidar_top/*.bin` 与 `transforms/`）。
