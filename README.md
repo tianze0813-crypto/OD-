@@ -159,6 +159,16 @@ bak/                             已归档（**gitignore**，见 bak/README.md�
 ｜`--vru-detector voxelnext|bevfusion`（默认 voxelnext）｜`--bev-raw-dir`（复用已生成的 raw，不重跑推理）
 ｜`--car-yaw-settle step45\|step45-axis\|step2`（默认 step45 = B1）｜`--keep-vehicle-diagnostics`｜`--keep-chain-labels`｜`--link-only`｜`--output-tag`
 
+换权重 / 分类别阈值 / 留过程数据（2026-09-29 新增）：
+- `--bev-cfg <cfg.py>` / `--bev-ckpt <ckpt.pth>`：车链 BEVFusion 的配置与权重（换微调权重时必须给与训练几何一致的配置，如
+  `bevfusion/configs/police_bevfusion_mmdet3d_lidaronly_ct2roi.py`）。
+- `--vehicle-car-score-threshold 0.1` / `--vehicle-truck-score-threshold 0.05`：车链 **BEV 阶段 + step2 硬过滤** 的分类别分数门槛。
+  给了分类别值时，raw 推理门槛会自动取 `min(原值, 各类阈值)`，避免低阈值那类在上游被截断；
+  同时 `pipeline/vehicle_pass.py` 会把 `--class-score-thresholds Car=..,Truck=..` 透传给 `main_chain` 的 step2
+  （此前 step2 自带 0.2，会把入口设的 0.1/0.05 又卡回去）。
+- `--keep-work-dir <dir>`：把每个 clip 的全部中间过程数据落到 `<dir>/<clip名>/`（BEV raw、车链 step2/45/5a、
+  car step3/4/5 诊断、truck 分支、VRU step2/3 等），不再随临时目录删除。
+
 ---
 
 ## 当前行为现状（改动前先读这里）
