@@ -24,6 +24,7 @@ import sys
 import tempfile
 import time
 from collections import Counter
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -241,18 +242,27 @@ def _run_raw(python: Path, clip: Path, cfg: Path, ckpt: Path,
 
 
 def _run_raw_bevfusion(python: Path, clip: Path, work_root: Path,
-                       score_thresh: float, mode: str = "lidar") -> Path:
+                       score_thresh: float, mode: str = "lidar",
+                       cfg: Path | None = None,
+                       ckpt: Path | None = None) -> Path:
     """【改动】2026-09-20：Truck 链改用 BEVFusion 检测器（pipeline/step1_bevfusion_truck.py）。
 
     该脚本内部会：去畸变+5列bin+infos（幂等缓存）-> mmdet3d BEVFusion 推理（z 已统一到框中心）
     -> 挂相机可见性；产物仍是 <clip>_raw.json，结构与旧链路一致。
+
+    【改动】2026-09-29：可选 cfg / ckpt 直接透传（换用交警域微调权重时不必再改环境变量）。
     """
     output = work_root / f"{clip.name}_raw.json"
-    _run([
+    command = [
         python, ROOT / "pipeline" / "step1_bevfusion_truck.py",
         "--clip", clip, "--work-root", work_root,
         "--score-thresh", score_thresh, "--mode", str(mode),
-    ])
+    ]
+    if cfg is not None:
+        command += ["--cfg", str(cfg)]
+    if ckpt is not None:
+        command += ["--ckpt", str(ckpt)]
+    _run(command)
     if not output.is_file():
         raise RuntimeError(f"BEVFusion 推理没有创建 raw JSON: {output}")
     return output
@@ -481,9 +491,25 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
              step5a_enabled: bool = True,
              step5a_min_points_in_box: int = 6,
              step5a_max_hole_frames: int | None = None,
-             step5a_max_fills_per_track: int | None = None) -> Dict[str, Any]:
+             step5a_max_fills_per_track: int | None = None,
+             # 【改动】2026-09-29：换用交警域微调权重（BEVFusion lidar cfg/ckpt 透传）
+             bev_cfg: Path | None = None,
+             bev_ckpt: Path | None = None,
+             # 【改动】2026-09-29：车链 BEV 阶段的分类别分数门槛（Car / Truck ...）；
+             # 给定时覆盖车链默认的 Car 0.2 / Truck 0.2，并保证 raw 推理门槛不高于其中最小值。
+             vehicle_class_score_thresholds: Dict[str, float] | None = None,
+             # 【改动】2026-09-29：非空则中间过程数据落在 <work_root>/<clip名>/（不随临时目录删除）
+             work_root: Path | None = None) -> Dict[str, Any]:
     base = clip.name
     tag = output_tag.strip("_-")
+    # 【改动】2026-09-29：分类型 BEV 门槛。raw 推理门槛必须 <= 其中最小值，
+    # 否则低阈值那一类在上游就被砍掉了（例如 truck 0.05 被 raw 0.1 截断）。
+    vehicle_thresholds = {str(k): float(v)
+                          for k, v in (vehicle_class_score_thresholds or {}).items()}
+    effective_bev_raw_threshold = float(bev_raw_threshold)
+    if vehicle_thresholds:
+        effective_bev_raw_threshold = min(
+            [effective_bev_raw_threshold, *vehicle_thresholds.values()])
     # 【改动】已经是 <clip>_pre 的输入 -> output_name == base：重跑就地覆盖，
     # 不改名、不生成 <clip>_pre_pre（见 _pre_clip_name）。
     output_name = _pre_clip_name(base, tag, output_suffix)
@@ -535,8 +561,15 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
     # 车链诊断（在 work 临时目录里，跑完要落到输出目录；直接留 dict）
     vehicle_diag_data: Dict[str, Any] | None = None
     clip_start = time.monotonic()
-    with tempfile.TemporaryDirectory(prefix=f"hybrid_{base}_") as temp:
-        work = Path(temp)
+    with ExitStack() as work_stack:
+        if work_root is not None:
+            # 【改动】2026-09-29：保留全部中间过程数据 -> 落在 <work_root>/<clip名>/
+            work = Path(work_root) / base
+            work.mkdir(parents=True, exist_ok=True)
+            _print(f"{base}: 过程数据目录 {work}（不随运行结束删除）")
+        else:
+            work = Path(work_stack.enter_context(
+                tempfile.TemporaryDirectory(prefix=f"hybrid_{base}_")))
         total = len(selected)
         step = 0
         bev_raw: Path | None = None
@@ -550,7 +583,8 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
                 _print(f"{base}: 复用 BEVFusion raw json -> {bev_raw}")
             else:
                 bev_raw = _run_raw_bevfusion(python, clip, work / "bev_raw",
-                                             bev_raw_threshold, truck_detector_mode)
+                                             effective_bev_raw_threshold,
+                                             truck_detector_mode, bev_cfg, bev_ckpt)
                 _print(f"{base}: BEVFusion raw json（三链共用）-> {bev_raw.name}")
         if merged_vehicle:
             # 【改动】2026-09-21 车链：Car 与 Truck 共用一份 BEVFusion 检测 + 一次后处理
@@ -560,7 +594,8 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
             _t = time.monotonic()
             if bev_raw is None:
                 bev_raw = _run_raw_bevfusion(python, clip, work / "bev_raw",
-                                             bev_raw_threshold, truck_detector_mode)
+                                             effective_bev_raw_threshold,
+                                             truck_detector_mode, bev_cfg, bev_ckpt)
             vehicle = run_vehicle_pass(
                 bev_raw, clip, work / "vehicle", python,
                 diagnostics_path=(work / "vehicle_diagnostics.json"
@@ -577,8 +612,8 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
                 step5a_max_hole_frames=step5a_max_hole_frames,
                 step5a_max_fills_per_track=step5a_max_fills_per_track,
                 class_score_thresholds={
-                    "Car": 0.2,
-                    "Truck": 0.2,
+                    "Car": float(vehicle_thresholds.get("Car", 0.2)),
+                    "Truck": float(vehicle_thresholds.get("Truck", 0.2)),
                     "Trailer": float(trailer_score_threshold)},
                 truck_short_track_max_frames=int(short_track_max_frames) or 4,
             )
@@ -831,6 +866,21 @@ def main() -> int:
                         help="复用该目录下 <clip名>_raw.json（不重新跑 BEVFusion 推理）")
     parser.add_argument("--bev-raw-threshold", type=float, default=0.1,
                         help="三链共享的 BEVFusion raw json 分数门槛（链内阈值另外把关）")
+    # 【改动】2026-09-29：换用交警域微调权重（不必改环境变量）
+    parser.add_argument("--bev-cfg", type=Path, default=None,
+                        help="车链 BEVFusion lidar 配置（默认 models 里的官方 lidaronly 配置）；"
+                             "换微调权重时必须给与训练几何一致的配置")
+    parser.add_argument("--bev-ckpt", type=Path, default=None,
+                        help="车链 BEVFusion lidar 权重（默认 models/bevfusion_mmdet3d_lidaronly.pth）")
+    # 【改动】2026-09-29：车链 BEV 阶段分类别分数门槛（Car/Truck）
+    parser.add_argument("--vehicle-car-score-threshold", type=float, default=None,
+                        help="车链 Car 的 BEV 阶段分数门槛（默认 0.2）")
+    parser.add_argument("--vehicle-truck-score-threshold", type=float, default=None,
+                        help="车链 Truck 的 BEV 阶段分数门槛（默认 0.2）")
+    # 【改动】2026-09-29：保留中间过程数据
+    parser.add_argument("--keep-work-dir", type=Path, default=None,
+                        help="非空则每个 clip 的全部中间过程数据落到 <该目录>/<clip名>/"
+                             "（BEV raw json、车链 step2~step5、诊断 json 等；默认随临时目录删除）")
     parser.add_argument("--output-suffix", type=str, default="",
                         help="输出名 = <输入clip名><后缀>（如 _bev）；默认仍按 <clip>_pre / <clip>_<tag>_pre")
     parser.add_argument("--link-only", action="store_true",
@@ -952,6 +1002,11 @@ def main() -> int:
     truck_ckpt = args.truck_ckpt.expanduser().resolve()
     vru_cfg = args.vru_cfg.expanduser().resolve()
     vru_ckpt = args.vru_ckpt.expanduser().resolve()
+    # 【改动】2026-09-29：显式给的 BEVFusion 配置/权重先校验存在，避免跑到一半才报错
+    if args.bev_cfg is not None and not args.bev_cfg.expanduser().is_file():
+        raise RuntimeError(f"--bev-cfg 不存在: {args.bev_cfg}")
+    if args.bev_ckpt is not None and not args.bev_ckpt.expanduser().is_file():
+        raise RuntimeError(f"--bev-ckpt 不存在: {args.bev_ckpt}")
     if "truck" in chains:
         _validate_weight(truck_ckpt)
         if not truck_cfg.is_file():
@@ -970,8 +1025,11 @@ def main() -> int:
         weights = ("models/bevfusion_mmdet3d_lidarcam.pth"
                    if args.truck_detector_mode == "fusion"
                    else "models/bevfusion_mmdet3d_lidaronly.pth")
+        if args.bev_ckpt is not None:
+            weights = str(args.bev_ckpt)
+        cfg_note = (f" cfg={args.bev_cfg}" if args.bev_cfg is not None else "")
         _print(f"chains={chains} | 车链 Car+Truck: detector=BEVFusion "
-               f"mode={args.truck_detector_mode} weights={weights} "
+               f"mode={args.truck_detector_mode} weights={weights}{cfg_note} "
                f"(trailer_rules={not args.no_trailer_rules}, policy={args.trailer_policy}) "
                f"| Car yaw settle={args.car_yaw_settle} "
                f"| VRU: detector={args.vru_detector} weights={vru_ckpt.name}")
@@ -1034,6 +1092,15 @@ def main() -> int:
             vru_detector=args.vru_detector,
             bev_raw_threshold=args.bev_raw_threshold,
             bev_raw_dir=args.bev_raw_dir,
+            bev_cfg=(args.bev_cfg.expanduser().resolve() if args.bev_cfg else None),
+            bev_ckpt=(args.bev_ckpt.expanduser().resolve() if args.bev_ckpt else None),
+            vehicle_class_score_thresholds={
+                key: float(value) for key, value in (
+                    ("Car", args.vehicle_car_score_threshold),
+                    ("Truck", args.vehicle_truck_score_threshold))
+                if value is not None},
+            work_root=(args.keep_work_dir.expanduser().resolve()
+                       if args.keep_work_dir else None),
             output_suffix=args.output_suffix,
             link_only=args.link_only,
             trailer_rules=not args.no_trailer_rules,
