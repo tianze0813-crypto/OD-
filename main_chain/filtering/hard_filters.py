@@ -17,6 +17,10 @@ from tracking import tracker_conservative as tracking      # 【改动】类别�
 @dataclass(frozen=True)
 class HardFilterConfig:
     score_threshold: float = 0.3
+    # 【改动】2026-09-29 按（规范）类别的分数门槛，例如 (("Car", 0.1), ("Truck", 0.05))。
+    # 未登记类别回落到 score_threshold（= 旧行为）。键为 tracking.canonical_class_name
+    # 归一后的名字；口径与 pipeline/vehicle_pass.py 的 class_score_thresholds 一致。
+    class_score_thresholds: Tuple[Tuple[str, float], ...] = ()
     range_front: float = 80.0
     range_rear: float = 20.0
     range_side: float = 40.0
@@ -31,6 +35,12 @@ class HardFilterConfig:
         "Vehicle", "Car", "Truck", "Pedestrian", "Cyclist"
     )
     diagnostic_examples_per_reason: int = 30
+
+    def score_threshold_for(self, class_name: Any) -> float:
+        """【改动】按（归一）类别取分数门槛；未登记类别用 score_threshold。"""
+        canonical = tracking.canonical_class_name(class_name)
+        table = {str(k): float(v) for k, v in self.class_score_thresholds}
+        return float(table.get(canonical or "", self.score_threshold))
 
 
 def _sparsity_threshold_for(config: "HardFilterConfig",
@@ -140,7 +150,7 @@ def apply_hard_filters(frames: List[Dict[str, Any]], clip: Path,
             else:
                 box = det["box_lidar"]
                 class_name = str(det.get("class_name", ""))
-                if float(det.get("score", 0.0)) < config.score_threshold:
+                if float(det.get("score", 0.0)) < config.score_threshold_for(class_name):
                     reasons.append("score")
                 if not _class_allowed(class_name, config.keep_classes):
                     reasons.append("class_whitelist")
@@ -185,6 +195,7 @@ def apply_hard_filters(frames: List[Dict[str, Any]], clip: Path,
     return {
         "policy": {
             "score_threshold": config.score_threshold,
+            "score_threshold_by_class": dict(config.class_score_thresholds),
             "range_front": config.range_front,
             "range_rear": config.range_rear,
             "range_side": config.range_side,

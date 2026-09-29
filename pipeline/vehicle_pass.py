@@ -453,6 +453,15 @@ def run(raw_json: Path, clip: Path, work_root: Path,
                "--raw-json", vehicle_raw, "--clip", clip,
                "--work-root", steps_root,
                "--car-yaw-settle", str(params["car_yaw_settle"])]
+    # 【改动】2026-09-29：把分类别分数门槛透传给 step2（否则 step2 自带 0.2 会把
+    # 入口设的 Car 0.1 / Truck 0.05 又卡回 0.2）。
+    vehicle_class_thresholds = tuple(
+        (str(name), float(value))
+        for name, value in (params.get("class_score_thresholds") or {}).items())
+    if vehicle_class_thresholds:
+        command += ["--class-score-thresholds",
+                    ",".join(f"{name}={value:g}"
+                             for name, value in vehicle_class_thresholds)]
     if params.get("static_rigid"):
         command.append("--static-rigid")
     if not params.get("step5a_enabled", True):

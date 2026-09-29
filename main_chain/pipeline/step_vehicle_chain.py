@@ -59,7 +59,11 @@ from tracking import tracker_conservative as tracking              # noqa: E402
 
 # 车链默认参数（Car / Truck 各自与单链行为对齐）
 DEFAULTS: Dict[str, Any] = dict(
-    class_score_threshold=0.2,                 # Car 0.2 / Truck 0.2（raw 门槛另在入口把关）
+    class_score_threshold=0.2,                 # 未登记类别的回落门槛（旧行为：Car/Truck 都用它）
+    # 【改动】2026-09-29 分类别分数门槛：step2 硬过滤直接按类过滤（Car/Truck 可不同）。
+    # 为空 = 全部用 class_score_threshold（旧行为）。入口 --class-score-thresholds 传入，
+    # 未显式给 --class-score-threshold 时，回落值自动取分类别里的最小值（避免低阈值那类被截断）。
+    class_score_thresholds=(),
     class_sparsity=(("Car", 5), ("Truck", 10)),
     class_min_lifecycle=(("Car", 3), ("Truck", 4)),
     range_front=80.0,
@@ -177,6 +181,8 @@ def run(raw_json: Path, clip: Path, work_root: Path, *,
     step2_diag = work_root / f"{base}_step2_diagnostics.json"
     hard_config = HardFilterConfig(
         score_threshold=float(params["class_score_threshold"]),
+        class_score_thresholds=tuple(
+            (str(c), float(v)) for c, v in params.get("class_score_thresholds", ())),
         range_front=float(params["range_front"]),
         range_rear=float(params["range_rear"]),
         range_side=float(params["range_side"]),
@@ -320,8 +326,12 @@ def main() -> None:
     parser.add_argument("--clip", type=Path, required=True)
     parser.add_argument("--work-root", type=Path, required=True)
     parser.add_argument("--keep-classes", default="Car,Truck")
-    parser.add_argument("--class-score-threshold", type=float,
-                        default=DEFAULTS["class_score_threshold"])
+    parser.add_argument("--class-score-threshold", type=float, default=None,
+                        help="未登记类别的回落分数门槛；不显式给时，若给了 "
+                             "--class-score-thresholds 则自动取其中最小值，否则 0.2")
+    parser.add_argument("--class-score-thresholds", default="",
+                        help="【改动】分类别分数门槛，形如 \"Car=0.1,Truck=0.05\"（键用规范类别名）；"
+                             "空 = 按旧行为全部用 --class-score-threshold")
     parser.add_argument("--sparsity-car", type=int, default=5)
     parser.add_argument("--sparsity-truck", type=int, default=10)
     parser.add_argument("--short-car", type=int, default=3)
@@ -347,10 +357,27 @@ def main() -> None:
     parser.add_argument("--step5a-max-fills-per-track", type=int, default=None,
                         help="step5a 每条轨迹补帧总量上限（默认不限 = 全补）")
     args = parser.parse_args()
+    class_score_thresholds = []
+    for item in str(args.class_score_thresholds).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise SystemExit(f"--class-score-thresholds 项缺少 '='：{item!r}")
+        name, value = item.split("=", 1)
+        class_score_thresholds.append((name.strip(), float(value)))
+    class_score_thresholds = tuple(class_score_thresholds)
+    if args.class_score_threshold is not None:
+        fallback = float(args.class_score_threshold)
+    elif class_score_thresholds:
+        fallback = min(v for _c, v in class_score_thresholds)
+    else:
+        fallback = float(DEFAULTS["class_score_threshold"])
     result = run(
         args.raw_json, args.clip, args.work_root,
         keep_classes=tuple(c.strip() for c in args.keep_classes.split(",") if c.strip()),
-        class_score_threshold=args.class_score_threshold,
+        class_score_threshold=fallback,
+        class_score_thresholds=class_score_thresholds,
         class_sparsity=(("Car", args.sparsity_car), ("Truck", args.sparsity_truck)),
         class_min_lifecycle=(("Car", args.short_car), ("Truck", args.short_truck)),
         range_front=args.range_front, range_rear=args.range_rear,
