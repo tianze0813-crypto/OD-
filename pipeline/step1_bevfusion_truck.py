@@ -12,6 +12,10 @@
 （frames: [{frame_id, detections:[{class_name, score, box_lidar}]}]，lidar 系），
 可被 step2 及之后的所有阶段直接消费。
 
+【改动·2026-10-08】过程数据不落盘：①的缓存（bevfusion/data/police/<clip> 每包约 150MB、
+work/infos/*、去畸变图）在推理结束时就地删掉，只留上面的 raw json。批量跑包不会再让
+``bevfusion/data/`` 无限增长。要留缓存调试用 ``--keep-prep``（或 ``BEVFUSION_KEEP_PREP=1``）。
+
 本脚本自身跑在 **openpcdet** 环境（需要 filtering.camera_visibility）；
 ①② 通过外部 BEVFusion 工程用 **mmdet3d** 环境的 python 以子进程执行，
 路径可用环境变量覆盖（云端部署时必改）：
@@ -28,6 +32,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pickle
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -99,6 +105,87 @@ def infer(clip: Path, raw_json: Path, score_thresh: float, cfg: str, ckpt: str,
           "--z-convention", z_convention])
 
 
+# 【改动·2026-10-08】预处理缓存默认跑完即删。
+#   背景：prep_data.py 会把每个 clip 的 lidar_top 4 列 bin 复制成 5 列（LoadPointsFromFile
+#   写死 load_dim=5，不补列喂不进去）——单帧 ~1.9MB、比源数据还大 25%，一个 80 帧的包
+#   ~150MB；再加 transforms 复制、infos pkl、去畸变图。以前这份缓存只写不删，批量跑几百个
+#   包后 <project>/bevfusion/data/police/ 涨到 50G（见 README「过程数据」）。
+#   现在 step1 推理结束（成功或失败）就清掉本次 clip 的全部过程数据，只留
+#   <work-root>/<clip>_raw.json。要留着缓存调试 -> --keep-prep 或 BEVFUSION_KEEP_PREP=1。
+PREP_KEEP_ENV = "BEVFUSION_KEEP_PREP"
+
+
+def keep_prep_enabled(args) -> bool:
+    """是否保留 BEVFusion 预处理缓存。"""
+    if bool(getattr(args, "keep_prep", False)):
+        return True
+    return os.environ.get(PREP_KEEP_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _drop_clip_from_aggregate_infos(infos_dir: Path, clip_name: str) -> Path | None:
+    """从聚合 infos 里摘掉该 clip 的条目，保留其它 clip（坏文件直接删）。
+
+    聚合文件是所有 clip 共用的一份，所以只摘本次 clip，不能整份删 —— 否则并发跑别的
+    clip 的进程会读到空 infos（正是 tests/root/test_bevfusion_infos.py 记录的那个坑）。
+    """
+    agg = infos_dir / "police_mmdet3d_infos.pkl"
+    if not agg.is_file():
+        return None
+    try:
+        with open(agg, "rb") as f:
+            payload = pickle.load(f)
+        data = payload.get("data_list", []) if isinstance(payload, dict) else []
+        kept = [x for x in data if x.get("scene_token") != clip_name]
+    except Exception:                       # 读不了 / 结构不对：留着也没用
+        agg.unlink(missing_ok=True)
+        return agg
+    if len(kept) == len(data):              # 本来就没有本 clip 的条目：不动它
+        return None
+    if not kept:                            # 没有别的 clip 了 -> 直接删
+        agg.unlink(missing_ok=True)
+        return agg
+    if isinstance(payload, dict):
+        payload["data_list"] = kept
+    else:
+        payload = {"metainfo": {"dataset": "police_bevfusion"}, "data_list": kept}
+    tmp = agg.with_name(agg.name + ".tmp")
+    with open(tmp, "wb") as f:              # 先写临时文件再改名：并发下不会读到半个 pkl
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp, agg)
+    return agg
+
+
+def cleanup_prep(clip: Path) -> list[Path]:
+    """删掉本次 prep 产生的过程数据，返回实际删掉的路径。
+
+    覆盖 prep_data.py / mmdet3d_prep.py / 去畸变的全部落盘点：
+      data/police/<clip>/                5 列 bin + transforms 复制 + image 软链（大头）
+      work/undist/<clip>/                去畸变针孔图（仅 fusion 模式有）
+      work/infos/<clip>_infos.pkl        per-clip infos
+      work/infos/police_mmdet3d_infos.pkl 聚合 infos（只摘本 clip 条目）
+      work/infos/police_val_infos.pkl     prep_data 的冗余 infos（只留最后一次跑的，删）
+    """
+    name = clip.name
+    removed: list[Path] = []
+    for target in (BEVFUSION_ROOT / "data" / "police" / name,
+                   BEVFUSION_ROOT / "work" / "undist" / name):
+        if target.is_symlink() or target.exists():
+            if target.is_symlink() or target.is_file():
+                target.unlink(missing_ok=True)
+            else:
+                shutil.rmtree(target, ignore_errors=True)
+            removed.append(target)
+    infos_dir = BEVFUSION_ROOT / "work" / "infos"
+    for name_only in (f"{name}_infos.pkl", "police_val_infos.pkl"):
+        p = infos_dir / name_only
+        if p.is_file():
+            p.unlink()
+            removed.append(p)
+    if (pruned := _drop_clip_from_aggregate_infos(infos_dir, name)) is not None:
+        removed.append(pruned)
+    return removed
+
+
 def run_inference(clip: Path, args) -> Path:
     raw_json = Path(args.work_root) / f"{clip.name}_raw.json"
     raw_json.parent.mkdir(parents=True, exist_ok=True)
@@ -112,26 +199,42 @@ def run_inference(clip: Path, args) -> Path:
             raise ValueError(f"clip 缺少 transforms/calib.json：{clip}")
     else:
         validate_clip(clip)
-    if not args.skip_prepare:
-        prepare(clip, jobs=args.jobs, images=(mode != "lidar"))
-    cfg = args.cfg if mode != "lidar" else os.environ.get(
-        "BEVFUSION_TRUCK_LIDAR_CFG", BEVFUSION_LIDAR_CFG)
-    ckpt = args.ckpt if mode != "lidar" else os.environ.get(
-        "BEVFUSION_TRUCK_LIDAR_CKPT", BEVFUSION_LIDAR_CKPT)
-    if mode == "lidar" and (args.cfg != BEVFUSION_CFG or args.ckpt != BEVFUSION_CKPT):  # 显式传了就用显式值
-        cfg, ckpt = args.cfg, args.ckpt        # 显式传了就用显式值
-    infer(clip, raw_json, args.score_thresh, cfg, ckpt, args.z_convention)
-    if not raw_json.is_file():
-        raise RuntimeError(f"BEVFusion 推理没有产出 {raw_json}")
+    try:
+        if not args.skip_prepare:
+            prepare(clip, jobs=args.jobs, images=(mode != "lidar"))
+        cfg = args.cfg if mode != "lidar" else os.environ.get(
+            "BEVFUSION_TRUCK_LIDAR_CFG", BEVFUSION_LIDAR_CFG)
+        ckpt = args.ckpt if mode != "lidar" else os.environ.get(
+            "BEVFUSION_TRUCK_LIDAR_CKPT", BEVFUSION_LIDAR_CKPT)
+        if mode == "lidar" and (args.cfg != BEVFUSION_CFG or args.ckpt != BEVFUSION_CKPT):  # 显式传了就用显式值
+            cfg, ckpt = args.cfg, args.ckpt    # 显式传了就用显式值
+        infer(clip, raw_json, args.score_thresh, cfg, ckpt, args.z_convention)
+        if not raw_json.is_file():
+            raise RuntimeError(f"BEVFusion 推理没有产出 {raw_json}")
 
-    if not args.no_visibility_check:
-        frames = json.loads(raw_json.read_text(encoding="utf-8"))
-        stats = camera_visibility.filter_raw_frames(frames, clip, 0.0, args.vis_occl_tol)
-        raw_json.write_text(json.dumps(frames, ensure_ascii=False, indent=2) + "\n",
-                            encoding="utf-8")
-        print(f"visibility metadata: checked={stats['checked']} "
-              f"dropped={stats['dropped']}", flush=True)
-    return raw_json
+        if not args.no_visibility_check:
+            frames = json.loads(raw_json.read_text(encoding="utf-8"))
+            stats = camera_visibility.filter_raw_frames(frames, clip, 0.0, args.vis_occl_tol)
+            raw_json.write_text(json.dumps(frames, ensure_ascii=False, indent=2) + "\n",
+                                encoding="utf-8")
+            print(f"visibility metadata: checked={stats['checked']} "
+                  f"dropped={stats['dropped']}", flush=True)
+        return raw_json
+    finally:
+        # 【改动·2026-10-08】放在 finally：推理失败也不会把 ~150MB/包 的过程数据留在盘上。
+        if keep_prep_enabled(args):
+            print(f"[prep] 保留预处理缓存（--keep-prep / {PREP_KEEP_ENV}=1）："
+                  f"{BEVFUSION_ROOT / 'data' / 'police' / clip.name}", flush=True)
+        else:
+            try:
+                removed = cleanup_prep(clip)
+            except Exception as exc:        # 清理失败不能把整批跑挂掉，但必须吼出来
+                print(f"[prep][warn] 过程数据清理失败（{exc}），请手动删 "
+                      f"{BEVFUSION_ROOT / 'data' / 'police' / clip.name}",
+                      file=sys.stderr, flush=True)
+            else:
+                for p in removed:
+                    print(f"[prep] 已清理过程数据 {p}", flush=True)
 
 
 def collect_clips(args):
@@ -166,11 +269,22 @@ def main() -> None:
     parser.add_argument("--z-convention", default=BEVFUSION_Z,
                         choices=["center", "bottom"])
     parser.add_argument("--skip-prepare", action="store_true",
-                        help="复用已有去畸变图/infos（调试用）")
+                        help="复用已有去畸变图/infos（调试用；默认跑完就删缓存，"
+                             "所以要和 --keep-prep 一起用）")
+    parser.add_argument("--keep-prep", action="store_true",
+                        help="【默认关】保留本次 clip 的过程数据"
+                             "（bevfusion/data/police/<clip>、work/infos/*、去畸变图）。"
+                             f"默认推理一结束就删；也可用 {PREP_KEEP_ENV}=1 打开")
     parser.add_argument("--jobs", type=int, default=6)
     parser.add_argument("--vis-occl-tol", type=float, default=0.3)
     parser.add_argument("--no-visibility-check", action="store_true")
     args = parser.parse_args()
+
+    # 【改动·2026-10-08】--skip-prepare 依赖上一次跑留下的缓存，而缓存默认跑完就删
+    # -> 组合不成立，直接在入口拦掉，免得跑到一半报「找不到 bin/calib」。
+    if args.skip_prepare and not keep_prep_enabled(args):
+        parser.error("--skip-prepare 需要缓存已在（bevfusion/data/police/<clip>）；"
+                     "缓存默认跑完即删，请加 --keep-prep 复用（或先跑一次 --keep-prep）")
 
     if not BEVFUSION_PYTHON.exists():
         raise SystemExit(f"BEVFUSION_PYTHON 不存在：{BEVFUSION_PYTHON}")

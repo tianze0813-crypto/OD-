@@ -2,6 +2,10 @@
 
 被 `pipeline/step1_bevfusion_truck.py` 调用；本目录只放**代码/配置**，数据与缓存都在 `data/`、`work/`（已 gitignore）。
 
+【2026-10-08】`data/`、`work/` 里的预处理缓存（每包约 150 MB 的 5 列 bin + transforms 复制 +
+infos + 去畸变图）由 `step1_bevfusion_truck.py` 在推理结束后**自动删除**，只留 `<work-root>/<clip>_raw.json`。
+要留缓存调试：`step1 --keep-prep` 或 `export BEVFUSION_KEEP_PREP=1`。单独跑本目录的脚本时不受影响。
+
 ```
 configs/
   police_bevfusion_mmdet3d.py            C+L 推理配置（继承官方 lidar-cam 配置，4 路相机 + 384x512）

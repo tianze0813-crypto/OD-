@@ -169,6 +169,30 @@ bak/                             已归档（**gitignore**，见 bak/README.md�
   （此前 step2 自带 0.2，会把入口设的 0.1/0.05 又卡回去）。
 - `--keep-work-dir <dir>`：把每个 clip 的全部中间过程数据落到 `<dir>/<clip名>/`（BEV raw、车链 step2/45/5a、
   car step3/4/5 诊断、truck 分支、VRU step2/3 等），不再随临时目录删除。
+  注意：**BEVFusion 自己的预处理缓存不归这里管**，它默认跑完即删（见下节）。
+
+### BEVFusion 预处理缓存：默认不保留（2026-10-08 改）
+
+`pipeline/step1_bevfusion_truck.py` 的第 ① 步会把每个 clip 的 `lidar_top` 从 4 列复制成 5 列
+（`LoadPointsFromFile(load_dim=5)` 写死，不补第 5 列喂不进模型），再加上 `transforms` 复制与 infos：
+
+| 过程数据 | 每包量 |
+| --- | --- |
+| `bevfusion/data/police/<clip>/lidar/lidar_top/*.bin` | ~150 MB（80 帧 × ~1.9 MB，比源数据还大 25%）|
+| `bevfusion/data/police/<clip>/transforms/{calib.json,pose_data.txt}` | ~1.7 MB |
+| `bevfusion/data/police/<clip>/image/<cam>` | 0（软链到 `work/undist/`）|
+| `bevfusion/work/undist/<clip>/<cam>/*.jpg` | 仅 `--mode fusion` 有 |
+| `bevfusion/work/infos/<clip>_infos.pkl`、`police_mmdet3d_infos.pkl`、`police_val_infos.pkl` | 每包 ~0.5 MB，聚合文件会累积 |
+
+**这些以前只写不删**，批量跑几百个包后 `bevfusion/data/police/` 涨到 50 GB
+（再叠上 in-place 批跑产生的 `*_pre` / `*_pre_pre` 同名副本共 13.9 GB）。
+现在 `step1` 在**推理一结束（成功或失败都一样）**就删掉本次 clip 的全部过程数据，只留
+`<work-root>/<clip>_raw.json`；批量跑 N 个包的峰值占用 ≈ 1 个包（~150 MB），不再随包数线性增长。
+
+- 想留缓存调试：`--keep-prep`，或全局 `export BEVFUSION_KEEP_PREP=1`。
+- `--skip-prepare`（复用已有缓存）依赖上一次跑留下的缓存，所以必须和 `--keep-prep` 一起用；
+  单独给会被 `step1` 入口直接拦下。
+- 聚合 infos 只摘掉本 clip 的条目、其余 clip 保留（并发跑不同 clip 时不会被整份清掉）。
 
 ---
 
@@ -285,8 +309,11 @@ step5a 在 **step4.5 与 step5 之间**、在**并集帧表**上跑一次：
      （说明见同目录 `_yaw_AB_README.txt`）。
 
 2. `README`/`main_chain/README.md` 里仍有少量指向 `bak/` 的旧描述（回退路径、已删的旧单链）。
-3. `bevfusion/data/`（约 16 GB）是预处理缓存，里面混着旧实验的 `*_pre` / `*_pre_pre` 条目，可清。
-4. `bevfusion/work/infos/` 与 `bevfusion/data/` 是**共享缓存：同一时间只跑一个批跑**，否则互相抢。
+3. ~~`bevfusion/data/`（约 16 GB）是预处理缓存，里面混着旧实验的 `*_pre` / `*_pre_pre` 条目，可清。~~
+   **已解决（2026-10-08）**：`step1` 现在跑完就删本次 clip 的预处理缓存，`bevfusion/data/` 不再累积
+   （历史遗留的 `*_pre` / `*_pre_pre` 副本已手工清掉，约 50 GB）。详见「BEVFusion 预处理缓存：默认不保留」。
+4. `bevfusion/work/infos/` 与 `bevfusion/data/` 仍是**共享路径：同一时间只跑一个批跑**（infos 聚合文件是
+   全局单文件），否则互相抢。跑完的包已不残留缓存，但并发跑同一个 clip 仍会互相踩。
 
 ---
 
