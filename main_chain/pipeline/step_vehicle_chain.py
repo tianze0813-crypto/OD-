@@ -172,9 +172,14 @@ def run(raw_json: Path, clip: Path, work_root: Path, *,
     _probe = json.loads(raw_json.read_text(encoding="utf-8"))
     if not isinstance(_probe, list) or not _probe:
         raise SystemExit(f"[vehicle-chain] 输入 raw json 是空的（0 帧）：{raw_json}")
+    # 【改动 2026-10-09】0 框不再硬失败：BEVFusion 原始检测可能在类阈值
+    # （Car 0.1 / Truck 0.05）过滤后清零，整包确实没有车/卡车目标时按"空结果"继续，
+    # 产出空的车链结果正常收尾（下游 vehicle_pass / 合并写 label 都能吃空输入）。
+    # 0 帧仍然硬失败（上面的分支），用于区分"这一包真没目标"和"推理没跑到该 clip"。
+    # 动机：批量跑时单个空包 SystemExit 会中断整批（1008 批次曾在 clip25 上卡死 1.5h）。
     if _count(_probe) == 0:
-        raise SystemExit(
-            f"[vehicle-chain] 输入 raw json 里没有任何框（{len(_probe)} 帧）：{raw_json}")
+        print(f"[vehicle-chain] 警告：输入 raw json 里没有任何框（{len(_probe)} 帧），"
+              f"按空结果继续（车链输出为空）：{raw_json}", flush=True)
 
     # ---- step2：共享身份跟踪（Car/Truck 并集，类别优先级仲裁，Car 优先）----
     step2_json = work_root / f"{base}_step2.json"

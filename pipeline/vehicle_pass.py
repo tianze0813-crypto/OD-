@@ -387,10 +387,12 @@ def run(raw_json: Path, clip: Path, work_root: Path,
         raise RuntimeError(
             f"BEVFusion 原始检测是空的（0 帧）：{raw_json} —— 检查该 clip 的 BEV 推理日志，"
             f"串行重跑这个 clip（infos 可能被另一个并发进程覆盖过）")
+    # 【改动 2026-10-09】原始检测 0 框不再硬失败：整包没有车/卡车目标时按"空车链结果"
+    # 继续跑（产出只有 VRU 的 label），并在诊断里标记，便于事后核对是不是空包。
+    # 0 帧仍然硬失败（上面的分支），用于区分"这一包真没目标"和"推理没跑到该 clip"。
     if _count(source) == 0:
-        raise RuntimeError(
-            f"BEVFusion 原始检测里没有任何框（{len(source)} 帧 / 0 框）：{raw_json} —— "
-            f"raw 阈值 0.1 下这通常意味着推理没真正跑到该 clip，串行重跑确认")
+        print(f"[vehicle-pass] 警告：BEVFusion 原始检测里没有任何框"
+              f"（{len(source)} 帧 / 0 框），按空车链结果继续：{raw_json}", flush=True)
     diagnostics: Dict[str, Any] = {
         "pipeline": "vehicle_pass",
         "clip": str(clip.resolve()),
@@ -400,6 +402,8 @@ def run(raw_json: Path, clip: Path, work_root: Path,
         "input_classes": sorted({str(det.get("class_name"))
                                  for frame in source
                                  for det in frame.get("detections", [])}),
+        # 【改动 2026-10-09】空包标记：该 clip 没有任何车/卡车原始检测
+        "empty_vehicle_input": _count(source) == 0,
     }
 
     # ---- 1) 类别合并（跟踪前，保持原时机）----
