@@ -9,8 +9,8 @@ import numpy as np
 
 from pipeline.hybrid_expD_noncar import (
     _noncar_filter,
-    drop_short_motion_nonmotorized,
     drop_spinning_vehicle,
+    fit_pedestrian_box_top,
 )
 from pipeline.hybrid_merge import merge_frames, merge_label_frames
 
@@ -442,62 +442,103 @@ class HybridPipelineTest(unittest.TestCase):
                 ["scene_pre"])
 
 
-class ShortMotionNonmotorizedTest(unittest.TestCase):
-    def test_static_nmv_track_is_dropped(self):
-        frames = _moving_frames("Nonmotorized_vehicle", [0.0] * 10)
-        dropped, stats = drop_short_motion_nonmotorized(
-            frames, _IdentityCoords(), min_net_displacement=15.0)
-        self.assertEqual(dropped, {7})
-        self.assertEqual(stats["tracks_dropped"], 1)
-        self.assertEqual(stats["boxes_removed"], 10)
-        self.assertTrue(all(not frame["detections"] for frame in frames))
+class PedestrianTopFitTest(unittest.TestCase):
+    """行人框：高统一 1.8m -> 顶贴头皮 -> 框内低点 P95 作参照，间距>5cm 才裁、<=20cm。"""
 
-    def test_nmv_track_with_net_displacement_over_15m_is_kept(self):
-        frames = _moving_frames(
-            "Nonmotorized_vehicle", [0.0, 4.0, 8.0, 12.0, 16.0, 20.0])
-        dropped, stats = drop_short_motion_nonmotorized(
-            frames, _IdentityCoords(), min_net_displacement=15.0)
-        self.assertEqual(dropped, set())
-        self.assertEqual(stats["tracks_seen"], 1)
-        self.assertEqual(stats["tracks_dropped"], 0)
-        self.assertTrue(all(len(frame["detections"]) == 1 for frame in frames))
+    @staticmethod
+    def _clip(root: Path, timestamp: int, points) -> Path:
+        lidar = root / "lidar" / "lidar_top"
+        lidar.mkdir(parents=True, exist_ok=True)
+        np.asarray(points, dtype=np.float32).reshape(-1, 4).tofile(
+            lidar / f"{timestamp}.bin")
+        return root
 
-    def test_jitter_does_not_keep_static_nmv_track(self):
-        # Same start/end center despite large frame-to-frame jitter: net
-        # displacement is small, so the noisy track must be removed.
-        frames = _moving_frames(
-            "Nonmotorized_vehicle",
-            [5.0 * (index % 2) for index in range(10)])
-        dropped, _stats = drop_short_motion_nonmotorized(
-            frames, _IdentityCoords(), min_net_displacement=15.0)
-        self.assertEqual(dropped, {7})
+    @staticmethod
+    def _stick(z0, z1, step=0.1):
+        n = int(round((z1 - z0) / step)) + 1
+        return [[0.0, 0.0, z0 + step * index, 1.0] for index in range(n)]
 
-    def test_missing_pose_frames_are_skipped_from_displacement(self):
-        centers = [0.0, 100.0, 0.0, 0.0, 0.0]
-        frames = _moving_frames("Nonmotorized_vehicle", centers)
-        coords = _MissingPoseCoords({2_000_000_000})
-        dropped, stats = drop_short_motion_nonmotorized(
-            frames, coords, min_net_displacement=15.0)
-        # After skipping the missing-pose frame the usable net displacement is
-        # 0m, so the track is removed; including it would have reported 100m.
-        self.assertEqual(dropped, {7})
-        self.assertEqual(stats["tracks_dropped"], 1)
+    @staticmethod
+    def _ground_grid(z=0.0):
+        # dense flat ground inside the 0.7x0.7 footprint
+        return [[x / 20.0, y / 20.0, z, 1.0]
+                for x in (-6, -3, 0, 3, 6) for y in (-6, -3, 0, 3, 6)]
 
-    def test_unmeasurable_track_is_kept(self):
-        frames = _moving_frames("Nonmotorized_vehicle", [0.0] * 5)
-        coords = _MissingPoseCoords(
-            {1_000_000_000, 2_000_000_000, 4_000_000_000, 5_000_000_000})
-        dropped, stats = drop_short_motion_nonmotorized(
-            frames, coords, min_net_displacement=15.0)
-        self.assertEqual(dropped, set())
-        self.assertEqual(stats["tracks_unmeasurable"], 1)
-        self.assertTrue(all(len(frame["detections"]) == 1 for frame in frames))
+    @classmethod
+    def _scene(cls, root, stick, ground_z=0.0):
+        return cls._clip(root, 1_000_000_000,
+                         list(stick) + cls._ground_grid(ground_z))
 
-    def test_static_track_of_other_class_is_kept(self):
-        frames = _moving_frames("Truck", [0.0] * 10)
-        dropped, _stats = drop_short_motion_nonmotorized(
-            frames, _IdentityCoords(), min_net_displacement=15.0)
-        self.assertEqual(dropped, set())
+    @staticmethod
+    def _frames(class_name="Pedestrian", z=1.0, dz=1.8):
+        return [{
+            "frame_id": "1000000000",
+            "detections": [{
+                "track_id": 1, "class_name": class_name, "score": 0.8,
+                "box_lidar": [0.0, 0.0, float(z), 0.7, 0.7, float(dz), 0.0],
+            }],
+        }]
+
+    def test_sunken_box_is_trimmed_to_reference_capped(self):
+        # head 1.5, reference 0.0 -> gap 0.3, capped to 0.2
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._scene(root, self._stick(0.5, 1.5))
+            frames = self._frames(z=1.0, dz=1.8)
+            stats = fit_pedestrian_box_top(frames, root, target_height_m=1.8)
+            box = frames[0]["detections"][0]["box_lidar"]
+            self.assertEqual(stats["boxes_moved"], 1)
+            self.assertEqual(stats["boxes_trimmed"], 1)
+            self.assertAlmostEqual(stats["max_trim_m"], 0.2, places=4)
+            self.assertAlmostEqual(box[5], 1.6, places=5)
+            self.assertAlmostEqual(box[2], 0.7, places=5)
+            self.assertAlmostEqual(box[2] + box[5] / 2.0, 1.5, places=5)
+
+    def test_gap_at_or_below_5cm_does_not_trigger(self):
+        # head 1.8 -> bottom 0.0 == reference -> no trim
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._scene(root, self._stick(0.0, 1.8))
+            frames = self._frames(z=1.2, dz=1.0)
+            stats = fit_pedestrian_box_top(frames, root, target_height_m=1.8)
+            box = frames[0]["detections"][0]["box_lidar"]
+            self.assertEqual(stats["boxes_trimmed"], 0)
+            self.assertAlmostEqual(box[5], 1.8, places=5)
+            self.assertAlmostEqual(box[2], 0.9, places=5)
+
+    def test_small_gap_is_trimmed_exactly(self):
+        # head 1.7 -> bottom -0.1, reference 0.0 -> gap 0.1 (< cap)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._scene(root, self._stick(0.2, 1.7))
+            frames = self._frames(z=1.0, dz=1.8)
+            stats = fit_pedestrian_box_top(frames, root, target_height_m=1.8)
+            box = frames[0]["detections"][0]["box_lidar"]
+            self.assertEqual(stats["boxes_trimmed"], 1)
+            self.assertAlmostEqual(stats["max_trim_m"], 0.1, places=3)
+            self.assertAlmostEqual(box[5], 1.7, places=4)
+            self.assertAlmostEqual(box[2] - box[5] / 2.0, 0.0, places=4)
+
+    def test_too_few_points_is_skipped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._clip(root, 1_000_000_000,
+                       [[0.0, 0.0, 1.6, 1.0], [0.0, 0.0, 1.5, 1.0],
+                        [0.0, 0.0, 1.4, 1.0]])
+            frames = self._frames(z=1.0, dz=1.8)
+            stats = fit_pedestrian_box_top(frames, root, target_height_m=1.8)
+            self.assertEqual(stats["boxes_moved"], 0)
+            self.assertEqual(stats["boxes_skipped_few_points"], 1)
+
+    def test_other_classes_are_untouched(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._scene(root, self._stick(0.5, 1.5))
+            frames = self._frames(class_name="Nonmotorized_vehicle", z=1.0)
+            stats = fit_pedestrian_box_top(frames, root, target_height_m=1.8)
+            self.assertEqual(stats["boxes_moved"], 0)
+            self.assertAlmostEqual(
+                frames[0]["detections"][0]["box_lidar"][2], 1.0, places=5)
 
 
 class FrameCarOverlapTest(unittest.TestCase):

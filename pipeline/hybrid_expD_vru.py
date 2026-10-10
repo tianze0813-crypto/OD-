@@ -1,12 +1,13 @@
 """VRU 链（行人 + 非机动车）：独立的推理后处理。
 
 与 Truck 链完全分离的参数（【改动】按用户 2026-09-18 需求）：
-  * 范围      方框 前 60 / 后 20 / 左右 40；行人另加 15m 半径
-  * 分数阈值  Pedestrian 0.2 / Nonmotorized_vehicle 0.2
+  * 范围      方框 前 60 / 后 20 / 左右 40；行人另加 20m 半径（【改动】2026-10-10：15 -> 20）
+  * 分数阈值  Pedestrian 0.4 / Nonmotorized_vehicle 0.25（【改动】2026-10-10）
   * 短轨迹    4（链级，非机动车等照旧）
   * 行人门槛  20  （【改动】2026-09-19 用户要求：**只对行人**，生命周期 <20 帧的轨迹整条删；
                      非机动车不受影响。实现在 tracking.apply_post_filters 的 class_min_frames）
-  * 静止过滤  非机动车净位移 < 15m 丢弃（行人不过滤）
+  * 静止过滤  【改动】2026-10-10：非机动车 15m 净位移过滤已按用户要求整段删除，不再删除任何 NMV 轨迹
+  * 行人框  【改动】2026-10-10：框高统一为 1.9m（原始 >1.9m 用原始高度）-> 顶贴头皮 -> 用框内低点 P95 作参照，框底与之有间距(>5cm)才裁、最多 20cm（逐帧，仅 Pedestrian）
   * yaw       沿用旧版 legacy（用户要求新版 yaw 只给 Truck）
   * obj_id    从 2000 开始（与 Truck 链的 1000 起互不冲突）
   * 【改动】2026-09-19：原"世界系一排行人"整排过滤规则已按用户要求删除，
@@ -34,7 +35,7 @@ LABEL_SUBDIR = "label_vru"
 # 本链的默认参数（可被 run(...) 的 overrides 覆盖）
 DEFAULTS: Dict[str, Any] = dict(
     keep_classes=KEEP_CLASSES,
-    class_score_thresholds={"Pedestrian": 0.2, "Nonmotorized_vehicle": 0.2},
+    class_score_thresholds={"Pedestrian": 0.4, "Nonmotorized_vehicle": 0.25},  # 【改动】2026-10-10
     range_front=60.0,          # 【改动】前 60
     range_rear=20.0,
     range_side=40.0,
@@ -42,9 +43,14 @@ DEFAULTS: Dict[str, Any] = dict(
     visibility_min_ratio=0.05,
     short_track_max_frames=4,    # 链级短轨迹阈值（<= 语义），非机动车等照旧
     pedestrian_min_frames=20,    # 【改动】只对行人：帧数 <20 的轨迹整条删（2026-09-19 用户要求）
-    pedestrian_max_distance=15.0,            # 【改动】行人 15m 半径
+    pedestrian_max_distance=20.0,            # 【改动】2026-10-10：行人 15m -> 20m
     nonmotorized_max_distance=60.0,
-    nonmotorized_min_net_displacement=15.0,  # 【改动】非机动车静止过滤
+    # 【改动】2026-10-10 行人框统一 1.8m + 顶部贴头皮 + 底部裁到真实最低点（VRU 链默认开）
+    pedestrian_top_fit=True,
+    pedestrian_top_fit_min_points=8,
+    pedestrian_top_fit_target_height_m=1.9,
+    pedestrian_top_fit_bottom_trim_m=0.20,
+    pedestrian_top_fit_min_bottom_gap_m=0.05,
     yaw_impl="legacy",         # 【改动】用户要求新版 yaw 只给 Truck
     static_rotation_classes=("Nonmotorized_vehicle",),
 )
@@ -97,11 +103,12 @@ def main() -> None:
     parser.add_argument("--range-front", type=float, default=DEFAULTS["range_front"])
     parser.add_argument("--range-rear", type=float, default=DEFAULTS["range_rear"])
     parser.add_argument("--range-side", type=float, default=DEFAULTS["range_side"])
-    parser.add_argument("--pedestrian-score-threshold", type=float, default=0.2)
-    parser.add_argument("--nonmotorized-score-threshold", type=float, default=0.2)
-    parser.add_argument("--pedestrian-max-distance", type=float, default=15.0)
+    parser.add_argument("--pedestrian-score-threshold", type=float, default=0.4)  # 【改动】2026-10-10
+    parser.add_argument("--nonmotorized-score-threshold", type=float, default=0.25)  # 【改动】2026-10-10
+    parser.add_argument("--pedestrian-max-distance", type=float, default=20.0)  # 【改动】2026-10-10
     parser.add_argument("--nonmotorized-max-distance", type=float, default=60.0)
-    parser.add_argument("--nonmotorized-min-net-displacement", type=float, default=15.0)
+    parser.add_argument("--no-pedestrian-top-fit", action="store_true",
+                        help="关闭行人框顶空白贴合")
     parser.add_argument("--short-track-max-frames", type=int, default=4)
     parser.add_argument("--pedestrian-min-frames", type=int, default=20,
                         help="【改动】仅行人：生命周期 < 该帧数的轨迹整条过滤（默认 20，0=关闭）")
@@ -113,7 +120,7 @@ def main() -> None:
                                        "Nonmotorized_vehicle": float(args.nonmotorized_score_threshold)},
                pedestrian_max_distance=float(args.pedestrian_max_distance),
                nonmotorized_max_distance=float(args.nonmotorized_max_distance),
-               nonmotorized_min_net_displacement=float(args.nonmotorized_min_net_displacement),
+               pedestrian_top_fit=not args.no_pedestrian_top_fit,
                range_front=args.range_front, range_rear=args.range_rear,
                range_side=args.range_side,
                short_track_max_frames=int(args.short_track_max_frames),

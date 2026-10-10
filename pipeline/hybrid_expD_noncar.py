@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import sys
 from collections import defaultdict
 
@@ -271,99 +272,177 @@ def drop_spinning_vehicle(
     }
 
 
-def drop_short_motion_nonmotorized(
-        frames: List[Dict[str, Any]],
-        coords: tracking.CoordinateProvider,
-        *,
-        min_net_displacement: float = 15.0,
-        class_name: str = "Nonmotorized_vehicle",
-) -> tuple[set[int], Dict[str, Any]]:
-    """Keep only Nonmotorized_vehicle tracks with enough net displacement.
+# Pedestrian bottom reference (2026-10-10): the low points INSIDE the box,
+# 95th percentile of the lowest cluster -> robust "floor" height.
+_GROUND_CLUSTER_M = 0.05
+_GROUND_MIN_POINTS = 6
+_GROUND_PERCENTILE = 95.0
 
-    For each track the world-frame XY net displacement between its first and
-    last usable observation is computed.  Frames whose pose transform is
-    unavailable are skipped from this calculation.  A track is removed when
-    its net displacement is at most ``min_net_displacement`` meters.  Jitter
-    does not affect the criterion because only the two end centers are used.
-    Tracks with fewer than two usable observations are kept because their net
-    displacement cannot be measured.
+
+def fit_pedestrian_box_top(
+        frames: List[Dict[str, Any]],
+        clip: Path,
+        *,
+        min_points: int = 8,
+        target_height_m: float = 1.9,
+        max_bottom_trim_m: float = 0.20,
+        min_bottom_gap_m: float = 0.05,
+        class_name: str = "Pedestrian",
+) -> Dict[str, Any]:
+    """Normalise a Pedestrian box to 1.8 m, pin its top on the head, trim to ground.
+
+    Per detection and per frame (2026-10-10 rule v2):
+
+    1. Unify height: if the detected height is at or below ``target_height_m``
+       the box is re-sized to exactly ``target_height_m``; an already taller
+       detection keeps its own height.
+    2. Move the box so its top sits on the highest point inside it (head),
+       so the scalp is always touched.
+    3. Bottom reference: inside the box, keep the lowest cluster of points and
+       use its 95th percentile as the floor height.  If the box bottom is more
+       than ``min_bottom_gap_m`` below that floor the bottom is raised toward
+       it, capped at ``max_bottom_trim_m``.  A box that already reaches the
+       floor is left untouched.  The top stays on the head.
+
+    Boxes with fewer than ``min_points`` in-box points are skipped.
     """
-    observations: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
-    tracks_seen: set[int] = set()
+    lidar_dir = Path(clip) / "lidar" / "lidar_top"
+    cache: Dict[int, Any] = {}
+    resized = 0
+    moved = 0
+    trimmed = 0
+    considered = 0
+    skipped_few_points = 0
+    max_shift = 0.0
+    max_trim = 0.0
+    details: List[Dict[str, Any]] = []
+
+    def inside_mask(points: np.ndarray, box: Sequence[float]) -> Any:
+        bx, by, bz, bdx, bdy, bdz, byaw = (float(value) for value in box[:7])
+        cos_yaw, sin_yaw = math.cos(byaw), math.sin(byaw)
+        px = points[:, 0] - bx
+        py = points[:, 1] - by
+        local_x = cos_yaw * px + sin_yaw * py
+        local_y = -sin_yaw * px + cos_yaw * py
+        return (
+            (np.abs(local_x) <= bdx / 2.0)
+            & (np.abs(local_y) <= bdy / 2.0)
+            & (points[:, 2] >= bz - bdz / 2.0)
+            & (points[:, 2] <= bz + bdz / 2.0)
+        )
+
+    def low_point_reference(points: np.ndarray, box: Sequence[float]) -> Any:
+        """P95 of the low points inside the box (robust floor reference)."""
+        inside = inside_mask(points, box)
+        candidates = points[inside, 2]
+        if len(candidates) < _GROUND_MIN_POINTS:
+            return None
+        low_edge = float(np.min(candidates))
+        cluster = candidates[candidates <= low_edge + _GROUND_CLUSTER_M]
+        if len(cluster) < _GROUND_MIN_POINTS:
+            cluster = np.sort(candidates)[:_GROUND_MIN_POINTS]
+        return float(np.percentile(cluster, _GROUND_PERCENTILE))
+
     for frame in frames:
         try:
             timestamp = int(frame["frame_id"])
         except (KeyError, TypeError, ValueError):
             continue
-        world_from_lidar = coords.world_from_lidar(timestamp)
+        points = cache.get(timestamp, "missing")
+        if points == "missing":
+            path = lidar_dir / f"{timestamp}.bin"
+            if not path.is_file():
+                cache[timestamp] = None
+                points = None
+            else:
+                raw = np.fromfile(str(path), dtype=np.float32)
+                columns = 4 if raw.size % 4 == 0 else 5
+                points = raw.reshape(-1, columns)[:, :3]
+                cache[timestamp] = points
+        if points is None or len(points) == 0:
+            continue
+
         for det in frame.get("detections", []):
             if tracking.canonical_class_name(det.get("class_name", "")) != class_name:
                 continue
-            if det.get("track_id") is None or not tracking.finite_box(det):
+            if not tracking.finite_box(det):
                 continue
-            track_id = int(det["track_id"])
-            tracks_seen.add(track_id)
-            if world_from_lidar is None:
-                # Missing pose frames do not participate in the net
-                # displacement calculation.
+            considered += 1
+            box = det["box_lidar"]
+
+            inside = inside_mask(points, box)
+            if int(np.count_nonzero(inside)) < int(min_points):
+                skipped_few_points += 1
                 continue
-            center = tracking.center_world(det["box_lidar"], world_from_lidar)
-            observations[track_id].append({
+
+            original_height = float(box[5])
+            original_bottom = float(box[2]) - original_height / 2.0
+            height = (float(target_height_m)
+                      if original_height <= float(target_height_m)
+                      else original_height)
+            if abs(height - original_height) > 1e-6:
+                resized += 1
+
+            # Step 1: unify height by extending UPWARD -- the bottom stays put
+            # and the added part goes on top, so the downward move can use it.
+            box[5] = height
+            box[2] = original_bottom + height / 2.0
+
+            inside = inside_mask(points, box)
+            if int(np.count_nonzero(inside)) < int(min_points):
+                skipped_few_points += 1
+                continue
+            head = float(np.max(points[inside, 2]))
+
+            # Step 2: move down until the box top sits on the head.
+            top_before = float(box[2]) + height / 2.0
+            shift = top_before - head
+            box[2] = head - height / 2.0
+            moved += 1
+            max_shift = max(max_shift, max(shift, 0.0))
+
+            # Step 3: raise the bottom toward the in-box low-point reference,
+            # but only when a real gap (> min_bottom_gap_m) exists; the trim
+            # itself is capped at max_bottom_trim_m.
+            trim = 0.0
+            gap = None
+            ground = low_point_reference(points, box)
+            if ground is not None:
+                bottom = float(box[2]) - float(box[5]) / 2.0
+                gap = ground - bottom
+                if gap > float(min_bottom_gap_m):
+                    trim = min(gap, float(max_bottom_trim_m))
+                    if trim > 1e-6:
+                        box[5] = float(box[5]) - trim
+                        box[2] = float(box[2]) + trim / 2.0
+                        trimmed += 1
+                        max_trim = max(max_trim, trim)
+
+            details.append({
                 "frame_id": timestamp,
-                "center_xy": np.asarray(center[:2], dtype=np.float64),
+                "track_id": (int(det["track_id"])
+                             if det.get("track_id") is not None else None),
+                "head_z": round(head, 4),
+                "height_m": round(float(box[5]), 4),
+                "shift_m": round(max(shift, 0.0), 4),
+                "bottom_gap_m": (round(gap, 4) if gap is not None else None),
+                "trim_m": round(trim, 4),
             })
 
-    dropped: set[int] = set()
-    details: List[Dict[str, Any]] = []
-    unmeasurable = 0
-    for track_id, items in sorted(observations.items()):
-        items = sorted(items, key=lambda item: int(item["frame_id"]))
-        if len(items) < 2:
-            unmeasurable += 1
-            continue
-        first, last = items[0], items[-1]
-        net_displacement = float(
-            np.linalg.norm(last["center_xy"] - first["center_xy"]))
-        if net_displacement > float(min_net_displacement):
-            continue
-        dropped.add(track_id)
-        details.append({
-            "track_id": track_id,
-            "observations": len(items),
-            "net_displacement_m": round(net_displacement, 4),
-            "first_frame": int(first["frame_id"]),
-            "last_frame": int(last["frame_id"]),
-        })
-
-    # Tracks with no usable pose at all are unmeasurable as well.
-    unmeasurable += len(tracks_seen - set(observations))
-
-    removed = 0
-    for frame in frames:
-        old = frame.get("detections", [])
-        kept = []
-        for det in old:
-            if (det.get("track_id") is not None
-                    and int(det["track_id"]) in dropped
-                    and tracking.canonical_class_name(
-                        det.get("class_name", "")) == class_name):
-                continue
-            kept.append(det)
-        removed += len(old) - len(kept)
-        frame["detections"] = kept
-        frame["num_detections"] = len(kept)
-
-    return dropped, {
-        "pipeline": "hybrid_drop_short_motion_nonmotorized",
+    return {
+        "pipeline": "hybrid_fit_pedestrian_box_top",
         "class": class_name,
-        "min_net_displacement_m": float(min_net_displacement),
-        "tracks_seen": len(tracks_seen),
-        "tracks_measured": len(observations),
-        "tracks_unmeasurable": unmeasurable,
-        "tracks_dropped": len(dropped),
-        "tracks_kept": len(tracks_seen) - len(dropped) - unmeasurable,
-        "boxes_removed": removed,
-        "dropped_track_ids": sorted(dropped),
+        "min_points": int(min_points),
+        "target_height_m": float(target_height_m),
+        "max_bottom_trim_m": float(max_bottom_trim_m),
+        "min_bottom_gap_m": float(min_bottom_gap_m),
+        "boxes_considered": considered,
+        "boxes_resized_to_target": resized,
+        "boxes_moved": moved,
+        "boxes_trimmed": trimmed,
+        "boxes_skipped_few_points": skipped_few_points,
+        "max_shift_m": round(max_shift, 4),
+        "max_trim_m": round(max_trim, 4),
         "details": details,
     }
 
@@ -380,7 +459,12 @@ def run(raw_json: Path, clip: Path, out_json: Path,
         class_score_thresholds: Mapping[str, float] | None = None,
         pedestrian_max_distance: float = 15.0,   # 【改动】20 -> 15
         nonmotorized_max_distance: float = 60.0,
-        nonmotorized_min_net_displacement: float = 15.0,
+        # 【改动 2026-10-10】行人框统一 1.8m + 顶部贴头皮 + 底部按 P95 拟合地面裁（有间距才裁、最多 20cm）（VRU 链默认开）
+        pedestrian_top_fit: bool = False,
+        pedestrian_top_fit_min_points: int = 8,
+        pedestrian_top_fit_target_height_m: float = 1.9,
+        pedestrian_top_fit_bottom_trim_m: float = 0.20,
+        pedestrian_top_fit_min_bottom_gap_m: float = 0.05,
         # 【改动】范围过滤：前 60 / 后 20 / 左右 40
         range_front: float = 60.0,
         range_rear: float = 20.0,
@@ -435,7 +519,6 @@ def run(raw_json: Path, clip: Path, out_json: Path,
             "current_identity_tracking",
             "current_class_correction_and_filters_without_static_car_pass",
             "current_non_car_geometry_refinement",
-            "drop_short_motion_nonmotorized",
             "base_link_conversion",
         ],
     }
@@ -544,11 +627,14 @@ def run(raw_json: Path, clip: Path, out_json: Path,
         diagnostics["truck_postprocess"] = apply_truck_postprocess(
             processed, coords, Path(clip),
             truck_postprocess_config or TruckPostConfig())
-    _short_dropped, short_motion_stats = drop_short_motion_nonmotorized(
-        processed, coords,
-        min_net_displacement=nonmotorized_min_net_displacement,
-    )
-    diagnostics["nonmotorized_short_motion"] = short_motion_stats
+    if pedestrian_top_fit:
+        # 【改动 2026-10-10】行人框顶留白 > gap 就整框下移贴合（逐帧，仅 Pedestrian）
+        diagnostics["pedestrian_top_fit"] = fit_pedestrian_box_top(
+            processed, Path(clip),
+            min_points=pedestrian_top_fit_min_points,
+            target_height_m=pedestrian_top_fit_target_height_m,
+            max_bottom_trim_m=pedestrian_top_fit_bottom_trim_m,
+            min_bottom_gap_m=pedestrian_top_fit_min_bottom_gap_m)
     _spin_dropped, spin_stats = drop_spinning_vehicle(processed)
     diagnostics["spinning_truck_bus"] = spin_stats
     output, final_diag = apply_five_class_output(processed, coords)
@@ -600,10 +686,6 @@ def main() -> None:
     parser.add_argument("--nonmotorized-score-threshold", type=float)
     parser.add_argument("--pedestrian-max-distance", type=float, default=15.0)  # 【改动】20 -> 15
     parser.add_argument("--nonmotorized-max-distance", type=float, default=60.0)
-    parser.add_argument("--nonmotorized-min-net-displacement", type=float,
-                        default=15.0,
-                        help="keep NMV tracks whose world-frame XY net "
-                             "displacement is greater than this")
     args = parser.parse_args()
     class_thresholds = {}
     for name, value in (
@@ -623,8 +705,6 @@ def main() -> None:
         class_score_thresholds=class_thresholds,
         pedestrian_max_distance=args.pedestrian_max_distance,
         nonmotorized_max_distance=args.nonmotorized_max_distance,
-        nonmotorized_min_net_displacement=(
-            args.nonmotorized_min_net_displacement),
     )
     print(json.dumps({
         "pipeline": result["pipeline"],

@@ -64,7 +64,6 @@ DEFAULTS: Dict[str, Any] = dict(
     sparsity_max_points=10,
     visibility_min_ratio=0.05,
     short_track_max_frames=4,  # 【改动】短轨迹过滤保留，阈值 4
-    nonmotorized_min_net_displacement=0.0,   # 本链无 NMV，不生效
     yaw_impl="v2",             # 【改动】新版 yaw：动态段保留 detector yaw
     static_rotation_classes=("Truck", "Bus"),
     # 【改动】2026-09-20 关掉 step2_5 的「静止旋转轨迹整条删除」：

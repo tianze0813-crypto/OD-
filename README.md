@@ -135,7 +135,7 @@ bak/                             已归档（**gitignore**，见 bak/README.md�
 ```
 
 `models/` 里在用的：**`ft_ct2_A_fulllr_epoch8.pth`（车链默认，交警域微调 ct2-A，配 `configs/police_bevfusion_mmdet3d_lidaronly_ct2roi.py`）**、`bevfusion_mmdet3d_lidaronly.pth`（旧官方 46MB，可显式指回）、`bevfusion_mmdet3d_lidarcam.pth`
-（fusion 模式）、`voxelnext_vru_1head2cls_epoch20.pth` + `voxelnext_vru_infer.yaml`（VRU）、
+（fusion 模式）、`voxelnext_vru_rider_005_60m_epoch20.pth` + `voxelnext_vru_infer_60_005.yaml`（VRU 默认，2026-10-10 起，0.05m/±60m 配套 config；旧 `voxelnext_vru_1head2cls_epoch20.pth` + `voxelnext_vru_infer.yaml` 保留可显式指回）、
 `voxelnext_truckB_epoch15.pth` + `voxelnext_truck_infer.yaml`（Truck 回退，入口会校验存在）、
 `vod_2cls_ft_e12.pth` + `voxelnext_fiveclass_nuscenes_infer.yaml`（`--chains noncar`）。
 
@@ -148,10 +148,12 @@ bak/                             已归档（**gitignore**，见 bak/README.md�
 
 | 项 | Car / Truck（车链） | VRU |
 | --- | --- | --- |
-| 分数门槛（默认）| **Car 0.1 / Truck 0.05** / Trailer 0.25 | Ped 0.2 / NMV 0.2 |
-| 范围 前/后/侧 (m) | 80 / 20 / 40 | 60 / 20 / 40（行人另限 15 m，NMV 60 m）|
+| 分数门槛（默认）| **Car 0.1 / Truck 0.05** / Trailer 0.25 | **Ped 0.4 / NMV 0.25**（raw 推理门槛 0.25）|
+| 范围 前/后/侧 (m) | 80 / 20 / 40 | 60 / 20 / 40（行人另限 **20 m**，NMV 60 m）|
 | 稀疏度（框内点数）| Car ≤5 / Truck ≤10 | ≤10 |
 | 短轨迹 | Car ≤3 / Truck ≤4 帧 | ≤4 帧（行人另加 <20 帧整条删）|
+| 行人框 | — | 框高统一 1.9m（原始 >1.9m 用原始高度）→ 顶贴头皮 → 框内低点 P95 作参照，框底与参照间距 >5cm 才裁、最多 20cm；逐帧，框内 <8 点跳过 |
+| 非机动车静止过滤 | — | **已删除**（2026-10-10：原 15m 净位移删链规则整段移除）|
 | 挂车 | `--trailer-policy to-truck`（默认并成 Truck，标注侧无 Trailer 类）| — |
 | 静态刚性框 | `--static-rigid`（默认关）| — |
 | yaw | Car：`--car-yaw-settle step45`（默认，B1：static_yaw 只算不写 + 几何跑 detector 原生系 + step4.5 settle 在几何之后写轴和方向）；Truck：`geometry_yaw_v2` | `legacy` |

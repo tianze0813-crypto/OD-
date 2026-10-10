@@ -49,8 +49,8 @@ NONCAR_CKPT = ROOT / "models" / "vod_2cls_ft_e12.pth"
 # 【改动】三条链各自的权重/配置
 TRUCK_CFG = ROOT / "models" / "voxelnext_truck_infer.yaml"
 TRUCK_CKPT = ROOT / "models" / "voxelnext_truckB_epoch15.pth"
-VRU_CFG = ROOT / "models" / "voxelnext_vru_infer.yaml"
-VRU_CKPT = ROOT / "models" / "voxelnext_vru_1head2cls_epoch20.pth"
+VRU_CFG = ROOT / "models" / "voxelnext_vru_infer_60_005.yaml"   # 【改动】2026-10-10 与 0.05m/±60m 新权重配套；旧权重用 voxelnext_vru_infer.yaml
+VRU_CKPT = ROOT / "models" / "voxelnext_vru_rider_005_60m_epoch20.pth"   # 【改动】2026-10-10 新 VRU 默认权重
 TRUCK_ID_OFFSET = 1000
 VRU_ID_OFFSET = 2000
 DEFAULT_CHAINS = ("car", "truck", "vru")
@@ -454,7 +454,6 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
              pedestrian_max_distance: float = 15.0,   # 【改动】20 -> 15
              nonmotorized_max_distance: float = 60.0,
              sparsity_max_points: int = 10,
-             nonmotorized_min_net_displacement: float = 15.0,
              chains: tuple = DEFAULT_CHAINS,          # 【改动】car,truck,vru
              truck_cfg: Path = TRUCK_CFG,
              truck_ckpt: Path = TRUCK_CKPT,
@@ -711,8 +710,6 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
                 pedestrian_max_distance=pedestrian_max_distance,
                 nonmotorized_max_distance=nonmotorized_max_distance,
                 sparsity_max_points=sparsity_max_points,
-                nonmotorized_min_net_displacement=(
-                    nonmotorized_min_net_displacement),
             )
             expd_frames = json.loads(expd_json.read_text(encoding="utf-8"))
             timings["noncar"] = round(time.monotonic() - _t, 1)
@@ -838,11 +835,6 @@ def main() -> int:
     parser.add_argument("--pedestrian-max-distance", type=float, default=15.0)  # 【改动】20 -> 15
     parser.add_argument("--nonmotorized-max-distance", type=float, default=60.0)
     parser.add_argument("--sparsity-max-points", type=int, default=10)
-    parser.add_argument("--nonmotorized-min-net-displacement",
-                        type=float, default=15.0,
-                        help="drop NMV tracks whose world-frame XY net "
-                             "displacement (first to last usable center) is "
-                             "not greater than this")
     parser.add_argument("--noncar-cfg", type=Path, default=NONCAR_CFG,
                         help="non-Car inference config (default: expD config)")
     parser.add_argument("--noncar-ckpt", type=Path, default=NONCAR_CKPT,
@@ -919,7 +911,7 @@ def main() -> int:
                         help="keep: 纯挂车轨迹保留 Trailer；to-truck（默认）: 一律并成 Truck")
     parser.add_argument("--vru-cfg", type=Path, default=VRU_CFG)
     parser.add_argument("--vru-ckpt", type=Path, default=VRU_CKPT)
-    parser.add_argument("--vru-raw-threshold", type=float, default=0.3)
+    parser.add_argument("--vru-raw-threshold", type=float, default=0.25)  # 【改动】2026-10-10
     parser.add_argument("--car-truck-cover-threshold", type=float, default=0.5,
                         help="Car 被 Truck 覆盖的面积 / Car 面积 达到该值就删掉这条 "
                              "Car 轨迹的全部帧（0 关闭）")
@@ -991,9 +983,7 @@ def main() -> int:
            f"class thresholds={class_thresholds}, "
            f"pedestrian_max_distance={args.pedestrian_max_distance}, "
            f"nonmotorized_max_distance={args.nonmotorized_max_distance}, "
-           f"sparsity_max_points={args.sparsity_max_points}, "
-           f"nonmotorized_min_net_displacement="
-           f"{args.nonmotorized_min_net_displacement}")
+           f"sparsity_max_points={args.sparsity_max_points}")
     chains = tuple(name.strip() for name in args.chains.split(",") if name.strip())
     unknown = [name for name in chains if name not in ("car", "truck", "vru", "noncar")]
     if unknown:
@@ -1082,8 +1072,6 @@ def main() -> int:
             pedestrian_max_distance=args.pedestrian_max_distance,
             nonmotorized_max_distance=args.nonmotorized_max_distance,
             sparsity_max_points=args.sparsity_max_points,
-            nonmotorized_min_net_displacement=(
-                args.nonmotorized_min_net_displacement),
             chains=chains,
             truck_cfg=truck_cfg,
             truck_ckpt=truck_ckpt,
