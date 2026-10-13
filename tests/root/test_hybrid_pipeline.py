@@ -254,7 +254,8 @@ class HybridPipelineTest(unittest.TestCase):
 
             self.assertEqual(events, ["bev_raw", "vehicle", "expd_inference", "expd_postprocess"])
             labels = json.loads(
-                (output_root / "scene_pre" / "label" / "1.json").read_text())
+                (output_root / "scene_pre" / "label" / "det"
+                 / "1.json").read_text())
             self.assertEqual([label["obj_type"] for label in labels],
                              ["Car", "Truck"])
             self.assertFalse((source / "label").exists())
@@ -358,7 +359,7 @@ class HybridPipelineTest(unittest.TestCase):
             self.assertFalse(source.exists())
             self.assertTrue(destination.is_dir())
             labels = json.loads(
-                (destination / "label" / "1.json").read_text())
+                (destination / "label" / "det" / "1.json").read_text())
             self.assertEqual([label["obj_type"] for label in labels],
                              ["Car", "Truck"])
             self.assertEqual(result["final_clip"], str(destination))
@@ -376,14 +377,17 @@ class HybridPipelineTest(unittest.TestCase):
                          "scene_pre_bev")
 
     def test_runner_reruns_existing_pre_clip_in_place(self):
-        """带 _pre 的输入重跑：目录名不变，只重写 label/（不生成 _pre_pre）。"""
+        """带 _pre 的输入重跑：目录名不变，只重写 label/det/（不生成 _pre_pre）。"""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "scene_pre"
             (source / "lidar" / "lidar_top").mkdir(parents=True)
             (source / "lidar" / "lidar_top" / "1.bin").write_bytes(b"")
-            (source / "label").mkdir()
+            # 旧产物：老版本平铺的 label/*.json + 新一轮的 label/det/*.json
+            # 重跑后两者都要被清掉，只留新的 label/det/1.json。
+            (source / "label" / "det").mkdir(parents=True)
             (source / "label" / "stale.json").write_text("[]", encoding="utf-8")
+            (source / "label" / "det" / "old.json").write_text("[]", encoding="utf-8")
             output_root = root / "out"
 
             def fake_vehicle(_raw, _clip, _work_root, _python, **_kwargs):
@@ -410,7 +414,9 @@ class HybridPipelineTest(unittest.TestCase):
             self.assertTrue(source.is_dir())
             self.assertFalse((root / "scene_pre_pre").exists())
             self.assertFalse((source / "label" / "stale.json").exists())
-            labels = json.loads((source / "label" / "1.json").read_text())
+            self.assertFalse((source / "label" / "det" / "old.json").exists())
+            labels = json.loads(
+                (source / "label" / "det" / "1.json").read_text())
             self.assertEqual([label["obj_type"] for label in labels], ["Car"])
             self.assertEqual(result["final_clip"], str(source))
 

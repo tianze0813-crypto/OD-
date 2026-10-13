@@ -1,11 +1,11 @@
 # 四类别 LiDAR 预标注流水线（Car / Truck / Pedestrian / Nonmotorized_vehicle）
 
 输入：SUSTechPOINTS 原始 clip（含 `lidar/lidar_top/*.bin` 与 `transforms/`）。
-输出：每帧写在 `<clip>_pre/label/<frame_id>.json`（**base_link** 系，obj_id 已分段），
+输出：每帧写在 `<clip>_pre/label/det/<frame_id>.json`（**base_link** 系，obj_id 已分段），
 可直接用 SUSTechPOINTS 打开。
 
 一条链路：**BEVFusion 推理一次**（Car 与 Truck 共用这份检测，动静态区域只算一次）
-+ **VoxelNeXt 推理一次**（行人 / 非机动车），最后按 frame_id 合成一份 `label/`。
++ **VoxelNeXt 推理一次**（行人 / 非机动车），最后按 frame_id 合成一份 `label/det/`。
 
 ---
 
@@ -56,7 +56,7 @@ done
 
 | 产物 | 何时写 | 说明 |
 | --- | --- | --- |
-| `<clip>_pre/label/<frame_id>.json` | 总是 | SUST 标签，base_link 系 |
+| `<clip>_pre/label/det/<frame_id>.json` | 总是 | SUST 标签，base_link 系（2026-10-13 起多一层 `det/`） |
 | `<clip>_pre/vehicle_pass_diagnostics.json` | 加 `--keep-vehicle-diagnostics` | 车链全过程诊断（槽位 / 动态区域 / 挂车折叠 / 几何还原 / yaw），调试用 |
 | `<clip>_pre/label_car`、`label_truck`、`label_vru` | 加 `--keep-chain-labels` | 分链标签，便于对比 |
 
@@ -70,7 +70,7 @@ done
 
 ```text
 hybrid_run.sh                                   挑 openpcdet 环境的 python，exec 入口脚本
-└─ scripts/run_hybrid_prelabel.py               编排：推理一次 -> 车链 -> VRU -> 合并 -> 写 label/
+└─ scripts/run_hybrid_prelabel.py               编排：推理一次 -> 车链 -> VRU -> 合并 -> 写 label/det/
    │
    ├─ pipeline/step1_bevfusion_truck.py                    【子进程，mmdet3d 环境】
    │   ├─ bevfusion/scripts/prep_data.py           5 列 bin + 去畸变（mode=lidar 时跳过图像）
@@ -100,7 +100,7 @@ hybrid_run.sh                                   挑 openpcdet 环境的 python�
    ├─ pipeline/hybrid_expD_vru.py                          VRU 链（VoxelNeXt）
    │   └─ pipeline/step1_lidar_inference.py 【子进程】models/voxelnext_vru_1head2cls_epoch20.pth
    │
-   └─ scripts/run_hybrid_prelabel.py::_merge_chain_labels  三条链按 frame_id 合成一份 label/
+   └─ scripts/run_hybrid_prelabel.py::_merge_chain_labels  三条链按 frame_id 合成一份 label/det/
 ```
 
 > ⚠️ `main_chain/` 不是历史残留：Car 的 step2~step5（含 step5a）就是那份代码（子进程、独立 `sys.path`）。

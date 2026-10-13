@@ -8,7 +8,7 @@
   2. Truck : pipeline/hybrid_expD_truck.py，权重 models/voxelnext_truckB_epoch15.pth（obj_id +1000）
   3. VRU   : pipeline/hybrid_expD_vru.py，权重 models/voxelnext_vru_1head2cls_epoch20.pth（obj_id +2000）
 
-三条链各自独立推理，最后按 frame_id 合成一份 label/。
+三条链各自独立推理，最后按 frame_id 合成一份 label/det/（【改动】2026-10-13：多一层 det）。
 用 --chains 可选子集，例如 --chains car,truck；旧五类单链用 --chains car,noncar。
 """
 
@@ -76,6 +76,19 @@ _SKIP_DIR_NAMES = {"lost+found", ".Trash-1000", ".Trash", "$RECYCLE.BIN",
 
 
 PRE_SUFFIX = "_pre"
+
+# 【改动】2026-10-13：最终 SUST 标签多一层 det 目录，落成
+# ``<clip>/label/det/<frame_id>.json``（原先是 ``<clip>/label/<frame_id>.json``）。
+# 这是一层适配：写盘 / 清理都按 label/det 走；若某个下游仍只认平铺的 label/*.json，
+# 把 DET_SUBDIR 置空即可整体回退。
+LABEL_SUBDIR = "label"
+DET_SUBDIR = "det"
+
+
+def _label_dir(clip: Path) -> Path:
+    """最终标签目录：``<clip>/label/det``（DET_SUBDIR 为空时退回 ``<clip>/label``）。"""
+    base = Path(clip) / LABEL_SUBDIR
+    return base / DET_SUBDIR if DET_SUBDIR else base
 
 
 def _pre_clip_name(base: str, tag: str = "",
@@ -212,9 +225,15 @@ def _python_candidates(explicit: Path | None) -> List[Path]:
 
 
 def _write_labels(frames: List[Dict[str, Any]], clip: Path) -> int:
-    label_dir = clip / "label"
-    if label_dir.exists():
-        shutil.rmtree(label_dir)
+    """写最终合并标签：``<clip>/label/det/<frame_id>.json``（【改动】2026-10-13）。
+
+    先整棵删掉 ``<clip>/label`` 再重建：这样重跑时旧的 ``label/*.json``（老版本
+    平铺产物）和 ``label/det/*.json`` 都会被清干净，不会和新结果混在一起。
+    """
+    label_root = clip / LABEL_SUBDIR
+    if label_root.exists():
+        shutil.rmtree(label_root)
+    label_dir = _label_dir(clip)
     label_dir.mkdir(parents=True, exist_ok=True)
     count = 0
     for frame in frames:
@@ -525,9 +544,9 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
             shutil.rmtree(destination)
         elif rerun_in_place and not overwrite:
             raise RuntimeError(
-                f"重跑已标注的 clip 要带 --overwrite（会覆盖 {clip}/label）: {clip}")
+                f"重跑已标注的 clip 要带 --overwrite（会覆盖 {clip}/label/det）: {clip}")
         if rerun_in_place:
-            _print(f"{base}: 就地重跑（已标注，覆盖 label/ 与分链标签）")
+            _print(f"{base}: 就地重跑（已标注，覆盖 label/det/ 与分链标签）")
     elif export_sust:
         destination = output_root / output_name
         if destination.exists():
@@ -746,7 +765,7 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
                 (destination / sub).symlink_to(src.resolve())
         labels = _write_labels(merged, destination)
     elif in_place and rerun_in_place:
-        # 重跑已标注的 clip：目录名不变，只把 label/ 整个重写（_write_labels 会先 rmtree）
+        # 重跑已标注的 clip：目录名不变，只把 label/ 整棵重写（_write_labels 先 rmtree 再建 label/det）
         labels = _write_labels(merged, destination)
     elif in_place:
         # 端到端原地模式：把输入 clip 改名为 <clip>_pre，再把标签写进去，
