@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -108,7 +110,7 @@ class VehiclePassTest(unittest.TestCase):
 
 
 class EmptyInputTest(unittest.TestCase):
-    """空输入必须硬失败：不能再产出「只有 VRU 标签」的半成品。"""
+    """空输入：0 帧仍硬失败；0 框只警告，按空车链结果继续（2026-10-09 起）。"""
 
     def test_empty_frames_raises(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -118,14 +120,26 @@ class EmptyInputTest(unittest.TestCase):
                 run(raw, Path("/tmp/whatever_clip"), Path(tmp) / "work")
             self.assertIn("0 帧", str(ctx.exception))
 
-    def test_frames_without_boxes_raises(self):
+    def test_frames_without_boxes_warns_and_continues(self):
+        """1 帧 0 框：不再硬失败，只打印警告后继续（0 帧才硬失败）。
+
+        后续阶段需要真实 clip（transforms/pose_data.txt 等），本用例只关心
+        「0 框不再抛 RuntimeError，而是打一条警告」；下游因缺文件抛的异常与本用例无关。
+        """
         with tempfile.TemporaryDirectory() as tmp:
             raw = Path(tmp) / "raw.json"
             raw.write_text(json.dumps([{"frame_id": "1", "detections": []}]),
                            encoding="utf-8")
-            with self.assertRaises(RuntimeError) as ctx:
-                run(raw, Path("/tmp/whatever_clip"), Path(tmp) / "work")
-            self.assertIn("没有任何框", str(ctx.exception))
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                try:
+                    run(raw, Path("/tmp/whatever_clip"), Path(tmp) / "work")
+                except RuntimeError as exc:
+                    self.fail(f"0 框不应再抛 RuntimeError（应只警告后继续）：{exc}")
+                except Exception:
+                    pass
+            self.assertIn("没有任何框", buf.getvalue())
+            self.assertIn("警告", buf.getvalue())
 
 
 if __name__ == "__main__":
