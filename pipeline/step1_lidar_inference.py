@@ -4,6 +4,9 @@
 Input is an unlabelled SUST clip (``lidar/lidar_top/*.bin`` plus
 ``transforms/``).  Output is the ``*_raw.json`` consumed by step 2.
 
+【改动 2026-10-10】``--fuse-lidars``：推理前先把 lidar_front / lidar_rear 按标定
+融合进 lidar_top（补 top 雷达近场盲区），融合结果落在 ``<work-root>/lidar_fused/<clip>/``。
+
 Run this step with the OpenPCDet environment, for example:
     python pipeline/step1_lidar_inference.py \
         --clip /path/to/scene_clip
@@ -22,6 +25,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from filtering import camera_visibility
+from pipeline import lidar_fusion
 
 
 DEFAULT_CFG = PROJECT_ROOT / "models" / "voxelnext_fiveclass_nuscenes_infer.yaml"
@@ -74,12 +78,21 @@ def collect_clips(args) -> list[Path]:
 def run_inference(clip: Path, args) -> Path:
     raw_json = args.work_root / f"{clip.name}_raw.json"
     raw_json.parent.mkdir(parents=True, exist_ok=True)
+    lidar_dir = clip / "lidar" / "lidar_top"
+    if getattr(args, "fuse_lidars", False):
+        # 公共预处理：front/rear -> top 系拼接，补 top 近场盲区。
+        fused_dir = args.work_root / "lidar_fused" / clip.name
+        if not any(fused_dir.glob("*.bin")):
+            stats = lidar_fusion.fuse_clip(clip, fused_dir)
+            print(f"lidar fusion: {stats['frames']} 帧, 附加 "
+                  f"{stats['attached_points']} 点 -> {fused_dir}", flush=True)
+        lidar_dir = fused_dir
     cmd = [
         sys.executable,
         str(PROJECT_ROOT / "inference" / "run_prelabel.py"),
         "--cfg_file", str(args.cfg),
         "--ckpt", str(args.ckpt),
-        "--lidar_dir", str(clip / "lidar" / "lidar_top"),
+        "--lidar_dir", str(lidar_dir),
         "--out_json", str(raw_json),
         "--score_thresh", str(args.score_thresh),
     ]
@@ -113,6 +126,8 @@ def main() -> None:
     parser.add_argument("--score-thresh", type=float, default=0.3)
     parser.add_argument("--drop-vis-below", type=float, default=0.05)
     parser.add_argument("--vis-occl-tol", type=float, default=0.3)
+    parser.add_argument("--fuse-lidars", action="store_true",
+                        help="推理前融合 lidar_front/rear 到 lidar_top（补近场盲区）")
     parser.add_argument("--no-visibility-check", action="store_true")
     args = parser.parse_args()
 

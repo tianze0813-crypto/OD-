@@ -217,14 +217,14 @@ class HybridPipelineTest(unittest.TestCase):
                     "truck_frames": [],
                     "diagnostics": {"car_detections": 1, "truck_detections": 0}}
 
-            def fake_bev(_python, _clip, work_root, _threshold, _mode, _cfg=None, _ckpt=None):
+            def fake_bev(_python, _clip, work_root, _threshold, _mode, _cfg=None, _ckpt=None, fuse_lidars=False):
                 events.append("bev_raw")
                 work_root.mkdir(parents=True, exist_ok=True)
                 raw = work_root / "bev_raw.json"
                 raw.write_text("[]", encoding="utf-8")
                 return raw
 
-            def fake_raw(_python, _clip, _cfg, _ckpt, work_root, name, _threshold):
+            def fake_raw(_python, _clip, _cfg, _ckpt, work_root, name, _threshold, fuse_lidars=False):
                 events.append("expd_inference")
                 work_root.mkdir(parents=True, exist_ok=True)
                 raw = work_root / f"{name}_raw.json"
@@ -276,13 +276,13 @@ class HybridPipelineTest(unittest.TestCase):
                     "truck_frames": [],
                     "diagnostics": {"car_detections": 1, "truck_detections": 0}}
 
-            def fake_bev(_python, _clip, work_root, _threshold, _mode, _cfg=None, _ckpt=None):
+            def fake_bev(_python, _clip, work_root, _threshold, _mode, _cfg=None, _ckpt=None, fuse_lidars=False):
                 work_root.mkdir(parents=True, exist_ok=True)
                 raw = work_root / "bev_raw.json"
                 raw.write_text("[]", encoding="utf-8")
                 return raw
 
-            def fake_raw(_python, _clip, _cfg, _ckpt, work_root, name, _threshold):
+            def fake_raw(_python, _clip, _cfg, _ckpt, work_root, name, _threshold, fuse_lidars=False):
                 work_root.mkdir(parents=True, exist_ok=True)
                 raw = work_root / f"{name}_raw.json"
                 raw.write_text("[]", encoding="utf-8")
@@ -325,13 +325,13 @@ class HybridPipelineTest(unittest.TestCase):
                     "truck_frames": [],
                     "diagnostics": {"car_detections": 1, "truck_detections": 0}}
 
-            def fake_bev(_python, _clip, work_root, _threshold, _mode, _cfg=None, _ckpt=None):
+            def fake_bev(_python, _clip, work_root, _threshold, _mode, _cfg=None, _ckpt=None, fuse_lidars=False):
                 work_root.mkdir(parents=True, exist_ok=True)
                 raw = work_root / "bev_raw.json"
                 raw.write_text("[]", encoding="utf-8")
                 return raw
 
-            def fake_raw(_python, _clip, _cfg, _ckpt, work_root, name, _threshold):
+            def fake_raw(_python, _clip, _cfg, _ckpt, work_root, name, _threshold, fuse_lidars=False):
                 work_root.mkdir(parents=True, exist_ok=True)
                 raw = work_root / f"{name}_raw.json"
                 raw.write_text("[]", encoding="utf-8")
@@ -397,7 +397,7 @@ class HybridPipelineTest(unittest.TestCase):
                     "truck_frames": [],
                     "diagnostics": {"car_detections": 1, "truck_detections": 1}}
 
-            def fake_bev(_python, _clip, work_root, _threshold, _mode, _cfg=None, _ckpt=None):
+            def fake_bev(_python, _clip, work_root, _threshold, _mode, _cfg=None, _ckpt=None, fuse_lidars=False):
                 work_root.mkdir(parents=True, exist_ok=True)
                 raw = work_root / "bev_raw.json"
                 raw.write_text("[]", encoding="utf-8")

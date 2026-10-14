@@ -246,15 +246,19 @@ def _write_labels(frames: List[Dict[str, Any]], clip: Path) -> int:
 
 
 def _run_raw(python: Path, clip: Path, cfg: Path, ckpt: Path,
-             work_root: Path, name: str, score_thresh: float) -> Path:
+             work_root: Path, name: str, score_thresh: float,
+             fuse_lidars: bool = False) -> Path:
     # step1_lidar_inference.py writes <clip.name>_raw.json under work_root.
     output = work_root / f"{clip.name}_raw.json"
-    _run([
+    command = [
         python, ROOT / "pipeline" / "step1_lidar_inference.py",
         "--clip", clip, "--work-root", work_root,
         "--cfg", cfg, "--ckpt", ckpt,
         "--score-thresh", score_thresh, "--drop-vis-below", "0.0",
-    ])
+    ]
+    if fuse_lidars:
+        command.append("--fuse-lidars")
+    _run(command)
     if not output.is_file():
         raise RuntimeError(f"inference did not create raw JSON: {output}")
     return output
@@ -263,7 +267,8 @@ def _run_raw(python: Path, clip: Path, cfg: Path, ckpt: Path,
 def _run_raw_bevfusion(python: Path, clip: Path, work_root: Path,
                        score_thresh: float, mode: str = "lidar",
                        cfg: Path | None = None,
-                       ckpt: Path | None = None) -> Path:
+                       ckpt: Path | None = None,
+                       fuse_lidars: bool = False) -> Path:
     """【改动】2026-09-20：Truck 链改用 BEVFusion 检测器（pipeline/step1_bevfusion_truck.py）。
 
     该脚本内部会：去畸变+5列bin+infos（幂等缓存）-> mmdet3d BEVFusion 推理（z 已统一到框中心）
@@ -277,6 +282,8 @@ def _run_raw_bevfusion(python: Path, clip: Path, work_root: Path,
         "--clip", clip, "--work-root", work_root,
         "--score-thresh", score_thresh, "--mode", str(mode),
     ]
+    if fuse_lidars:
+        command.append("--fuse-lidars")
     if cfg is not None:
         command += ["--cfg", str(cfg)]
     if ckpt is not None:
@@ -496,6 +503,7 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
              vru_cfg: Path = VRU_CFG,
              vru_ckpt: Path = VRU_CKPT,
              vru_raw_threshold: float = 0.3,
+             vru_fuse_lidars: bool = True,   # 【改动 2026-10-10】VRU 默认融合 front/rear 补近场（车链不融合）
              keep_chain_labels: bool = False,
              # 已停用（见 _merge_chain_labels：Car 优先接管 Car/Truck 冲突）
              car_truck_cover_threshold: float = 0.5,
@@ -699,7 +707,8 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
             _print(f"{base}: {step}/{total} VRU 链（{vru_src}: Pedestrian + Nonmotorized_vehicle）")
             _t = time.monotonic()
             raw = bev_raw if vru_detector == "bevfusion" else _run_raw(
-                python, clip, vru_cfg, vru_ckpt, work / "vru_raw", "vru", vru_raw_threshold)
+                python, clip, vru_cfg, vru_ckpt, work / "vru_raw", "vru", vru_raw_threshold,
+                fuse_lidars=vru_fuse_lidars)
             out = work / "vru.json"
             diag_path = work / "vru_diagnostics.json"
             result = run_expd_vru(raw, clip, out, diag_path)
@@ -931,6 +940,8 @@ def main() -> int:
     parser.add_argument("--vru-cfg", type=Path, default=VRU_CFG)
     parser.add_argument("--vru-ckpt", type=Path, default=VRU_CKPT)
     parser.add_argument("--vru-raw-threshold", type=float, default=0.25)  # 【改动】2026-10-10
+    parser.add_argument("--no-vru-fuse-lidars", action="store_true",
+                        help="关闭 VRU 链默认的多雷达融合（默认开：推理前把 lidar_front/rear 融合进 lidar_top，补近场盲区；车链不融合）")
     parser.add_argument("--car-truck-cover-threshold", type=float, default=0.5,
                         help="Car 被 Truck 覆盖的面积 / Car 面积 达到该值就删掉这条 "
                              "Car 轨迹的全部帧（0 关闭）")
@@ -1126,6 +1137,7 @@ def main() -> int:
             vru_cfg=vru_cfg,
             vru_ckpt=vru_ckpt,
             vru_raw_threshold=args.vru_raw_threshold,
+            vru_fuse_lidars=not bool(args.no_vru_fuse_lidars),
             keep_chain_labels=args.keep_chain_labels,
             car_truck_cover_threshold=args.car_truck_cover_threshold,
         ))

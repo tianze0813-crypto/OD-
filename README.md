@@ -159,7 +159,7 @@ bak/                             已归档（**gitignore**，见 bak/README.md�
 | yaw | Car：`--car-yaw-settle step45`（默认，B1：static_yaw 只算不写 + 几何跑 detector 原生系 + step4.5 settle 在几何之后写轴和方向）；Truck：`geometry_yaw_v2` | `legacy` |
 
 常用开关：`--chains car,truck,vru`（默认）｜`--truck-detector-mode lidar|fusion`（默认 lidar）
-｜`--vru-detector voxelnext|bevfusion`（默认 voxelnext）｜`--bev-raw-dir`（复用已生成的 raw，不重跑推理）
+｜`--vru-detector voxelnext|bevfusion`（默认 voxelnext）｜`--vru-raw-threshold`（默认 0.25）｜`--no-vru-fuse-lidars`（**VRU 链默认开启**多雷达融合：推理前把 lidar_front/rear 按标定 + 自车运动补偿融合进 lidar_top，补 top 近场盲区；车链不融合）｜`--bev-raw-dir`（复用已生成的 raw，不重跑推理）
 ｜`--car-yaw-settle step45\|step45-axis\|step2`（默认 step45 = B1）｜`--keep-vehicle-diagnostics`｜`--keep-chain-labels`｜`--link-only`｜`--output-tag`
 
 换权重 / 分类别阈值 / 留过程数据（2026-09-29 新增）：

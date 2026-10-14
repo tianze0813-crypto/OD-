@@ -186,10 +186,34 @@ def cleanup_prep(clip: Path) -> list[Path]:
     return removed
 
 
+def _materialise_fused_clip(clip: Path, work_root: Path) -> Path:
+    """造一个同名"影子 clip"：lidar/lidar_top = 融合点云，transforms/image 软链回源。
+
+    prep_data.py 按 <data-root>/<clip>/lidar/lidar_top/*.bin 读点云，所以把
+    --data-root 指向影子 clip 的父目录即可复用整套 BEVFusion 预处理。
+    """
+    from pipeline import lidar_fusion
+    shadow = Path(work_root) / "lidar_fused" / clip.name
+    fused_dir = shadow / "lidar" / "lidar_top"
+    if not fused_dir.is_dir() or not any(fused_dir.glob("*.bin")):
+        stats = lidar_fusion.fuse_clip(clip, fused_dir)
+        print(f"lidar fusion: {stats['frames']} 帧, 附加 {stats['attached_points']} 点, "
+              f"补偿帧 {stats['compensated_frames']} -> {fused_dir}", flush=True)
+    for name in ("transforms", "image", "readme.json"):
+        src = clip / name
+        dst = shadow / name
+        if src.exists() and not dst.exists():
+            dst.symlink_to(src.resolve())
+    return shadow
+
+
 def run_inference(clip: Path, args) -> Path:
     raw_json = Path(args.work_root) / f"{clip.name}_raw.json"
     raw_json.parent.mkdir(parents=True, exist_ok=True)
     mode = str(getattr(args, "mode", "fusion"))
+    if getattr(args, "fuse_lidars", False):
+        # 【改动 2026-10-10】BEVFusion 也走多雷达融合：用影子 clip 顶替源 clip。
+        clip = _materialise_fused_clip(clip, Path(args.work_root))
     if mode == "lidar":
         # 纯雷达：不需要 image/ 目录，也不需要去畸变
         lidar_top = clip / "lidar" / "lidar_top"
@@ -278,6 +302,8 @@ def main() -> None:
     parser.add_argument("--jobs", type=int, default=6)
     parser.add_argument("--vis-occl-tol", type=float, default=0.3)
     parser.add_argument("--no-visibility-check", action="store_true")
+    parser.add_argument("--fuse-lidars", action="store_true",
+                        help="推理前把 lidar_front/rear 融合进 lidar_top（补近场盲区）")
     args = parser.parse_args()
 
     # 【改动·2026-10-08】--skip-prepare 依赖上一次跑留下的缓存，而缓存默认跑完就删
