@@ -6,6 +6,8 @@ Input is an unlabelled SUST clip (``lidar/lidar_top/*.bin`` plus
 
 【改动 2026-10-10】``--fuse-lidars``：推理前先把 lidar_front / lidar_rear 按标定
 融合进 lidar_top（补 top 雷达近场盲区），融合结果落在 ``<work-root>/lidar_fused/<clip>/``。
+融合点云是过程数据（~130MB/clip），**默认推理一结束就删**，只留 ``<clip>_raw.json``；
+要留着复用（调试 / 复跑）加 ``--keep-lidar-fusion``。
 
 Run this step with the OpenPCDet environment, for example:
     python pipeline/step1_lidar_inference.py \
@@ -16,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -75,10 +78,22 @@ def collect_clips(args) -> list[Path]:
     return clips
 
 
+def _cleanup_fused(fused_dir: Path) -> None:
+    """删掉本次融合出的点云（默认跑完即清，避免 work/ 越积越大）。"""
+    try:
+        shutil.rmtree(fused_dir, ignore_errors=True)
+        parent = fused_dir.parent
+        if parent.is_dir() and not any(parent.iterdir()):
+            parent.rmdir()
+    except OSError:
+        pass
+
+
 def run_inference(clip: Path, args) -> Path:
     raw_json = args.work_root / f"{clip.name}_raw.json"
     raw_json.parent.mkdir(parents=True, exist_ok=True)
     lidar_dir = clip / "lidar" / "lidar_top"
+    fused_dir = None
     if getattr(args, "fuse_lidars", False):
         # 公共预处理：front/rear -> top 系拼接，补 top 近场盲区。
         fused_dir = args.work_root / "lidar_fused" / clip.name
@@ -96,21 +111,26 @@ def run_inference(clip: Path, args) -> Path:
         "--out_json", str(raw_json),
         "--score_thresh", str(args.score_thresh),
     ]
-    print(">> " + " ".join(cmd), flush=True)
-    subprocess.run(cmd, check=True)
+    try:
+        print(">> " + " ".join(cmd), flush=True)
+        subprocess.run(cmd, check=True)
 
-    if not args.no_visibility_check:
-        frames = json.loads(raw_json.read_text(encoding="utf-8"))
-        # Visibility is metadata at this stage.  Identity assignment must see
-        # every detector output; both hard-filter passes happen after Step2.
-        stats = camera_visibility.filter_raw_frames(
-            frames, clip, 0.0, args.vis_occl_tol)
-        raw_json.write_text(
-            json.dumps(frames, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8")
-        print(f"visibility metadata: checked={stats['checked']} "
-              f"dropped={stats['dropped']}", flush=True)
-    return raw_json
+        if not args.no_visibility_check:
+            frames = json.loads(raw_json.read_text(encoding="utf-8"))
+            # Visibility is metadata at this stage.  Identity assignment must see
+            # every detector output; both hard-filter passes happen after Step2.
+            stats = camera_visibility.filter_raw_frames(
+                frames, clip, 0.0, args.vis_occl_tol)
+            raw_json.write_text(
+                json.dumps(frames, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8")
+            print(f"visibility metadata: checked={stats['checked']} "
+                  f"dropped={stats['dropped']}", flush=True)
+        return raw_json
+    finally:
+        # 【改动 2026-10-10】融合点云是过程数据，默认跑完即删（失败也删）。
+        if fused_dir is not None and not getattr(args, "keep_lidar_fusion", False):
+            _cleanup_fused(fused_dir)
 
 
 def main() -> None:
@@ -128,6 +148,9 @@ def main() -> None:
     parser.add_argument("--vis-occl-tol", type=float, default=0.3)
     parser.add_argument("--fuse-lidars", action="store_true",
                         help="推理前融合 lidar_front/rear 到 lidar_top（补近场盲区）")
+    parser.add_argument("--keep-lidar-fusion", action="store_true",
+                        help="【默认关】保留 <work-root>/lidar_fused/<clip> 融合点云"
+                             "（默认推理一结束就删，失败也删）")
     parser.add_argument("--no-visibility-check", action="store_true")
     args = parser.parse_args()
 

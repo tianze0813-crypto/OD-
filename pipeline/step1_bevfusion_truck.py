@@ -211,8 +211,10 @@ def run_inference(clip: Path, args) -> Path:
     raw_json = Path(args.work_root) / f"{clip.name}_raw.json"
     raw_json.parent.mkdir(parents=True, exist_ok=True)
     mode = str(getattr(args, "mode", "fusion"))
+    fused_shadow = None
     if getattr(args, "fuse_lidars", False):
         # 【改动 2026-10-10】BEVFusion 也走多雷达融合：用影子 clip 顶替源 clip。
+        fused_shadow = Path(args.work_root) / "lidar_fused" / clip.name
         clip = _materialise_fused_clip(clip, Path(args.work_root))
     if mode == "lidar":
         # 纯雷达：不需要 image/ 目录，也不需要去畸变
@@ -256,6 +258,12 @@ def run_inference(clip: Path, args) -> Path:
                 print(f"[prep][warn] 过程数据清理失败（{exc}），请手动删 "
                       f"{BEVFUSION_ROOT / 'data' / 'police' / clip.name}",
                       file=sys.stderr, flush=True)
+        # 【改动 2026-10-10】融合出的影子 clip 同样是过程数据，默认跑完即删。
+        if fused_shadow is not None and not getattr(args, "keep_lidar_fusion", False):
+            shutil.rmtree(fused_shadow, ignore_errors=True)
+            parent = fused_shadow.parent
+            if parent.is_dir() and not any(parent.iterdir()):
+                parent.rmdir()
             else:
                 for p in removed:
                     print(f"[prep] 已清理过程数据 {p}", flush=True)
@@ -304,6 +312,9 @@ def main() -> None:
     parser.add_argument("--no-visibility-check", action="store_true")
     parser.add_argument("--fuse-lidars", action="store_true",
                         help="推理前把 lidar_front/rear 融合进 lidar_top（补近场盲区）")
+    parser.add_argument("--keep-lidar-fusion", action="store_true",
+                        help="【默认关】保留 <work-root>/lidar_fused/<clip> 影子 clip"
+                             "（默认推理一结束就删）")
     args = parser.parse_args()
 
     # 【改动·2026-10-08】--skip-prepare 依赖上一次跑留下的缓存，而缓存默认跑完就删
