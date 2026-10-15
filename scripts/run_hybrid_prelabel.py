@@ -26,7 +26,7 @@ import time
 from collections import Counter
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -37,6 +37,7 @@ from pipeline.hybrid_expD_truck import run as run_expd_truck
 from pipeline.hybrid_expD_vru import run as run_expd_vru
 from pipeline.vehicle_pass import run as run_vehicle_pass        # 【改动】车链合并后处理
 from pipeline.hybrid_merge import merge_label_frames
+from pipeline.final_visibility import apply_final_visibility   # 【改动 2026-10-14】公共收尾阶段
 
 
 DEFAULT_OUTPUT_ROOT = Path.home() / "SUSTechPOINTS" / "data"
@@ -245,6 +246,90 @@ def _write_labels(frames: List[Dict[str, Any]], clip: Path) -> int:
     return count
 
 
+# 【改动 2026-10-14】每条链产出的类别：就地重跑部分链时，用它在盘上已有标签里
+# 剔掉"本次会重算"的框，剩下的复用（否则整棵 label/ 会被重写掉）。
+CHAIN_LABEL_CLASSES = {
+    "car": ("Car",),
+    "truck": ("Truck", "Bus", "Trailer"),
+    "vru": ("Pedestrian", "Nonmotorized_vehicle"),
+    "noncar": ("Truck", "Bus", "Pedestrian", "Nonmotorized_vehicle"),
+}
+
+
+def _read_existing_label_frames(clip: Path) -> Dict[str, List[Dict[str, Any]]]:
+    """读盘上已有的最终标签 ``<clip>/label/det/*.json`` -> {frame_id: [label]}。"""
+    label_dir = _label_dir(clip)
+    frames: Dict[str, List[Dict[str, Any]]] = {}
+    if not label_dir.is_dir():
+        return frames
+    for path in sorted(label_dir.glob("*.json")):
+        try:
+            labels = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(labels, list):
+            frames[path.stem] = labels
+    return frames
+
+
+def _reusable_existing_labels(clip: Path, selected: Sequence[str]
+                              ) -> tuple[Dict[str, List[Dict[str, Any]]], int]:
+    """就地重跑部分链：盘上不属于本次重算类别的标签（例：只跑 vru 时的 Car/Truck）。
+
+    （帧集合可以为空 = 这一帧只有本次要重算的类别。）
+    """
+    from tracking import tracker_conservative as tracking
+    rerun_classes = set()
+    for name in selected:
+        rerun_classes.update(CHAIN_LABEL_CLASSES.get(name, ()))
+    kept: Dict[str, List[Dict[str, Any]]] = {}
+    dropped = 0
+    for frame_id, labels in _read_existing_label_frames(clip).items():
+        keep = []
+        for label in labels:
+            raw = str(label.get("obj_type", ""))
+            canonical = tracking.canonical_class_name(raw) or raw
+            if raw in rerun_classes or canonical in rerun_classes:
+                dropped += 1
+                continue
+            keep.append(label)
+        if keep:
+            kept[frame_id] = keep
+    return kept, dropped
+
+
+def _merge_reused_labels(merged: List[Dict[str, Any]],
+                        reused: Dict[str, List[Dict[str, Any]]]
+                        ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """把复用的旧标签并回本轮结果（旧标签在前，沿用帧内 obj_id 去重规则）。"""
+    fresh = {str(frame.get("frame_id", "")): list(frame.get("labels", []))
+             for frame in merged}
+    return _merge_chain_labels({"_existing": reused, "_fresh": fresh},
+                               ["_existing", "_fresh"])
+
+
+def _cleanup_fused_lidar(fused_dir: Path | None) -> None:
+    """公共阶段跑完，删掉融合点云（空父目录一并收掉）。"""
+    if fused_dir is None:
+        return
+    try:
+        shutil.rmtree(fused_dir, ignore_errors=True)
+        parent = Path(fused_dir).parent
+        if parent.is_dir() and not any(parent.iterdir()):
+            parent.rmdir()
+    except OSError:
+        pass
+
+
+def _fused_lidar_dir(work: Path, clip: Path) -> Path | None:
+    """VRU 推理用的 front/rear 融合点云目录（top 系，按 top 时间戳命名）。
+
+    公共可见度阶段要拿它做点云高度比（补 lidar_top 近场盲区）；阶段跑完即删。
+    """
+    candidate = Path(work) / "vru_raw" / "lidar_fused" / Path(clip).name
+    return candidate if candidate.is_dir() else None
+
+
 def _run_raw(python: Path, clip: Path, cfg: Path, ckpt: Path,
              work_root: Path, name: str, score_thresh: float,
              fuse_lidars: bool = False) -> Path:
@@ -254,10 +339,13 @@ def _run_raw(python: Path, clip: Path, cfg: Path, ckpt: Path,
         python, ROOT / "pipeline" / "step1_lidar_inference.py",
         "--clip", clip, "--work-root", work_root,
         "--cfg", cfg, "--ckpt", ckpt,
-        "--score-thresh", score_thresh, "--drop-vis-below", "0.0",
+        "--score-thresh", score_thresh,
     ]
     if fuse_lidars:
         command.append("--fuse-lidars")
+        # 【改动 2026-10-14】融合点云不再"推理跑完即删"：公共可见度阶段（点云高度比）
+        # 还要用它，删除时机改到公共阶段之后（见 run_clip 里的 _cleanup_fused_lidar）。
+        command.append("--keep-lidar-fusion")
     _run(command)
     if not output.is_file():
         raise RuntimeError(f"inference did not create raw JSON: {output}")
@@ -731,7 +819,6 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
             expd_diag = work / "expd_noncar_diagnostics.json"
             expd_result = run_expd_noncar(
                 expd_raw, clip, expd_json, expd_diag,
-                visibility_min_ratio=drop_vis_below,
                 short_track_max_frames=short_track_max_frames,
                 score_threshold=score_threshold,
                 class_score_thresholds=class_score_thresholds,
@@ -754,10 +841,37 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
             merged, merge_diag = _merge_chain_labels(
                 chain_labels, selected,
                 car_truck_cover_threshold=car_truck_cover_threshold)
-        merged_label_count = sum(len(frame["labels"]) for frame in merged)
         timings["merge"] = round(time.monotonic() - _t, 1)
         merge_diag = dict(merge_diag or {})
         merge_diag["chain_stats"] = chain_stats
+
+        # 【改动 2026-10-14】就地重跑部分链：把盘上"这次不重算"的类别捡回来
+        # （只跑 vru 时保留 Car/Truck），否则整棵 label/ 会被重写掉。
+        if rerun_in_place:
+            reused, dropped_existing = _reusable_existing_labels(clip, selected)
+            reused_total = sum(len(v) for v in reused.values())
+            if reused_total:
+                merged, reuse_diag = _merge_reused_labels(merged, reused)
+                merge_diag["reused_existing_labels"] = {
+                    "labels": reused_total, "dropped_from_disk": dropped_existing,
+                    "merge": reuse_diag}
+                _print(f"{base}: 就地重跑，复用盘上已有标签 {reused_total} 个"
+                       f"（非 {'/'.join(selected)} 类别），旧标签剔除 {dropped_existing} 个")
+
+        # 【改动 2026-10-14】公共收尾阶段：car/truck/VRU 标签都出来之后，逐帧对
+        # 全部类别统一算遮挡属性 + 可见度过滤（帧内跨类遮挡才判得出来）。
+        fused_dir = _fused_lidar_dir(work, clip) if "vru" in selected else None
+        try:
+            final_vis = apply_final_visibility(
+                merged, clip, points_dir=fused_dir,
+                min_ratio=float(drop_vis_below))
+        finally:
+            _cleanup_fused_lidar(fused_dir)
+        merged_label_count = sum(len(frame["labels"]) for frame in merged)
+        merge_diag["final_visibility"] = final_vis
+        _print(f"{base}: 公共可见度：{final_vis['boxes_before']} -> "
+               f"{final_vis['boxes_after']} 框（删 {final_vis['boxes_removed']}，"
+               f"tag1={final_vis['tag1']} tag2={final_vis['tag2']}）")
 
     _t = time.monotonic()
     if link_only and destination is not None:
@@ -846,7 +960,11 @@ def main() -> int:
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--skip-install", action="store_true",
                         help="require an existing CUDA/OpenPCDet environment")
-    parser.add_argument("--drop-vis-below", type=float, default=0.05)
+    parser.add_argument("--drop-vis-below", type=float, default=0.0,
+                        help="【改动 2026-10-14】合并后公共阶段的可见度过滤阈值："
+                             "visibility.ratio <= 该值就删框。**默认 0 = 关闭过滤**"
+                             "（只算并写出 visibility 属性，不删任何框）；"
+                             "要开过滤给正数，例如 0.05")
     parser.add_argument("--score-threshold", type=float)
     parser.add_argument("--short-track-max-frames", type=int, default=4)
     parser.add_argument("--noncar-raw-threshold", type=float,

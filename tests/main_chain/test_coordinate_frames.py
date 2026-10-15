@@ -5,7 +5,6 @@ from pathlib import Path
 
 import numpy as np
 
-from filtering.camera_visibility import load_clip_cameras
 from tracking.tracker_conservative import CoordinateProvider
 
 
@@ -35,22 +34,6 @@ class CoordinateFrameContractTest(unittest.TestCase):
             json.dumps(calib), encoding="utf-8")
         (transforms / "pose_data.txt").write_text(
             "0,0,0,0,0,0,0,1\n", encoding="utf-8")
-
-    def test_camera_projection_keeps_pose_contract(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            self._write_clip(root)
-            cameras = load_clip_cameras(root)
-        self.assertTrue(np.allclose(
-            cameras["cam_front"]["T"][:3, 3], [10.0, -3.0, 0.0]))
-
-    def test_legacy_pose_fallback_is_preserved(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            self._write_clip(root, include_top=False)
-            cameras = load_clip_cameras(root)
-        self.assertTrue(np.allclose(
-            cameras["cam_front"]["T"][:3, 3], [10.0, -3.0, 0.0]))
 
     def test_world_from_lidar_top_contract(self):
         with tempfile.TemporaryDirectory() as directory:

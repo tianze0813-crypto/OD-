@@ -72,6 +72,13 @@ def _tb_det(track_id, name, x=0.0, y=0.0, dx=3.0, dy=1.5, yaw=0.0):
     }
 
 
+def _passthrough_final_visibility(merged, _clip, **_kwargs):
+    """公共可见度阶段的桩：这些用例只关心合并/导出，不建真实的标定与点云。"""
+    total = sum(len(frame.get("labels", [])) for frame in merged)
+    return {"boxes_before": total, "boxes_after": total, "boxes_removed": 0,
+            "tag1": 0, "tag2": 0}
+
+
 class _MissingPoseCoords:
     def __init__(self, missing_timestamps):
         self.missing = {int(value) for value in missing_timestamps}
@@ -243,7 +250,9 @@ class HybridPipelineTest(unittest.TestCase):
             with patch.object(hybrid_launcher, "run_vehicle_pass", fake_vehicle), \
                     patch.object(hybrid_launcher, "_run_raw_bevfusion", fake_bev), \
                     patch.object(hybrid_launcher, "_run_raw", fake_raw), \
-                    patch.object(hybrid_launcher, "run_expd_noncar", fake_expd):
+                    patch.object(hybrid_launcher, "run_expd_noncar", fake_expd), \
+                    patch.object(hybrid_launcher, "apply_final_visibility",
+                                 _passthrough_final_visibility):
                 result = hybrid_launcher.run_clip(
                     Path("python"), source, output_root, overwrite=False,
                     drop_vis_below=0.05, score_threshold=None,
@@ -299,7 +308,9 @@ class HybridPipelineTest(unittest.TestCase):
             with patch.object(hybrid_launcher, "run_vehicle_pass", fake_vehicle), \
                     patch.object(hybrid_launcher, "_run_raw_bevfusion", fake_bev), \
                     patch.object(hybrid_launcher, "_run_raw", fake_raw), \
-                    patch.object(hybrid_launcher, "run_expd_noncar", fake_expd):
+                    patch.object(hybrid_launcher, "run_expd_noncar", fake_expd), \
+                    patch.object(hybrid_launcher, "apply_final_visibility",
+                                 _passthrough_final_visibility):
                 result = hybrid_launcher.run_clip(
                     Path("python"), source, output_root, overwrite=False,
                     export_sust=False, drop_vis_below=0.05,
@@ -348,7 +359,9 @@ class HybridPipelineTest(unittest.TestCase):
             with patch.object(hybrid_launcher, "run_vehicle_pass", fake_vehicle), \
                     patch.object(hybrid_launcher, "_run_raw_bevfusion", fake_bev), \
                     patch.object(hybrid_launcher, "_run_raw", fake_raw), \
-                    patch.object(hybrid_launcher, "run_expd_noncar", fake_expd):
+                    patch.object(hybrid_launcher, "run_expd_noncar", fake_expd), \
+                    patch.object(hybrid_launcher, "apply_final_visibility",
+                                 _passthrough_final_visibility):
                 result = hybrid_launcher.run_clip(
                     Path("python"), source, output_root, overwrite=False,
                     in_place=True, drop_vis_below=0.05,
@@ -404,7 +417,9 @@ class HybridPipelineTest(unittest.TestCase):
                 return raw
 
             with patch.object(hybrid_launcher, "run_vehicle_pass", fake_vehicle), \
-                    patch.object(hybrid_launcher, "_run_raw_bevfusion", fake_bev):
+                    patch.object(hybrid_launcher, "_run_raw_bevfusion", fake_bev), \
+                    patch.object(hybrid_launcher, "apply_final_visibility",
+                                 _passthrough_final_visibility):
                 result = hybrid_launcher.run_clip(
                     Path("python"), source, output_root, overwrite=True,
                     in_place=True, drop_vis_below=0.05,

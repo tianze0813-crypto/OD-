@@ -139,7 +139,7 @@ class RunInferenceCleanupWiringTest(unittest.TestCase):
         return argparse.Namespace(
             work_root=self.work, mode="lidar", skip_prepare=False, jobs=1,
             cfg=step1.BEVFUSION_CFG, ckpt=step1.BEVFUSION_CKPT, score_thresh=0.1,
-            z_convention="center", no_visibility_check=True, vis_occl_tol=0.3,
+            z_convention="center",
             keep_prep=False)
 
     def setUp(self):

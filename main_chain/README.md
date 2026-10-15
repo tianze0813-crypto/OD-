@@ -162,23 +162,17 @@ lidar_top -> base_link -> pose -> world
 7. `label/` 导出直接使用 Step5 的 `box_lidar`，因此最终坐标是
    `base_link` 局部帧。
 
-### 当前可见度模块的特别说明
+### 可见度（遮挡属性）
 
-可见度实现按已恢复的远端版本保持不变。`filtering/camera_visibility.py` 当前构造
-的是：
+`main_chain/filtering/camera_visibility.py` 已删除（2026-10-14）。可见度不再在
+main_chain 里计算：三条链（Car/Truck/VRU）标签合并之后，由仓库根目录的公共阶段
+`pipeline/final_visibility.py` + `filtering/camera_visibility.py` 统一算一次，
+公共参考系是 **`base_link`**（口径与 `moga_data-main/steps/visualize.py` 的投影
+可视化一致：`cam_from_base = inv(base_from_cam)`）。因此：
 
-```text
-cam_from_pose = inv(base_from_cam) @ base_from_pose
-```
-
-因此它假定传入的 box 已经在 `pose` 局部帧；它不读取 `pose_data.txt`。但本仓库的
-Step1 会把 OpenPCDet 直接对 `lidar/lidar_top/*.bin` 的输出传给该模块，并没有在
-Step1 中做 `lidar_top -> pose` 转换。也就是说：
-
-- 如果当前数据的 `pose` 与 `lidar_top` 实际是同一坐标帧，这段投影可以直接使用；
-- 如果两者存在平移或旋转差异，Step1 的 visibility 比例和 5% 可见度过滤可能不准；
-- 这不改变 Step5 的坐标转换规则；visibility 仍在 box 转成 `base_link` 之前计算。
-  要修复输入帧契约，必须统一上游 box 的输入帧或修改可见度实现，不能只改 README。
+- main_chain 的 Step2 硬过滤不再有 `low_visibility` 规则，也不再读相机标定；
+- 分链产物里的 `visibility` 由公共阶段重算，链内不再挂这个字段；
+- 可见度阈值只由入口的 `--drop-vis-below`（默认 0.05）控制。
 
 ### 更换 base_link 的影响
 
@@ -190,8 +184,8 @@ Step1 中做 `lidar_top -> pose` 转换。也就是说：
 应为单位阵（以实际标定工具输出为准），此时转换结果数值上基本不变。
 
 不要只改 `pose` 或只改 `lidar_top`，也不要把 Step5 前的 box 提前转换后继续参与
-Step2--Step3 的 `lidar_top` 点云计算；否则点云拟合、跟踪、yaw 和可见度投影会出现
-偏差。若 `pose_data.txt` 的语义也改成了
+Step2--Step3 的 `lidar_top` 点云计算；否则点云拟合、跟踪、yaw 会出现偏差，公共阶段
+的可见度投影（要求 label 在 `base_link` 系）也会跟着错。若 `pose_data.txt` 的语义也改成了
 `world_from_lidar_top`，必须同步改写 `CoordinateProvider` 的公式，不能继续直接
 套用当前实现。
 

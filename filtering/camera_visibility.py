@@ -13,11 +13,19 @@
 
 注意：tag（1/2，50% 遮挡为界）只是标注侧的描述字段，不是过滤条件；
 过滤条件是**被遮挡 >= 95%**（可见度 <= 5%）的 box 直接删除（drop_vis_below
-默认 0.05）。过滤建议在模型推理后、跟踪/后处理前执行，避免不可见目标
-参与跟踪制造 ID 碎片。
+默认 0.05）。本仓库里可见度只在**最终公共阶段**（pipeline/final_visibility.py）
+算一次，作用在 car/truck/VRU 合并之后的标签上。
 
-坐标系：输入点云和 box 使用统一的 pose 局部帧。calib.json 的 tf2base_link 给的是
-base_from_sensor，因此 cam_from_local = inv(base_from_cam) @ base_from_pose，
+坐标系：公共参考系 = **base_link**，与 moga_data-main/steps/visualize.py 的
+投影可视化保持同一口径（该脚本 _load_merged_lidar_points 把每个雷达按静态
+外参变换到 base_link 再合并，_draw_lidar_on_image 用 base2imgs = base_link->cam
+投影）。calib.json 的 tf2base_link[X] 是 base_from_X，且 base_link 在变换图里
+是单位阵，因此：
+
+    cam_from_base = inv(base_from_cam)
+    base_from_top  = tf2base_link["lidar_top"]
+
+输入 box（base_link 系）与点云（先按 base_from_top 变到 base_link）必须同系，
 逐帧静态，不需要 pose_data.txt。
 """
 
@@ -32,12 +40,28 @@ import cv2
 CAMERA_NAMES = ["cam_front", "cam_rear", "cam_left", "cam_right", "cam_x8d"]
 
 
-def load_clip_cameras(clip_root):
+# 公共参考系。viewer 把点云/检测框统一到 base_link 再投影，见模块 docstring。
+DETECTION_FRAME = "base_link"
+
+
+def load_clip_cameras(clip_root, detection_frame: str = DETECTION_FRAME):
+    """返回 {cam: {K, D, w, h, T}}，``T`` = cam_from_detection_frame。
+
+    ``detection_frame`` 默认 ``"base_link"``（= 变换图里的单位阵，也就是
+    tf2base_link 的基系）。历史实现用的是 ``"pose"``，那套 calib 里
+    ``pose`` 与前雷达外参完全相同，只适用于标在 lidar_front 系的标签。
+    """
     clip_root = Path(clip_root)
     calib = json.loads((clip_root / "transforms" / "calib.json").read_text(encoding="utf-8"))
     tf = calib["tf2base_link"]
-    # Exported points and detector boxes use the standardized pose frame.
-    B_P = np.asarray(tf["pose"], dtype=np.float64)  # base_from_detection_frame
+    if detection_frame == "base_link":
+        base_from_detection = np.eye(4, dtype=np.float64)
+    elif detection_frame in tf:
+        base_from_detection = np.asarray(tf[detection_frame], dtype=np.float64)
+    else:
+        raise ValueError(
+            f"calib.json 的 tf2base_link 缺少检测系 {detection_frame!r}"
+            f"（可用：base_link / {sorted(tf)}）")
     cams = {}
     for name in CAMERA_NAMES:
         if name not in calib or name not in tf:
@@ -49,7 +73,7 @@ def load_clip_cameras(clip_root):
             "w": int(c["imgw"]),
             "h": int(c["imgh"]),
             # cam_from_detection_frame
-            "T": np.linalg.inv(np.asarray(tf[name], dtype=np.float64)) @ B_P,
+            "T": np.linalg.inv(np.asarray(tf[name], dtype=np.float64)) @ base_from_detection,
         }
     return cams
 
@@ -126,15 +150,39 @@ def _ratio_in_camera(hull, idx, hulls, depths, cam, occl_tol):
     return visible / total, occluded / total, truncated / total
 
 
-def _load_lidar_xyz(clip_root, frame_id) -> np.ndarray:
-    """Read one lidar_top xyzi frame, return the Nx3 XYZ points."""
-    path = Path(clip_root) / "lidar" / "lidar_top" / f"{frame_id}.bin"
+def base_from_top(clip_root) -> np.ndarray:
+    """``base_from_lidar_top`` from calib.json (points are exported in the top frame)."""
+    calib = json.loads((Path(clip_root) / "transforms" / "calib.json")
+                       .read_text(encoding="utf-8"))
+    tf = calib.get("tf2base_link") or {}
+    if "lidar_top" not in tf:
+        raise ValueError(
+            f"calib.json 的 tf2base_link 缺少 lidar_top：{Path(clip_root) / 'transforms' / 'calib.json'}")
+    return np.asarray(tf["lidar_top"], dtype=np.float64)
+
+
+def load_base_link_points(clip_root, frame_id, points_dir=None) -> np.ndarray:
+    """读一帧点云（top 系）并变到 base_link 系，返回 Nx3。
+
+    ``points_dir`` 给融合点云目录（<work>/lidar_fused/<clip>，同样是 top 系、
+    按 top 时间戳命名）时优先用它；否则退回 ``<clip>/lidar/lidar_top``。
+    与 viewer 一致：点云先按静态外参变到 base_link，再参与投影/遮挡判断。
+    """
+    path = None
+    if points_dir is not None:
+        candidate = Path(points_dir) / f"{frame_id}.bin"
+        if candidate.is_file():
+            path = candidate
+    if path is None:
+        path = Path(clip_root) / "lidar" / "lidar_top" / f"{frame_id}.bin"
     if not path.is_file():
         raise FileNotFoundError(f"lidar frame not found: {path}")
     values = np.fromfile(path, dtype=np.float32)
     if values.size % 4 != 0:
         raise ValueError(f"lidar frame is not xyzi float32: {path}")
-    return values.reshape(-1, 4)[:, :3]
+    points = values.reshape(-1, 4)[:, :3].astype(np.float64)
+    transform = base_from_top(clip_root)
+    return points @ transform[:3, :3].T + transform[:3, 3]
 
 
 def _points_in_box(points, box) -> np.ndarray:
@@ -175,7 +223,11 @@ def compute_frame_visibility(dets, cams, occl_tol=0.3,
                              points=None, use_point_occlusion=True,
                              point_occlusion_trigger=0.01,
                              full_vis_ratio=0.9):
-    """为帧内每个 det 写回 det['visibility']，返回统计。"""
+    """为帧内每个 det 写回 det['visibility']，返回统计。
+
+    ``dets`` 的 ``box_lidar`` 与 ``points`` 必须都在 ``cams`` 的检测系里
+    （默认 base_link）。帧内**所有类别**要一起传进来，跨类遮挡才判得出来。
+    """
     boxes = [d["box_lidar"] for d in dets]
     n = len(boxes)
     cam_data = {}
@@ -223,6 +275,9 @@ def compute_frame_visibility(dets, cams, occl_tol=0.3,
             else:
                 occ = max(float(occ), 1.0 - visible_ratio)
                 ratio = max(0.0, 1.0 - float(trunc) - occ)
+            # 【修·2026-10-14】原实现把上面算好的值又用 `= best` 覆盖掉了，
+            # 点云高度比补判（use_point_occlusion）从来没生效过。写回 best 才用得上。
+            best = (ratio, occ, trunc, name)
         if best is None:
             vis = {"tag": 2, "ratio": 0.0, "occluded": 0.0, "truncated": 1.0, "best_cam": None}
         else:
@@ -237,62 +292,4 @@ def compute_frame_visibility(dets, cams, occl_tol=0.3,
         d["visibility"] = vis
         stats["checked"] += 1
         stats["tag1" if vis["tag"] == 1 else "tag2"] += 1
-    return stats
-
-
-def compute_clip_visibility(out_frames, clip_root, args):
-    """对整个 clip 计算可见度；可见度低于 drop_vis_below 的 box 删除。"""
-    cams = load_clip_cameras(clip_root)
-    stats = {"frames": 0, "checked": 0, "tag1": 0, "tag2": 0,
-             "dropped": 0, "static_slots_protected": 0,
-             "cameras": len(cams)}
-    for frame in out_frames:
-        if not frame["detections"]:
-            continue
-        frame_id = str(frame["frame_id"])
-        frame_points = _load_lidar_xyz(clip_root, frame_id)
-        fstats = compute_frame_visibility(
-            frame["detections"], cams, args.vis_occl_tol, points=frame_points)
-        for k in ("checked", "tag1", "tag2"):
-            stats[k] += fstats[k]
-        stats["frames"] += 1
-        drop_below = getattr(args, "drop_vis_below", 0.0)
-        if drop_below > 0:
-            stats["static_slots_protected"] += sum(
-                1 for d in frame["detections"]
-                if (d.get("slot_static")
-                    and d.get("visibility", {}).get("ratio", 1.0) <= drop_below)
-            )
-            kept = [d for d in frame["detections"]
-                    if (d.get("slot_static")
-                        or d.get("visibility", {}).get("ratio", 1.0) > drop_below)]
-            stats["dropped"] += len(frame["detections"]) - len(kept)
-            frame["detections"] = kept
-    return stats
-
-
-def filter_raw_frames(frames, clip_root, drop_below, occl_tol=0.3):
-    """Attach visibility metadata and optionally drop very low-visibility boxes.
-
-    The current Step1 caller passes ``drop_below=0`` so identity tracking sees
-    every model detection.  Callers that explicitly pass a positive threshold
-    retain the legacy in-place filtering behavior.
-    """
-    cams = load_clip_cameras(clip_root)
-    stats = {"frames": 0, "checked": 0, "tag1": 0, "tag2": 0,
-             "dropped": 0, "cameras": len(cams)}
-    for frame in frames:
-        dets = frame["detections"]
-        if not dets:
-            continue
-        frame_id = str(frame["frame_id"])
-        frame_points = _load_lidar_xyz(clip_root, frame_id)
-        fstats = compute_frame_visibility(dets, cams, occl_tol, points=frame_points)
-        for k in ("checked", "tag1", "tag2"):
-            stats[k] += fstats[k]
-        stats["frames"] += 1
-        if drop_below > 0:
-            kept = [d for d in dets if d.get("visibility", {}).get("ratio", 1.0) > drop_below]
-            stats["dropped"] += len(dets) - len(kept)
-            frame["detections"] = kept
     return stats

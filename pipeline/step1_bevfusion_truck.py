@@ -16,7 +16,7 @@
 work/infos/*、去畸变图）在推理结束时就地删掉，只留上面的 raw json。批量跑包不会再让
 ``bevfusion/data/`` 无限增长。要留缓存调试用 ``--keep-prep``（或 ``BEVFUSION_KEEP_PREP=1``）。
 
-本脚本自身跑在 **openpcdet** 环境（需要 filtering.camera_visibility）；
+本脚本自身跑在 **openpcdet** 环境（需要 mmdet3d/BEVFusion 依赖）；
 ①② 通过外部 BEVFusion 工程用 **mmdet3d** 环境的 python 以子进程执行，
 路径可用环境变量覆盖（云端部署时必改）：
     BEVFUSION_ROOT    默认 <project>/bevfusion（配置/脚本/缓存都随项目走）
@@ -41,8 +41,6 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-
-from filtering import camera_visibility  # noqa: E402
 
 BEVFUSION_ROOT = Path(os.environ.get(
     "BEVFUSION_ROOT", str(PROJECT_ROOT / "bevfusion")))      # 配置/脚本/缓存都随项目走
@@ -238,13 +236,8 @@ def run_inference(clip: Path, args) -> Path:
         if not raw_json.is_file():
             raise RuntimeError(f"BEVFusion 推理没有产出 {raw_json}")
 
-        if not args.no_visibility_check:
-            frames = json.loads(raw_json.read_text(encoding="utf-8"))
-            stats = camera_visibility.filter_raw_frames(frames, clip, 0.0, args.vis_occl_tol)
-            raw_json.write_text(json.dumps(frames, ensure_ascii=False, indent=2) + "\n",
-                                encoding="utf-8")
-            print(f"visibility metadata: checked={stats['checked']} "
-                  f"dropped={stats['dropped']}", flush=True)
+        # 【改动 2026-10-14】遮挡属性/可见度过滤已移到三条链合并后的公共阶段
+        # （pipeline/final_visibility.py），raw 阶段不再挂 visibility 元数据。
         return raw_json
     finally:
         # 【改动·2026-10-08】放在 finally：推理失败也不会把 ~150MB/包 的过程数据留在盘上。
@@ -308,8 +301,6 @@ def main() -> None:
                              "（bevfusion/data/police/<clip>、work/infos/*、去畸变图）。"
                              f"默认推理一结束就删；也可用 {PREP_KEEP_ENV}=1 打开")
     parser.add_argument("--jobs", type=int, default=6)
-    parser.add_argument("--vis-occl-tol", type=float, default=0.3)
-    parser.add_argument("--no-visibility-check", action="store_true")
     parser.add_argument("--fuse-lidars", action="store_true",
                         help="推理前把 lidar_front/rear 融合进 lidar_top（补近场盲区）")
     parser.add_argument("--keep-lidar-fusion", action="store_true",

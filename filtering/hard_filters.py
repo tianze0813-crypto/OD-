@@ -10,7 +10,6 @@ from typing import Any, Dict, List, Sequence, Set, Tuple
 
 import numpy as np
 
-from filtering import camera_visibility
 from tracking import tracker_conservative as tracking
 
 
@@ -31,11 +30,6 @@ class HardFilterConfig:
     range_rear: float = 20.0
     range_side: float = 40.0
     sparsity_max_points: int = 10
-    visibility_min_ratio: float = 0.05
-    visibility_occlusion_tolerance: float = 0.3
-    use_point_occlusion: bool = True
-    point_occlusion_trigger: float = 0.01
-    point_occlusion_full_vis_ratio: float = 0.9
     pedestrian_max_distance: float = 20.0
     nonmotorized_max_distance: float = 60.0
     keep_classes: Tuple[str, ...] = (
@@ -109,9 +103,9 @@ def apply_category_score_filter(
 
     Step1 uses the lowest configured threshold so lower-score Car candidates
     remain available. This lightweight pass removes sub-threshold detections
-    from each category before they can add association noise; range,
-    visibility, sparsity, and all other annotation filters remain after ID
-    assignment in Step2 and Step2.5.
+    from each category before they can add association noise; range and
+    sparsity filters remain after ID assignment in Step2 and Step2.5, and
+    visibility is applied once in the final merged stage.
     """
     before = sum(len(frame.get("detections", [])) for frame in frames)
     removed_by_class: Counter[str] = Counter()
@@ -160,12 +154,10 @@ def apply_hard_filters(frames: List[Dict[str, Any]], clip: Path,
 
     Every failing rule is recorded even when a detection fails more than one
     rule. ``primary_reason_counts`` counts actual removals without double
-    counting. Kept detections retain their visibility tag for SUST export.
+    counting. 可见度（遮挡属性）与可见度过滤**不在这一层**了 —— 它在三条链
+    合并之后的公共阶段统一算一次，见 ``pipeline/final_visibility.py``。
     """
     clip = Path(clip)
-    cameras = camera_visibility.load_clip_cameras(clip)
-    if not cameras:
-        raise ValueError(f"no configured cameras found in {clip / 'transforms/calib.json'}")
 
     rule_counts: Counter[str] = Counter()
     primary_counts: Counter[str] = Counter()
@@ -179,12 +171,6 @@ def apply_hard_filters(frames: List[Dict[str, Any]], clip: Path,
         valid_detections = [detections[i] for i in valid_indices]
 
         points = _load_lidar_xyz(clip, frame_id)
-        visibility_stats = camera_visibility.compute_frame_visibility(
-            valid_detections, cameras, config.visibility_occlusion_tolerance,
-            points=points, use_point_occlusion=config.use_point_occlusion,
-            point_occlusion_trigger=config.point_occlusion_trigger,
-            full_vis_ratio=config.point_occlusion_full_vis_ratio)
-        del visibility_stats
         point_counts = count_points_in_boxes(
             points, [det["box_lidar"] for det in valid_detections])
         point_count_by_index = {
@@ -218,9 +204,6 @@ def apply_hard_filters(frames: List[Dict[str, Any]], clip: Path,
                     reasons.append("distant_nonmotorized")
                 if point_count_by_index[detection_index] <= config.sparsity_max_points:
                     reasons.append("sparse_points")
-                if (float(det.get("visibility", {}).get("ratio", 0.0))
-                        <= config.visibility_min_ratio):
-                    reasons.append("low_visibility")
 
             if not reasons:
                 kept.append(det)
@@ -237,7 +220,6 @@ def apply_hard_filters(frames: List[Dict[str, Any]], clip: Path,
                         "box_lidar": [round(float(x), 4)
                                       for x in det.get("box_lidar", [])[:7]],
                         "points_in_box": point_count_by_index.get(detection_index),
-                        "visibility_ratio": det.get("visibility", {}).get("ratio"),
                         "all_reasons": reasons,
                     })
             primary_counts[reasons[0]] += 1
@@ -256,7 +238,6 @@ def apply_hard_filters(frames: List[Dict[str, Any]], clip: Path,
             "range_rear": config.range_rear,
             "range_side": config.range_side,
             "sparsity_drop_at_or_below": config.sparsity_max_points,
-            "visibility_drop_at_or_below": config.visibility_min_ratio,
             "pedestrian_max_distance": config.pedestrian_max_distance,
             "keep_classes": list(config.keep_classes),
         },

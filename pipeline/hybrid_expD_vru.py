@@ -40,7 +40,6 @@ DEFAULTS: Dict[str, Any] = dict(
     range_rear=20.0,
     range_side=40.0,
     sparsity_max_points=10,
-    visibility_min_ratio=0.05,
     short_track_max_frames=4,    # 链级短轨迹阈值（<= 语义），非机动车等照旧
     pedestrian_min_frames=20,    # 【改动】只对行人：帧数 <20 的轨迹整条删（2026-09-19 用户要求）
     pedestrian_max_distance=20.0,            # 【改动】2026-10-10：行人 15m -> 20m

@@ -141,7 +141,6 @@ def _noncar_filter(frames: List[Dict[str, Any]],
 
 
 def _hard_config(*, sparsity_max_points: int,
-                 visibility_min_ratio: float,
                  score_threshold: float | None,
                  class_score_thresholds: Mapping[str, float] | None = None,
                  pedestrian_max_distance: float = 15.0,   # 【改动】20 -> 15
@@ -182,7 +181,6 @@ def _hard_config(*, sparsity_max_points: int,
         score_threshold=fallback,
         class_score_thresholds=per_class,
         sparsity_max_points=int(sparsity_max_points),
-        visibility_min_ratio=float(visibility_min_ratio),
         pedestrian_max_distance=float(pedestrian_max_distance),
         nonmotorized_max_distance=float(nonmotorized_max_distance),
         keep_classes=tuple(keep_classes) if keep_classes else NON_CAR_CLASSES,
@@ -450,7 +448,6 @@ def fit_pedestrian_box_top(
 def run(raw_json: Path, clip: Path, out_json: Path,
         diagnostics_path: Path | None = None,
         *, sparsity_max_points: int = 10,
-        visibility_min_ratio: float = 0.05,
         short_track_max_frames: int = 4,
         # 【改动】2026-09-19：仅对行人的生命周期门槛（严格小于：帧数 < 该值即整条删），
         # 0 = 关闭。非机动车/其它类别仍走 short_track_max_frames。
@@ -539,7 +536,6 @@ def run(raw_json: Path, clip: Path, out_json: Path,
         keep_classes=tuple(keep_classes),     # 【改动】见 _hard_config 说明
         range_front=range_front, range_rear=range_rear, range_side=range_side,
         sparsity_max_points=sparsity_max_points,
-        visibility_min_ratio=visibility_min_ratio,
         score_threshold=score_threshold,
         class_score_thresholds=class_score_thresholds,
         pedestrian_max_distance=pedestrian_max_distance,
@@ -677,7 +673,6 @@ def main() -> None:
     parser.add_argument("--out-json", required=True, type=Path)
     parser.add_argument("--diagnostics", type=Path)
     parser.add_argument("--sparsity-max-points", type=int, default=10)
-    parser.add_argument("--visibility-min-ratio", type=float, default=0.05)
     parser.add_argument("--short-track-max-frames", type=int, default=4)
     parser.add_argument("--score-threshold", type=float)
     parser.add_argument("--truck-score-threshold", type=float)
@@ -699,7 +694,6 @@ def main() -> None:
     result = run(
         args.raw_json, args.clip, args.out_json, args.diagnostics,
         sparsity_max_points=args.sparsity_max_points,
-        visibility_min_ratio=args.visibility_min_ratio,
         short_track_max_frames=args.short_track_max_frames,
         score_threshold=args.score_threshold,
         class_score_thresholds=class_thresholds,

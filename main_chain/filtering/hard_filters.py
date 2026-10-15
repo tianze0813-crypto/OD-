@@ -10,7 +10,6 @@ from typing import Any, Dict, List, Sequence, Set, Tuple
 
 import numpy as np
 
-from filtering import camera_visibility
 from tracking import tracker_conservative as tracking      # 【改动】类别别名归一
 
 
@@ -28,8 +27,6 @@ class HardFilterConfig:
     # 【改动】2026-09-21 按类别的稀疏度门槛（点数 <= 该值就删）：
     # 车链 Car 5 / Truck 10，与两条单链各自的行为对齐；未登记类别用 sparsity_max_points。
     class_sparsity_max_points: Tuple[Tuple[str, int], ...] = ()
-    visibility_min_ratio: float = 0.05
-    visibility_occlusion_tolerance: float = 0.3
     pedestrian_max_distance: float = 20.0
     keep_classes: Tuple[str, ...] = (
         "Vehicle", "Car", "Truck", "Pedestrian", "Cyclist"
@@ -113,12 +110,10 @@ def apply_hard_filters(frames: List[Dict[str, Any]], clip: Path,
 
     Every failing rule is recorded even when a detection fails more than one
     rule. ``primary_reason_counts`` counts actual removals without double
-    counting. Kept detections retain their visibility tag for SUST export.
+    counting. 可见度（遮挡属性）与可见度过滤**不在这一层**了 —— 它在三条链合并
+    之后的公共阶段统一算一次，见 ``pipeline/final_visibility.py``。
     """
     clip = Path(clip)
-    cameras = camera_visibility.load_clip_cameras(clip)
-    if not cameras:
-        raise ValueError(f"no configured cameras found in {clip / 'transforms/calib.json'}")
 
     rule_counts: Counter[str] = Counter()
     primary_counts: Counter[str] = Counter()
@@ -131,9 +126,6 @@ def apply_hard_filters(frames: List[Dict[str, Any]], clip: Path,
         valid_indices = [i for i, det in enumerate(detections) if _valid_box(det)]
         valid_detections = [detections[i] for i in valid_indices]
 
-        visibility_stats = camera_visibility.compute_frame_visibility(
-            valid_detections, cameras, config.visibility_occlusion_tolerance)
-        del visibility_stats
         points = _load_lidar_xyz(clip, frame_id)
         point_counts = count_points_in_boxes(
             points, [det["box_lidar"] for det in valid_detections])
@@ -165,9 +157,6 @@ def apply_hard_filters(frames: List[Dict[str, Any]], clip: Path,
                             config,
                             detections[detection_index].get("class_name"))):
                     reasons.append("sparse_points")
-                if (float(det.get("visibility", {}).get("ratio", 0.0))
-                        <= config.visibility_min_ratio):
-                    reasons.append("low_visibility")
 
             if not reasons:
                 kept.append(det)
@@ -184,7 +173,6 @@ def apply_hard_filters(frames: List[Dict[str, Any]], clip: Path,
                         "box_lidar": [round(float(x), 4)
                                       for x in det.get("box_lidar", [])[:7]],
                         "points_in_box": point_count_by_index.get(detection_index),
-                        "visibility_ratio": det.get("visibility", {}).get("ratio"),
                         "all_reasons": reasons,
                     })
             primary_counts[reasons[0]] += 1
@@ -201,7 +189,6 @@ def apply_hard_filters(frames: List[Dict[str, Any]], clip: Path,
             "range_side": config.range_side,
             "sparsity_drop_at_or_below": config.sparsity_max_points,
             "sparsity_by_class": dict(config.class_sparsity_max_points),
-            "visibility_drop_at_or_below": config.visibility_min_ratio,
             "pedestrian_max_distance": config.pedestrian_max_distance,
             "keep_classes": list(config.keep_classes),
         },

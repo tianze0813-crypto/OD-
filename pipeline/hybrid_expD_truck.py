@@ -62,7 +62,6 @@ DEFAULTS: Dict[str, Any] = dict(
     range_rear=20.0,
     range_side=40.0,
     sparsity_max_points=10,
-    visibility_min_ratio=0.05,
     short_track_max_frames=4,  # 【改动】短轨迹过滤保留，阈值 4
     yaw_impl="v2",             # 【改动】新版 yaw：动态段保留 detector yaw
     static_rotation_classes=("Truck", "Bus"),
@@ -247,7 +246,6 @@ def main() -> None:
             mode=str(args.detector_mode),
             score_thresh=float(args.raw_score_threshold),
             z_convention="center", skip_prepare=False, jobs=6,
-            vis_occl_tol=0.3, no_visibility_check=False,
         )
         raw_json = bf.run_inference(Path(args.clip).resolve(), bf_args)
         print(">> BEVFusion raw json: %s" % raw_json)

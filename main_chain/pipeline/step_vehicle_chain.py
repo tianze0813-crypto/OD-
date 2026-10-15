@@ -69,7 +69,6 @@ DEFAULTS: Dict[str, Any] = dict(
     range_front=80.0,
     range_rear=20.0,
     range_side=40.0,
-    visibility_min_ratio=0.05,
     # 车链里 Truck 由 BEVFusion 的 truck 头负责，step4 不再按尺寸把 Car 改写成 Truck
     car_size_relabel=False,
     car_size_truck_length_min=6.0,
@@ -194,7 +193,6 @@ def run(raw_json: Path, clip: Path, work_root: Path, *,
         sparsity_max_points=max(int(v) for _c, v in params["class_sparsity"]),
         class_sparsity_max_points=tuple(
             (str(c), int(v)) for c, v in params["class_sparsity"]),
-        visibility_min_ratio=float(params["visibility_min_ratio"]),
         keep_classes=tuple(str(c) for c in keep_classes),
     )
     settle_mode = car_yaw_settle_mode(params.get("car_yaw_settle"))

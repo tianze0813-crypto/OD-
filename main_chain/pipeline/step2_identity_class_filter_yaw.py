@@ -193,7 +193,6 @@ def main() -> None:
     parser.add_argument("--range-rear", type=float, default=20.0)
     parser.add_argument("--range-side", type=float, default=40.0)
     parser.add_argument("--sparsity-max-points", type=int, default=10)
-    parser.add_argument("--visibility-min-ratio", type=float, default=0.05)
     parser.add_argument("--pedestrian-max-distance", type=float, default=20.0)
     parser.add_argument("--keep-classes",
                         default="Vehicle,Car,Truck,Pedestrian,Cyclist")
@@ -211,7 +210,6 @@ def main() -> None:
         range_rear=args.range_rear,
         range_side=args.range_side,
         sparsity_max_points=args.sparsity_max_points,
-        visibility_min_ratio=args.visibility_min_ratio,
         pedestrian_max_distance=args.pedestrian_max_distance,
         keep_classes=tuple(x.strip() for x in args.keep_classes.split(",")
                            if x.strip()),

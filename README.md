@@ -100,7 +100,8 @@ hybrid_run.sh                                   挑 openpcdet 环境的 python�
    ├─ pipeline/hybrid_expD_vru.py                          VRU 链（VoxelNeXt）
    │   └─ pipeline/step1_lidar_inference.py 【子进程】models/voxelnext_vru_1head2cls_epoch20.pth
    │
-   └─ scripts/run_hybrid_prelabel.py::_merge_chain_labels  三条链按 frame_id 合成一份 label/det/
+   ├─ scripts/run_hybrid_prelabel.py::_merge_chain_labels  三条链按 frame_id 合成一份 label/det/
+   └─ pipeline/final_visibility.py  公共收尾阶段：合并标签后统一算遮挡属性 + 可见度过滤
 ```
 
 > ⚠️ `main_chain/` 不是历史残留：Car 的 step2~step5（含 step5a）就是那份代码（子进程、独立 `sys.path`）。
@@ -125,6 +126,7 @@ pipeline/                        编排 + Truck/VRU 链
   step3_refinement.py            Truck 几何 + yaw v2
   step2_identity.py / truck_car_tracking.py   旧五类链的跟踪/合并（被 noncar 链用）
   hybrid_merge.py                Car + 非车 两链合并（仅 noncar 模式）
+  final_visibility.py            公共收尾：合并后统一算遮挡属性（visibility）+ 可见度过滤
 main_chain/                      Car 共享阶段（OD-main-0909 vendor 快照，勿就地改）
 geometry/ filtering/ tracking/ classification/   根目录这棵：Truck / VRU / 入口用
 geometry_yaw_v2/                 Truck 专用 yaw（静态锁已关）
@@ -154,11 +156,12 @@ bak/                             已归档（**gitignore**，见 bak/README.md�
 | 短轨迹 | Car ≤3 / Truck ≤4 帧 | ≤4 帧（行人另加 <20 帧整条删）|
 | 行人框 | — | 框高统一 1.9m（原始 >1.9m 用原始高度）→ 顶贴头皮 → 框内低点 P95 作参照，框底与参照间距 >5cm 才裁、最多 20cm；逐帧，框内 <8 点跳过 |
 | 非机动车静止过滤 | — | **已删除**（2026-10-10：原 15m 净位移删链规则整段移除）|
+| 遮挡属性 / 可见度过滤 | **合并后的公共阶段统一算一次**（`pipeline/final_visibility.py`）：帧内全部类别一起判遮挡。**可见度过滤默认关闭**（`--drop-vis-below` 默认 0 = 只写 `visibility` 属性、不删框；给正数如 0.05 才按 `ratio <= 阈值` 删）；链内不再算 | 同左 |
 | 挂车 | `--trailer-policy to-truck`（默认并成 Truck，标注侧无 Trailer 类）| — |
 | 静态刚性框 | `--static-rigid`（默认关）| — |
 | yaw | Car：`--car-yaw-settle step45`（默认，B1：static_yaw 只算不写 + 几何跑 detector 原生系 + step4.5 settle 在几何之后写轴和方向）；Truck：`geometry_yaw_v2` | `legacy` |
 
-常用开关：`--chains car,truck,vru`（默认）｜`--truck-detector-mode lidar|fusion`（默认 lidar）
+常用开关：`--chains car,truck,vru`（默认）｜`--drop-vis-below`（默认 **0 = 关闭可见度过滤**，只算属性；给正数如 0.05 才删框）｜`--truck-detector-mode lidar|fusion`（默认 lidar）
 ｜`--vru-detector voxelnext|bevfusion`（默认 voxelnext）｜`--vru-raw-threshold`（默认 0.25）｜`--no-vru-fuse-lidars`（**VRU 链默认开启**多雷达融合：推理前把 lidar_front/rear 按标定 + 自车运动补偿融合进 lidar_top，补 top 近场盲区；车链不融合）｜`--bev-raw-dir`（复用已生成的 raw，不重跑推理）
 ｜`--car-yaw-settle step45\|step45-axis\|step2`（默认 step45 = B1）｜`--keep-vehicle-diagnostics`｜`--keep-chain-labels`｜`--link-only`｜`--output-tag`
 
@@ -268,7 +271,8 @@ step5a 在 **step4.5 与 step5 之间**、在**并集帧表**上跑一次：
 * 守卫：洞两侧邻居世界中心一致（<1.0 m）且轴一致；该帧已有别的 Car/Truck 与补框
   BEV IoU > 0.02 则跳过；
 * **只新增**检测（`_step5a_filled: true`、`region="static"`、`score=0.0`、
-  `visibility` 取相邻帧该目标的深拷贝），step4.5 已定稿的检测一字不改
+  `visibility` 取相邻帧该目标的深拷贝；链内已不再算遮挡属性，export 里的 `visibility`
+  由公共阶段 `pipeline/final_visibility.py` 重算），step4.5 已定稿的检测一字不改
   （自检 `append_only_check`）；
 * 开关：入口默认开，`--no-step5a` 关；`--step5a-min-points-in-box` /
   `--step5a-max-hole-frames` / `--step5a-max-fills-per-track` 可调。

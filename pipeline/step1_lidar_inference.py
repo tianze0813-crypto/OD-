@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Step 1: run lidar-top inference and attach camera visibility metadata.
+"""Step 1: run lidar-top inference.
 
 Input is an unlabelled SUST clip (``lidar/lidar_top/*.bin`` plus
 ``transforms/``).  Output is the ``*_raw.json`` consumed by step 2.
@@ -8,6 +8,10 @@ Input is an unlabelled SUST clip (``lidar/lidar_top/*.bin`` plus
 融合进 lidar_top（补 top 雷达近场盲区），融合结果落在 ``<work-root>/lidar_fused/<clip>/``。
 融合点云是过程数据（~130MB/clip），**默认推理一结束就删**，只留 ``<clip>_raw.json``；
 要留着复用（调试 / 复跑）加 ``--keep-lidar-fusion``。
+
+【改动 2026-10-14】orchestration（scripts/run_hybrid_prelabel.py）会带
+``--keep-lidar-fusion`` 跑：融合点云要活到**公共可见度阶段**（pipeline/final_visibility.py
+用它的近场点做点云高度比），阶段跑完由编排那边删掉。
 
 Run this step with the OpenPCDet environment, for example:
     python pipeline/step1_lidar_inference.py \
@@ -27,7 +31,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from filtering import camera_visibility
 from pipeline import lidar_fusion
 
 
@@ -115,17 +118,8 @@ def run_inference(clip: Path, args) -> Path:
         print(">> " + " ".join(cmd), flush=True)
         subprocess.run(cmd, check=True)
 
-        if not args.no_visibility_check:
-            frames = json.loads(raw_json.read_text(encoding="utf-8"))
-            # Visibility is metadata at this stage.  Identity assignment must see
-            # every detector output; both hard-filter passes happen after Step2.
-            stats = camera_visibility.filter_raw_frames(
-                frames, clip, 0.0, args.vis_occl_tol)
-            raw_json.write_text(
-                json.dumps(frames, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8")
-            print(f"visibility metadata: checked={stats['checked']} "
-                  f"dropped={stats['dropped']}", flush=True)
+        # 【改动 2026-10-14】遮挡属性/可见度过滤已移到三条链合并后的公共阶段
+        # （pipeline/final_visibility.py），raw 阶段不再挂 visibility 元数据。
         return raw_json
     finally:
         # 【改动 2026-10-10】融合点云是过程数据，默认跑完即删（失败也删）。
@@ -144,14 +138,12 @@ def main() -> None:
     parser.add_argument("--cfg", type=Path, default=DEFAULT_CFG)
     parser.add_argument("--ckpt", type=Path, default=DEFAULT_CKPT)
     parser.add_argument("--score-thresh", type=float, default=0.3)
-    parser.add_argument("--drop-vis-below", type=float, default=0.05)
-    parser.add_argument("--vis-occl-tol", type=float, default=0.3)
     parser.add_argument("--fuse-lidars", action="store_true",
                         help="推理前融合 lidar_front/rear 到 lidar_top（补近场盲区）")
     parser.add_argument("--keep-lidar-fusion", action="store_true",
                         help="【默认关】保留 <work-root>/lidar_fused/<clip> 融合点云"
-                             "（默认推理一结束就删，失败也删）")
-    parser.add_argument("--no-visibility-check", action="store_true")
+                             "（默认推理一结束就删，失败也删；orchestration 会打开它，"
+                             "留给公共可见度阶段用，阶段跑完再删）")
     args = parser.parse_args()
 
     for path, name in ((args.cfg, "cfg"), (args.ckpt, "ckpt")):
