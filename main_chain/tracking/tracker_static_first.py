@@ -1234,6 +1234,15 @@ class StaticFirstTracker:
         # claimed once (no two vehicles share a slot).
         stop_bound_slots: set[int] = set()
         stop_binds = []
+        # 【修·2026-10-17】**跨两个 bind 阶段共享**的"槽位已被认领"集合。
+        # 旧实现 stop_bound_slots / arrival_bound_slots 各管各的：一个槽位可以被
+        # stop-bind 认领一次（前一辆车停过又走了）、再被 arrival-bind 认领一次
+        # （后一辆车停进同一格），两条不同的动态轨迹都被改写成同一个 slot track_id，
+        # 于是在两车共存的帧里出现"同帧同 id 两个框"。
+        # 实测：P2 clip2 的槽位 15，车 91（停下又驶离）与车 83（随后停入）都拿到 id 15，
+        # f65~f67 三帧重复，直接把下游 step4.5 的硬断言打挂。
+        claimed_slots: set[int] = set()
+        claim_skips = 0        # arrival-bind 因为"槽位已被别人认领"而放弃的次数
         # 【改动】2026-09-21：按类别优先级排序（Car 先占槽位）
         for tid, items in sorted(
                 dynamic.items(),
@@ -1245,7 +1254,7 @@ class StaticFirstTracker:
                 continue
             best = None
             for slot in self.slots:
-                if int(slot.track_id) in stop_bound_slots:
+                if int(slot.track_id) in claimed_slots:
                     continue
                 ref = copy.deepcopy(items[-1])
                 ref.world = np.r_[dwell_center, items[-1].world[2]]
@@ -1269,6 +1278,7 @@ class StaticFirstTracker:
             if conflict:
                 continue
             stop_bound_slots.add(int(slot.track_id))
+            claimed_slots.add(int(slot.track_id))
             slot_track_id = int(slot.track_id)
             for frame in frames:
                 for det in frame.get("detections", []):
@@ -1308,7 +1318,12 @@ class StaticFirstTracker:
             # / gap) is the same vehicle parking, so bind it to the slot id.
             best = None
             for slot in self.slots:
+                # 【修·2026-10-17】共享 claimed_slots：槽位已被 stop-bind 认领就不再分给
+                # 另一辆车（同一格先后停两辆车是完全合法的，但不能共用一个 track_id）
                 if int(slot.track_id) in arrival_bound_slots:
+                    continue
+                if int(slot.track_id) in claimed_slots:
+                    claim_skips += 1
                     continue
                 slot_items = grouped.get(int(slot.track_id), [])
                 later = [o for o in slot_items
@@ -1345,6 +1360,7 @@ class StaticFirstTracker:
             _, slot = best
             slot_items = grouped.get(int(slot.track_id), [])
             arrival_bound_slots.add(int(slot.track_id))
+            claimed_slots.add(int(slot.track_id))
             slot_track_id = int(slot.track_id)
             for frame in frames:
                 for det in frame.get("detections", []):
@@ -1517,7 +1533,9 @@ class StaticFirstTracker:
                          "ingress_count": len(ingresses),
                          "stop_bind_count": len(stop_binds),
                          "arrival_bind_count": len(arrival_binds),
-                         "rejected_departure_count": len(rejected_departures)}
+                         "rejected_departure_count": len(rejected_departures),
+                         "claimed_slot_ids": sorted(int(v) for v in claimed_slots),
+                         "slot_claim_skips": int(claim_skips)}
 
     def process(self, frames: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         working = copy.deepcopy(list(frames))
