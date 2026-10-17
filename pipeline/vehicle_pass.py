@@ -68,9 +68,11 @@ DEFAULTS: Dict[str, Any] = dict(
     # ---- 车链共用（Car / Truck）----
     # 标注侧没有 Trailer：类别合并（跟踪前）之后，剩余纯挂车框在下一阶段直接并成 Truck
     keep_classes=("Car", "Truck"),
-    # 【改动·2026-09-29】默认按分类别分数门槛（用户拍板）：Car 0.1 / Truck 0.05。
+    # 【改动·2026-09-29】默认按分类别分数门槛（用户拍板）：Car 0.1 / Truck 0.1。
     # 这个值同时用于车链前段过滤 + 透传给 main_chain step2 的 --class-score-thresholds。
-    class_score_thresholds={"Car": 0.1, "Truck": 0.05, "Trailer": 0.25},
+    # 【改动 2026-10-17】Truck 0.05 -> 0.1（ct3_p2 权重 truck 召回变多、置信度整体抬高，
+    # 用户要求 Car / Truck 都按 0.1 卡）
+    class_score_thresholds={"Car": 0.1, "Truck": 0.1, "Trailer": 0.25},
     range_front=80.0,
     range_rear=20.0,
     range_side=40.0,
@@ -458,7 +460,7 @@ def run(raw_json: Path, clip: Path, work_root: Path,
                "--work-root", steps_root,
                "--car-yaw-settle", str(params["car_yaw_settle"])]
     # 【改动】2026-09-29：把分类别分数门槛透传给 step2（否则 step2 自带 0.2 会把
-    # 入口设的 Car 0.1 / Truck 0.05 又卡回 0.2）。
+    # 入口设的 Car 0.1 / Truck 0.1 又卡回 0.2）。
     vehicle_class_thresholds = tuple(
         (str(name), float(value))
         for name, value in (params.get("class_score_thresholds") or {}).items())

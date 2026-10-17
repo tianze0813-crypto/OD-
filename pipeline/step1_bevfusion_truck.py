@@ -23,8 +23,8 @@ work/infos/*、去畸变图）在推理结束时就地删掉，只留上面的 r
     BEVFUSION_PYTHON  默认 ~/miniconda3/envs/mmdet3d/bin/python（mmdet3d 环境）
     BEVFUSION_TRUCK_CFG / BEVFUSION_TRUCK_CKPT         C+L 配置/权重（默认 models/bevfusion_mmdet3d_lidarcam.pth）
     BEVFUSION_TRUCK_LIDAR_CFG / ..._LIDAR_CKPT         纯雷达配置/权重（mode=lidar，默认）：
-        默认 = 交警域微调 ct2-A —— configs/police_bevfusion_mmdet3d_lidaronly_ct2roi.py +
-        models/ft_ct2_A_fulllr_epoch8.pth（可用环境变量指回官方 lidaronly 那套）
+        默认 = 交警域微调 ct3_p2（2026-10-17 起）—— configs/police_bevfusion_mmdet3d_lidaronly_ct2roi.py +
+        models/ft_ct3_p2_fulllr_epoch13.pth（可用环境变量指回 ct2-A / 官方 lidaronly 那套）
     MMDET3D_ROOT      mmdetection3d 源码位置（默认 ~/MMDetection/mmdetection3d 等常见位置）
 """
 from __future__ import annotations
@@ -51,16 +51,18 @@ BEVFUSION_CFG = os.environ.get("BEVFUSION_TRUCK_CFG",
 BEVFUSION_CKPT = os.environ.get(
     "BEVFUSION_TRUCK_CKPT", str(PROJECT_ROOT / "models" / "bevfusion_mmdet3d_lidarcam.pth"))
 BEVFUSION_Z = os.environ.get("BEVFUSION_TRUCK_Z", "center")
-# 【改动·2026-09-29】纯雷达（lidar-only）默认换成交警域微调权重 ct2-A（epoch 8）：
-#   权重 models/ft_ct2_A_fulllr_epoch8.pth（car/truck 两类微调，5.7 万帧自动+人工数据）；
+# 【改动·2026-10-17】纯雷达（lidar-only）默认换成交警域微调权重 ct3_p2（epoch 13）：
+#   权重 models/ft_ct3_p2_fulllr_epoch13.pth（ct3_p2 = 从 ct2-A 起点、纯人工 GT、全量微调、
+#   lr1e-5 / 15ep；car/truck 两类，md5 72ca885840ce95ff0b0a564da61fca8b）；
 #   配置 configs/police_bevfusion_mmdet3d_lidaronly_ct2roi.py（训练几何：侧向 ±50.4 /
-#   前进 80.4 / 后退 20.4，1344×1344 正方网格；与权重必须成对使用）。
-#   旧官方权重（bevfusion_mmdet3d_lidaronly.pth + 对称 ±54 配置）仍可用环境变量或
-#   --bev-cfg/--bev-ckpt 显式指回。
+#   前进 80.4 / 后退 20.4，1344×1344×41 正方网格；ct3 未改 ROI，与 ct2-A 完全同一套几何，
+#   所以换权重不用换配置。推理前已用 10 类 head + 同一 BEV_GRID 核对过）。
+#   旧权重（ct2-A ft_ct2_A_fulllr_epoch8.pth、官方 bevfusion_mmdet3d_lidaronly.pth）
+#   仍可用环境变量或 --bev-cfg/--bev-ckpt 显式指回。
 BEVFUSION_LIDAR_CFG = os.environ.get(
     "BEVFUSION_TRUCK_LIDAR_CFG", "configs/police_bevfusion_mmdet3d_lidaronly_ct2roi.py")
 BEVFUSION_LIDAR_CKPT = os.environ.get(
-    "BEVFUSION_TRUCK_LIDAR_CKPT", str(PROJECT_ROOT / "models" / "ft_ct2_A_fulllr_epoch8.pth"))
+    "BEVFUSION_TRUCK_LIDAR_CKPT", str(PROJECT_ROOT / "models" / "ft_ct3_p2_fulllr_epoch13.pth"))
 
 
 def validate_clip(clip: Path) -> None:

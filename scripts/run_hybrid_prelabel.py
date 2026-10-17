@@ -228,13 +228,20 @@ def _python_candidates(explicit: Path | None) -> List[Path]:
 def _write_labels(frames: List[Dict[str, Any]], clip: Path) -> int:
     """写最终合并标签：``<clip>/label/det/<frame_id>.json``（【改动】2026-10-13）。
 
-    先整棵删掉 ``<clip>/label`` 再重建：这样重跑时旧的 ``label/*.json``（老版本
-    平铺产物）和 ``label/det/*.json`` 都会被清干净，不会和新结果混在一起。
+    【修·2026-10-17】**只清预测用的那一块**，不再整棵删 ``<clip>/label``：
+      * 删 ``label/det``（上一轮预测）
+      * 删 ``label/*.json``（2026-10-13 之前的平铺老产物）
+      * **保留** ``label/det_gt``（人工 GT）、``label/det_010`` 等任何其它子目录
+    旧实现 ``rmtree(<clip>/label)`` 会把放在 ``label/`` 下的 GT 一起删掉——
+    2026-10-17 在 ``P2测试集`` 上实测踩到过一次（有 ``P2测试集_005`` 备份可复原）。
     """
     label_root = clip / LABEL_SUBDIR
-    if label_root.exists():
-        shutil.rmtree(label_root)
     label_dir = _label_dir(clip)
+    if label_dir != label_root and label_dir.exists():
+        shutil.rmtree(label_dir)              # 只删 label/det
+    if label_root.is_dir():
+        for stale in label_root.glob("*.json"):
+            stale.unlink()                    # 平铺老产物
     label_dir.mkdir(parents=True, exist_ok=True)
     count = 0
     for frame in frames:
@@ -571,7 +578,10 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
              chains: tuple = DEFAULT_CHAINS,          # 【改动】car,truck,vru
              truck_cfg: Path = TRUCK_CFG,
              truck_ckpt: Path = TRUCK_CKPT,
-             truck_raw_threshold: float = 0.4,
+             # 【改动 2026-10-17】0.4 -> 0.1：与 --truck-raw-threshold / --bev-raw-threshold
+             # 的 argparse 默认一致（原来这个签名默认是 0.4 的死值，CLI 每次都显式覆盖成 0.1；
+             # 直接 import run_clip 不传参时才会踩到 0.4）。
+             truck_raw_threshold: float = 0.1,
              # 【改动】2026-09-20 Truck 链检测器与货车/挂车规则
              truck_detector: str = "bevfusion",
              truck_detector_mode: str = "lidar",     # 【改动】fusion | lidar
@@ -618,6 +628,7 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
     tag = output_tag.strip("_-")
     # 【改动】2026-09-29：分类型 BEV 门槛。raw 推理门槛必须 <= 其中最小值，
     # 否则低阈值那一类在上游就被砍掉了（例如 truck 0.05 被 raw 0.1 截断）。
+    # 2026-10-17 起 Car / Truck 都是 0.1 -> min(0.1, 0.1, 0.1) = 0.1，raw 不再被拉低。
     vehicle_thresholds = {str(k): float(v)
                           for k, v in (vehicle_class_score_thresholds or {}).items()}
     effective_bev_raw_threshold = float(bev_raw_threshold)
@@ -726,8 +737,9 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
                 step5a_max_hole_frames=step5a_max_hole_frames,
                 step5a_max_fills_per_track=step5a_max_fills_per_track,
                 class_score_thresholds={
-                    "Car": float(vehicle_thresholds.get("Car", 0.2)),
-                    "Truck": float(vehicle_thresholds.get("Truck", 0.2)),
+                    # 【改动 2026-10-17】兜底 0.2 -> 0.1（CLI 默认已显式给 0.1/0.1）
+                    "Car": float(vehicle_thresholds.get("Car", 0.1)),
+                    "Truck": float(vehicle_thresholds.get("Truck", 0.1)),
                     "Trailer": float(trailer_score_threshold)},
                 truck_short_track_max_frames=int(short_track_max_frames) or 4,
             )
@@ -769,7 +781,7 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
             diag_path = work / "truck_diagnostics.json"
             result = run_expd_truck(
                 raw, clip, out, diag_path,
-                class_score_thresholds={"Truck": 0.2,   # 【改动】0.4 -> 0.2
+                class_score_thresholds={"Truck": 0.1,   # 【改动】0.4 -> 0.2 -> 0.1
                                         "Trailer": float(trailer_score_threshold)},
                 trailer_rules=bool(trailer_rules),
                 trailer_dup_iom=float(trailer_dup_iom),
@@ -888,7 +900,7 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
                 (destination / sub).symlink_to(src.resolve())
         labels = _write_labels(merged, destination)
     elif in_place and rerun_in_place:
-        # 重跑已标注的 clip：目录名不变，只把 label/ 整棵重写（_write_labels 先 rmtree 再建 label/det）
+        # 重跑已标注的 clip：目录名不变，只重写 label/det（GT 等同级子目录保留）
         labels = _write_labels(merged, destination)
     elif in_place:
         # 端到端原地模式：把输入 clip 改名为 <clip>_pre，再把标签写进去，
@@ -1013,8 +1025,9 @@ def main() -> int:
     # 【改动】2026-09-29：车链 BEV 阶段分类别分数门槛（Car/Truck）
     parser.add_argument("--vehicle-car-score-threshold", type=float, default=0.1,
                         help="车链 Car 的分数门槛（BEV 阶段 + step2 硬过滤，默认 0.1）")
-    parser.add_argument("--vehicle-truck-score-threshold", type=float, default=0.05,
-                        help="车链 Truck 的分数门槛（BEV 阶段 + step2 硬过滤，默认 0.05）")
+    parser.add_argument("--vehicle-truck-score-threshold", type=float, default=0.1,
+                        help="车链 Truck 的分数门槛（BEV 阶段 + step2 硬过滤，默认 0.1；"
+                             "2026-10-17 由 0.05 上调——ct3_p2 权重 truck 分数整体抬高了）")
     # 【改动】2026-09-29：保留中间过程数据
     parser.add_argument("--keep-work-dir", type=Path, default=None,
                         help="非空则每个 clip 的全部中间过程数据落到 <该目录>/<clip名>/"
@@ -1162,7 +1175,7 @@ def main() -> int:
     if vehicle_chain:
         weights = ("models/bevfusion_mmdet3d_lidarcam.pth"
                    if args.truck_detector_mode == "fusion"
-                   else "models/ft_ct2_A_fulllr_epoch8.pth")   # 【改动】默认微调权重 ct2-A
+                   else "models/ft_ct3_p2_fulllr_epoch13.pth")   # 【改动 2026-10-17】默认微调权重 ct3_p2
         if args.bev_ckpt is not None:
             weights = str(args.bev_ckpt)
         cfg_note = (f" cfg={args.bev_cfg}" if args.bev_cfg is not None
@@ -1175,10 +1188,13 @@ def main() -> int:
     else:
         _print(f"chains={chains}  truck={truck_ckpt.name}  vru={vru_ckpt.name}")
         if "truck" in chains_set:
+            # 【改动 2026-10-17】打印真实默认权重：lidar -> ct3_p2 / fusion -> lidarcam
             weights = (truck_ckpt.name if args.truck_detector == "voxelnext"
-                       else "models/bevfusion_mmdet3d_lidaronly.pth")
+                       else ("models/ft_ct3_p2_fulllr_epoch13.pth"
+                             if args.truck_detector_mode == "lidar"
+                             else "models/bevfusion_mmdet3d_lidarcam.pth"))
             _print(f"truck chain(回退): detector={args.truck_detector} mode={args.truck_detector_mode} "
-                   f"thresholds={{'Truck': 0.2, 'Trailer': {args.trailer_score_threshold}}} "
+                   f"thresholds={{'Truck': 0.1, 'Trailer': {args.trailer_score_threshold}}} "
                    f"trailer_rules={not args.no_trailer_rules} weights={weights}")
     if "noncar" in chains:
         _validate_weight(noncar_ckpt)

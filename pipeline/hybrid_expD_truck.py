@@ -2,20 +2,25 @@
 
 与 VRU 链完全分离的参数（【改动】按用户 2026-09-18 需求）：
   * 范围      前 80 / 后 20 / 左右 40
-  * 分数阈值  Truck 0.4
+  * 分数阈值  Truck 0.1（2026-10-17 由 0.2 上调口径统一；docstring 早期写的 0.4 已作废）
   * 短轨迹    4（保留短轨迹过滤，阈值暂定 4）
   * 静止过滤  不做（卡车停车等灯是常态；链内静止过滤只作用于 Nonmotorized_vehicle，
               本链已把 NMV 过滤掉，因此天然不生效）
   * yaw       新版 v2（apply_motion_yaw=False：动态段/拐弯保留 detector yaw）
   * obj_id    从 1000 开始（与 VRU 链的 2000 起互不冲突）
 
-【改动】2026-09-20：检测器换成 BEVFusion（mmdet3d 1.x 官方 20ep 权重），并引入 Trailer（挂车）：
+【改动】2026-09-20：检测器换成 BEVFusion，并引入 Trailer（挂车）：
   * Step1 用 pipeline/step1_bevfusion_truck.py（C+L / 纯雷达可切）
   * 盒级规则：挂车被货车罩住 → 丢挂车（以 Truck 为准）；
               挂车与货车有交集 → 并集合并成一个大长 Truck
               （见 geometry/truck_trailer_rules.py）
   * 轨迹级规则：同一个 obj_id 里只要出现过 Truck，整条轨迹都改成 Truck
-  * 类别阈值：Truck **0.2**（2026-09-20 由 0.4 下调，让分数偏低的货车也能和挂车并集）；Trailer 0.25
+  * 类别阈值：Truck **0.1**（2026-09-20 由 0.4 下调到 0.2，2026-10-17 再定到 0.1）；Trailer 0.25
+
+【改动】2026-10-17：纯雷达默认权重换成 ct3_p2（models/ft_ct3_p2_fulllr_epoch13.pth，epoch 13），
+  配置仍是 configs/police_bevfusion_mmdet3d_lidaronly_ct2roi.py（ct3 未改 ROI，几何同一套）；
+  检测器原始阈值 0.1（--raw-score-threshold / BEVFusion --score-thresh 的默认值）。
+  同时 geometry/box_geometry.py 的 Truck 尺寸上限 17 m -> 26 m（真铰接车/超长挂车）。
 """
 from __future__ import annotations
 
@@ -57,7 +62,7 @@ LABEL_SUBDIR = "label_truck"
 # 本链的默认参数（可被 run(...) 的 overrides 覆盖）
 DEFAULTS: Dict[str, Any] = dict(
     keep_classes=KEEP_CLASSES,
-    class_score_thresholds={"Truck": 0.2, "Trailer": TRAILER_SCORE_THRESHOLD},  # 【改动】Truck 0.4 -> 0.2
+    class_score_thresholds={"Truck": 0.1, "Trailer": TRAILER_SCORE_THRESHOLD},  # 【改动】Truck 0.4 -> 0.2 -> 0.1
     range_front=80.0,          # 【改动】前 80
     range_rear=20.0,
     range_side=40.0,
@@ -229,7 +234,7 @@ def main() -> None:
     parser.add_argument("--range-front", type=float, default=DEFAULTS["range_front"])
     parser.add_argument("--range-rear", type=float, default=DEFAULTS["range_rear"])
     parser.add_argument("--range-side", type=float, default=DEFAULTS["range_side"])
-    parser.add_argument("--truck-score-threshold", type=float, default=0.2)  # 【改动】0.4 -> 0.2
+    parser.add_argument("--truck-score-threshold", type=float, default=0.1)  # 【改动】0.4 -> 0.2 -> 0.1
     parser.add_argument("--short-track-max-frames", type=int, default=4)
     parser.add_argument("--sparsity-max-points", type=int, default=10)
     parser.add_argument("--yaw-impl", default="v2")

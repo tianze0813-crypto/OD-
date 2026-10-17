@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
@@ -33,6 +35,63 @@ from tracking import tracker_static_first as static_first
 
 def _count(frames: Sequence[Dict[str, Any]]) -> int:
     return sum(len(frame.get("detections", [])) for frame in frames)
+
+
+def split_duplicate_track_ids(frames: List[Dict[str, Any]]
+                              ) -> Dict[str, Any]:
+    """同一帧里同一 ``track_id`` 出现多次时，把"不属于这条轨迹"的框换成新 id。
+
+    【修·2026-10-17】main_chain step2 的槽位绑定 / 遮挡复活 / id 继承等环节偶尔会把
+    两个物理目标写成同一个 id（P2 clip2 实测：id 15 在一帧里同时出现在 (10.5,-10.2)
+    和 (-8.1,-48.7)，相距 40 m+）。下游 step4.5 有硬断言禁止"同帧重复 id"，会整包失败。
+
+    这里的修法是**只拆不并**：保留与上一帧该 id 位置最近（无上一帧则分数最高）的那个框，
+    其余按"全片最大 id + 1"递增分配新 id —— 内容/类别/盒都不动，只改 id；被拆出来的
+    孤立框通常会因为短轨迹过滤自然消失，不会污染输出。
+    """
+    ids = [int(det["track_id"]) for frame in frames
+           for det in frame.get("detections", [])
+           if det.get("track_id") is not None]
+    next_id = (max(ids) + 1) if ids else 1
+    previous: Dict[int, tuple] = {}
+    splits: List[Dict[str, Any]] = []
+    for frame in frames:
+        detections = frame.get("detections", [])
+        counts = Counter(int(det["track_id"]) for det in detections
+                         if det.get("track_id") is not None)
+        for track_id, repeats in counts.items():
+            if repeats <= 1:
+                continue
+            group = [det for det in detections
+                     if det.get("track_id") is not None
+                     and int(det["track_id"]) == track_id]
+            reference = previous.get(track_id)
+
+            def _distance(det: Dict[str, Any]) -> float:
+                if reference is None:      # 首帧无参考：留分数最高的那个
+                    return -float(det.get("score", 0.0))
+                box = det.get("box_lidar") or [0.0, 0.0]
+                return math.hypot(float(box[0]) - reference[0],
+                                  float(box[1]) - reference[1])
+
+            group.sort(key=_distance)
+            for extra in group[1:]:
+                extra["track_id"] = int(next_id)
+                extra["_track_id_split_from"] = int(track_id)
+                splits.append({"frame_id": str(frame.get("frame_id")),
+                               "kept_id": int(track_id),
+                               "new_id": int(next_id)})
+                next_id += 1
+        for det in detections:
+            if det.get("track_id") is None:
+                continue
+            box = det.get("box_lidar") or [0.0, 0.0]
+            previous[int(det["track_id"])] = (float(box[0]), float(box[1]))
+    return {
+        "policy": "same-frame duplicate track_id -> split extras to fresh ids",
+        "splits": len(splits),
+        "details": splits[:20],
+    }
 
 
 def _assert_class_only(before: Sequence[Dict[str, Any]],
@@ -161,6 +220,8 @@ def run(
             after_det.pop("_step2_source_class", None)
     diagnostics["final_class_only_check"] = _assert_class_only(
         before_final_class, tracked)
+    # 【改动 2026-10-17】下游 step4.5 要求"同帧 id 唯一"，这里先把上游漏出来的重复 id 拆开
+    diagnostics["duplicate_id_repair"] = split_duplicate_track_ids(tracked)
     diagnostics["final_detections"] = _count(tracked)
 
     Path(out_json).parent.mkdir(parents=True, exist_ok=True)

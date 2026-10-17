@@ -48,7 +48,7 @@ done
 
 ```text
 [hybrid] chains=('car', 'truck', 'vru') | 车链 Car+Truck: detector=BEVFusion mode=lidar
-         weights=models/ft_ct2_A_fulllr_epoch8.pth ... | VRU: detector=voxelnext
+         weights=models/ft_ct3_p2_fulllr_epoch13.pth ... | VRU: detector=voxelnext
          weights=voxelnext_vru_1head2cls_epoch20.pth
 ```
 
@@ -78,7 +78,8 @@ hybrid_run.sh                                   挑 openpcdet 环境的 python�
    │   └─ bevfusion/scripts/infer_mmdet3d.py       BEVFusion 推理（10 类）
    │        + bevfusion/scripts/build_bev_pool.py  （被裸名 import）
    │        配置/权重：configs/police_bevfusion_mmdet3d[_lidaronly].py
-   │                  models/ft_ct2_A_fulllr_epoch8.pth（默认，微调 ct2-A）
+   │                  models/ft_ct3_p2_fulllr_epoch13.pth（默认，微调 ct3_p2 / 2026-10-17）
+   │                  / models/ft_ct2_A_fulllr_epoch8.pth（上一版权重，可显式指回）
    │                  / models/bevfusion_mmdet3d_lidaronly.pth（旧官方）/ _lidarcam.pth
    │
    ├─ pipeline/vehicle_pass.py                            合并车链（Car + Truck）
@@ -136,7 +137,7 @@ tests/                           测试：root/ + main_chain/ 两棵树各一套
 bak/                             已归档（**gitignore**，见 bak/README.md）
 ```
 
-`models/` 里在用的：**`ft_ct2_A_fulllr_epoch8.pth`（车链默认，交警域微调 ct2-A，配 `configs/police_bevfusion_mmdet3d_lidaronly_ct2roi.py`）**、`bevfusion_mmdet3d_lidaronly.pth`（旧官方 46MB，可显式指回）、`bevfusion_mmdet3d_lidarcam.pth`
+`models/` 里在用的：**`ft_ct3_p2_fulllr_epoch13.pth`（车链默认，交警域微调 ct3_p2 = 从 ct2-A 起点纯人工 GT 全量微调，配 `configs/police_bevfusion_mmdet3d_lidaronly_ct2roi.py`；2026-10-17 起）**、`ft_ct2_A_fulllr_epoch8.pth`（上一版，可显式指回）、`bevfusion_mmdet3d_lidaronly.pth`（旧官方 46MB，可显式指回）、`bevfusion_mmdet3d_lidarcam.pth`
 （fusion 模式）、`voxelnext_vru_rider_005_60m_epoch20.pth` + `voxelnext_vru_infer_60_005.yaml`（VRU 默认，2026-10-10 起，0.05m/±60m 配套 config；旧 `voxelnext_vru_1head2cls_epoch20.pth` + `voxelnext_vru_infer.yaml` 保留可显式指回）、
 `voxelnext_truckB_epoch15.pth` + `voxelnext_truck_infer.yaml`（Truck 回退，入口会校验存在）、
 `vod_2cls_ft_e12.pth` + `voxelnext_fiveclass_nuscenes_infer.yaml`（`--chains noncar`）。
@@ -150,7 +151,7 @@ bak/                             已归档（**gitignore**，见 bak/README.md�
 
 | 项 | Car / Truck（车链） | VRU |
 | --- | --- | --- |
-| 分数门槛（默认）| **Car 0.1 / Truck 0.05** / Trailer 0.25 | **Ped 0.4 / NMV 0.25**（raw 推理门槛 0.25）|
+| 分数门槛（默认）| **Car 0.1 / Truck 0.1** / Trailer 0.25 | **Ped 0.4 / NMV 0.25**（raw 推理门槛 0.25）|
 | 范围 前/后/侧 (m) | 80 / 20 / 40 | 60 / 20 / 40（行人另限 **20 m**，NMV 60 m）|
 | 稀疏度（框内点数）| Car ≤5 / Truck ≤10 | ≤10 |
 | 短轨迹 | Car ≤3 / Truck ≤4 帧 | ≤4 帧（行人另加 <20 帧整条删）|
@@ -168,10 +169,11 @@ bak/                             已归档（**gitignore**，见 bak/README.md�
 换权重 / 分类别阈值 / 留过程数据（2026-09-29 新增）：
 - `--bev-cfg <cfg.py>` / `--bev-ckpt <ckpt.pth>`：车链 BEVFusion 的配置与权重（换微调权重时必须给与训练几何一致的配置，如
   `bevfusion/configs/police_bevfusion_mmdet3d_lidaronly_ct2roi.py`）。
-- `--vehicle-car-score-threshold 0.1` / `--vehicle-truck-score-threshold 0.05`：车链 **BEV 阶段 + step2 硬过滤** 的分类别分数门槛。
-  默认即 Car 0.1 / Truck 0.05；raw 推理门槛会自动取 `min(原值, 各类阈值)`，避免低阈值那类在上游被截断；
+- `--vehicle-car-score-threshold 0.1` / `--vehicle-truck-score-threshold 0.1`：车链 **BEV 阶段 + step2 硬过滤** 的分类别分数门槛。
+  2026-10-17 起默认 **Car 0.1 / Truck 0.1**（ct3_p2 权重 truck 分数整体抬高，Truck 由 0.05 上调）；
+  raw 推理门槛会自动取 `min(原值, 各类阈值)`，避免低阈值那类在上游被截断（现在三者都 0.1 -> raw 也是 0.1）；
   同时 `pipeline/vehicle_pass.py` 会把 `--class-score-thresholds Car=..,Truck=..` 透传给 `main_chain` 的 step2
-  （此前 step2 自带 0.2，会把入口设的 0.1/0.05 又卡回去）。
+  （此前 step2 自带 0.2，会把入口设的 0.1 又卡回去）。
 - `--keep-work-dir <dir>`：把每个 clip 的全部中间过程数据落到 `<dir>/<clip名>/`（BEV raw、车链 step2/45/5a、
   car step3/4/5 诊断、truck 分支、VRU step2/3 等），不再随临时目录删除。
   注意：**BEVFusion 自己的预处理缓存不归这里管**，它默认跑完即删（见下节）。
