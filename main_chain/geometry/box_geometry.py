@@ -61,10 +61,9 @@ _SIZE_QUANTILES = {
 _SIZE_BOUNDS = {
     # Broad guards only. The track itself, not these values, determines size.
     "Car": ((3.20, 6.20), (1.45, 2.65), (1.20, 2.45)),
-    # 【改动 2026-10-17 用户口径】标注单框上限 = **17 m**；这里放行到 26 m 只为了让
-    # 「该不该拆」这个判断有据可依 —— 超过 17 m 的卡车会在
-    # geometry/truck_postprocess.split_long_trucks 里沿长轴拆成「前 17 m + 后 余量
-    # （26 m 时正好 9 m）」两段，各自独立 track_id，所以**导出框永远 <= 17 m**。
+    # 【改动 2026-10-17 用户口径（第二版）】估计上限 26 m；**只有 >20 m 的框会被拆**：
+    # geometry/truck_postprocess.split_long_trucks 沿行进方向拆成「前段 17 m + 后段余量」
+    # （26 m -> 17 + 9）两段，各自独立 track_id。<= 20 m 的框原样输出（17.0x 也不裁）。
     # 下限定为 5.50 仍表示"这不像卡车"的下界。宽 / 高不变。
     "Truck": ((5.50, 26.00), (2.00, 3.80), (2.10, 4.80)),
     "Cyclist": ((1.10, 3.80), (0.50, 1.60), (0.90, 2.30)),

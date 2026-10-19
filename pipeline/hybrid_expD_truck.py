@@ -20,9 +20,10 @@
 【改动】2026-10-17：纯雷达默认权重换成 ct3_p2（models/ft_ct3_p2_fulllr_epoch13.pth，epoch 13），
   配置仍是 configs/police_bevfusion_mmdet3d_lidaronly_ct2roi.py（ct3 未改 ROI，几何同一套）；
   检测器原始阈值 0.1（--raw-score-threshold / BEVFusion --score-thresh 的默认值）。
-  Truck 单框长度上限仍是 **17 m**：几何估计允许到 26 m，超过 17 m 的（真铰接车/超长挂车）
-  在 truck_postprocess 的最后一步 split_long_trucks 里拆成「前 17 m + 后 余量（26 m -> 9 m）」
-  两个框，各自独立 track_id（用户 2026-10-17 口径）。
+  Truck 超长车的处理（用户 2026-10-17 口径，第二版）：**只有 >20 m 才拆**，20 m 以下原样不动；
+  超长的在 truck_postprocess 最后一步 split_long_trucks 里沿**行进方向**拆成
+  「前段 17 m（车头那 17 m）+ 后段 余量（26 m -> 9 m）」两个框，各自独立 track_id。
+  框长轴只到 mod 180°、分不出车头车尾，所以前后靠每帧运动航向来定。
 """
 from __future__ import annotations
 

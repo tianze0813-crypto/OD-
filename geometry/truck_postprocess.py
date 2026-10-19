@@ -66,13 +66,15 @@ class TruckPostConfig:
     reversal_min_net: float = 1.0
     truck_class: str = "Truck"
     vehicle_classes: Tuple[str, ...] = ("Truck", "Bus")
-    # 【改动 2026-10-17 用户口径】单框上限 17 m；超长的卡车（铰接 / 超长挂车，
-    #   几何估计最高到 26 m）不再拉成一个长框，而是沿长轴拆成两段：
-    #      前段 = 17 m（保留原 track_id） + 后段 = 余量（26 m 时正好 9 m，各自独立 track_id）
-    #   余量不足 long_split_min_remainder_m 时只裁到 17 m、不拆（避免出现 0.x m 的碎片框）。
+    # 【改动 2026-10-17 用户口径（第二版）】只有**超过 20 m** 的卡车框才拆：
+    #   * <= 20 m：原样不动（17.0x 这种差一点点也不裁，保留检测/几何估计的原值）；
+    #   * >  20 m：沿**行进方向**拆成「前段 17 m（车头那 17 m，保留原 track_id）+
+    #              后段 余量（独立 track_id）」，26 m 时正好 17 m + 9 m。
+    # 行进方向用来定"哪一头算前面"（框长轴本身只到 mod 180°，靠它分不出车头车尾）。
     long_split_enabled: bool = True
-    long_split_max_piece_m: float = 17.0
-    long_split_min_remainder_m: float = 3.0
+    long_split_trigger_m: float = 20.0        # 超过这个长度才拆
+    long_split_front_m: float = 17.0          # 前段固定长度
+    long_split_min_remainder_m: float = 1.0   # 余量小于它就放弃（默认拆不到这种：20-17=3）
 
 
 def _wrap(angle: float) -> float:
@@ -729,35 +731,100 @@ def flip_yaw_reversals(frames: List[Dict[str, Any]],
             "reversed_detections": flipped, "tracks": details}
 
 
+def _unit(vector: Sequence[float]) -> Optional[np.ndarray]:
+    array = np.asarray(vector, dtype=np.float64)
+    norm = float(np.linalg.norm(array))
+    if norm <= 1e-9 or not np.all(np.isfinite(array)):
+        return None
+    return array / norm
+
+
+def _world_heading_to_local(heading: float,
+                            world_from_lidar) -> Optional[np.ndarray]:
+    """世界系朝向角 -> 该帧 lidar 局部系的单位方向向量。"""
+    if world_from_lidar is None:
+        return None
+    planar = np.asarray(world_from_lidar, dtype=np.float64)[:2, :2]
+    world = np.asarray([math.cos(float(heading)), math.sin(float(heading))])
+    try:
+        local = np.linalg.solve(planar, world)
+    except np.linalg.LinAlgError:
+        local = np.linalg.lstsq(planar, world, rcond=None)[0]
+    return _unit(local)
+
+
+def _track_travel_headings(items: Sequence[Dict[str, Any]],
+                           half: int = 2,
+                           speed_min: float = 0.30
+                           ) -> List[Optional[float]]:
+    """逐帧"行进方向"（世界系 heading，rad）。
+
+    优先用 ±``half`` 帧的速度拟合（转弯时方向跟着变）；拟合不出来的帧（太慢/点太少）
+    用它最近的有效值补；整条轨迹都不动（停车）时退回"首末净位移"；
+    仍然不可用就返回 None —— 调用方会退化成"框长轴 + 正方向那头算车头"。
+    """
+    count = len(items)
+    headings: List[Optional[float]] = [None] * count
+    for index in range(count):
+        headings[index] = _local_heading(items, index, half, speed_min)
+    known = [index for index, value in enumerate(headings) if value is not None]
+    if known:
+        for index in range(count):          # 用最近的有效 heading 补空
+            if headings[index] is not None:
+                continue
+            nearest = min(known, key=lambda k: abs(k - index))
+            headings[index] = headings[nearest]
+        return headings
+    if count >= 2:                          # 全静止 -> 首末净位移
+        net = np.asarray(items[-1]["world"][:2], dtype=np.float64) - \
+              np.asarray(items[0]["world"][:2], dtype=np.float64)
+        if float(np.linalg.norm(net)) >= 0.5:
+            heading = float(math.atan2(float(net[1]), float(net[0])))
+            return [heading] * count
+    return headings
+
+
 def split_long_trucks(frames: List[Dict[str, Any]],
+                      coords: Optional[tracking.CoordinateProvider] = None,
                       config: TruckPostConfig = TruckPostConfig()
                       ) -> Dict[str, Any]:
-    """【改动 2026-10-17】长度超过上限的卡车框拆成两段（前 17 m + 后 余量）。
+    """【改动 2026-10-17 用户口径（第二版）】超长卡车拆成两段。
 
-    用户口径：单框上限 **17 m**；遇到 26 m 这种长车（真铰接 / 超长挂车）就拆成
-    「前面一个 17 m、后面一个 9 m」两个框，各自带独立的 track_id。
-
-    实现要点：
-      * 沿框的**长轴**切（``box[3] >= box[4]`` 时是局部 x 轴，否则是 y 轴）；
-      * 前段（+长轴方向那一端）保留原 track_id；后段拿一个全片唯一的新 id，
-        并打 ``_truck_split_from`` 便于追溯；
-      * 宽 / 高 / z / yaw / 类别 / 分数 / 可见度等字段全部原样继承，只有中心与长边变；
-      * 两段**首尾相接**，不重叠也不留缝；
-      * 余量 < ``long_split_min_remainder_m``（默认 3 m）时只把长边裁到 17 m，不拆，
-        避免生成 0.x m 的碎片框。
+    规则：
+      * **只有长度 > ``long_split_trigger_m``（默认 20 m）才拆**；<= 20 m 原样不动
+        （17.0x 这种差一点点也不裁）。
+      * 拆的时候沿**行进方向**判断车头车尾：前段 17 m（车头那 17 m，保留原 track_id）
+        + 后段余量（26 m -> 9 m，独立 track_id）。框长轴只到 mod 180°，光看它分不出
+        车头车尾，所以行进方向只用来定"哪一头算前面"，框本身的 yaw/宽/高都不动。
+      * 两段首尾相接，不重叠不留缝；宽 / 高 / z / yaw / 类别 / 分数 / 可见度原样继承。
+      * 同一条轨迹的"后段"在整段里用同一个新 id（否则每帧新 id 会碎成一堆单帧轨迹）。
+      * 没有运动信息（停车、单帧轨迹、缺外参）时退回"框长轴正方向那头算车头"。
     """
     if not bool(config.long_split_enabled):
         return {"enabled": False, "reason": "long_split_disabled"}
-    max_piece = float(config.long_split_max_piece_m)
+    trigger = float(config.long_split_trigger_m)
+    front_len = float(config.long_split_front_m)
     min_remainder = float(config.long_split_min_remainder_m)
+
+    # 逐帧行进方向（局部系单位向量），用于定车头车尾
+    travel: Dict[Tuple[int, int], np.ndarray] = {}
+    if coords is not None:
+        for track_id, items in _collect_tracks(frames, coords, config).items():
+            headings = _track_travel_headings(items)
+            for item, heading in zip(items, headings):
+                if heading is None:
+                    continue
+                direction = _world_heading_to_local(heading,
+                                                    item["world_from_lidar"])
+                if direction is not None:
+                    travel[(int(track_id), int(item["timestamp"]))] = direction
+
     next_id = 1 + max(
         (int(det["track_id"]) for frame in frames
          for det in frame.get("detections", [])
          if det.get("track_id") is not None), default=0)
-    # 同一条原始轨迹的"后段"必须在整段里用同一个 id，否则每帧一个新 id 会碎成一堆
-    # 单帧轨迹（短轨迹过滤会直接删掉）——这里做 原 id -> 后段 id 的固定映射。
     tail_ids: Dict[int, int] = {}
-    split = clipped = 0
+    split = skipped = 0
     examples: List[Dict[str, Any]] = []
     for frame in frames:
         detections = frame.get("detections", [])
@@ -771,34 +838,35 @@ def split_long_trucks(frames: List[Dict[str, Any]],
             box = [float(value) for value in det["box_lidar"]]
             long_is_x = box[3] >= box[4]
             length = box[3] if long_is_x else box[4]
-            if length <= max_piece + 1e-6:
+            if length <= trigger + 1e-9:      # <= 20 m：完全不碰
                 continue
-            remainder = length - max_piece
-            if remainder < min_remainder:      # 只裁到上限，不拆
-                if long_is_x:
-                    box[3] = max_piece
-                else:
-                    box[4] = max_piece
-                det["box_lidar"] = box
-                clipped += 1
+            remainder = length - front_len
+            if remainder < min_remainder:     # 太长但余量太小 -> 放弃（默认走不到）
+                skipped += 1
                 continue
-            # 长轴方向：dx 是长边 -> 用 yaw；dy 是长边 -> yaw + 90°
             axis = box[6] if long_is_x else box[6] + math.pi / 2.0
-            cosine, sine = math.cos(axis), math.sin(axis)
-            half = length / 2.0
-            front_center = -half + max_piece / 2.0                 # 前段中心（局部长轴坐标）
-            rear_center = -half + max_piece + remainder / 2.0      # 后段中心
+            axis_unit = np.asarray([math.cos(axis), math.sin(axis)])
+            # 车头方向：有行进方向就用它定符号，没有就默认"框长轴正方向"
+            direction = travel.get((int(det["track_id"]),
+                                    int(frame.get("frame_id"))))
+            if direction is None:
+                sign, source = 1.0, "box_axis"
+            else:
+                sign = 1.0 if float(axis_unit @ direction) >= 0.0 else -1.0
+                source = "travel"
+            front_offset = sign * (length / 2.0 - front_len / 2.0)
+            rear_offset = sign * (remainder / 2.0 - length / 2.0)
             front = list(box)
-            front[0] = box[0] + cosine * front_center
-            front[1] = box[1] + sine * front_center
+            front[0] = box[0] + axis_unit[0] * front_offset
+            front[1] = box[1] + axis_unit[1] * front_offset
             rear = list(box)
-            rear[0] = box[0] + cosine * rear_center
-            rear[1] = box[1] + sine * rear_center
+            rear[0] = box[0] + axis_unit[0] * rear_offset
+            rear[1] = box[1] + axis_unit[1] * rear_offset
             if long_is_x:
-                front[3] = max_piece
+                front[3] = front_len
                 rear[3] = remainder
             else:
-                front[4] = max_piece
+                front[4] = front_len
                 rear[4] = remainder
             original_id = int(det["track_id"])
             tail_id = tail_ids.get(original_id)
@@ -807,34 +875,35 @@ def split_long_trucks(frames: List[Dict[str, Any]],
                 tail_ids[original_id] = tail_id
                 next_id += 1
             det["box_lidar"] = front
+            det["_truck_split_tail_id"] = int(tail_id)
             rear_det = copy.deepcopy(det)
             rear_det["box_lidar"] = rear
             rear_det["track_id"] = int(tail_id)
             rear_det["_truck_split_from"] = original_id
-            det["_truck_split_tail_id"] = int(tail_id)
             added.append(rear_det)
             split += 1
             if len(examples) < 20:
                 examples.append({
                     "frame_id": str(frame.get("frame_id")),
                     "track_id": original_id,
-                    "tail_track_id": int(rear_det["track_id"]),
+                    "tail_track_id": int(tail_id),
                     "length_before": round(float(length), 3),
-                    "front_length": round(float(max_piece), 3),
+                    "front_length": round(float(front_len), 3),
                     "rear_length": round(float(remainder), 3),
+                    "head_source": source,
                 })
         if added:
             detections.extend(added)
             frame["num_detections"] = len(detections)
     return {
         "enabled": True,
-        "policy": "Truck 单框上限 %.1f m；超长框沿长轴拆成「前 %.1f m + 后 余量」，各自独立 track_id"
-                  % (max_piece, max_piece),
-        "max_piece_m": max_piece,
+        "policy": ">%.1f m 才拆：沿行进方向取前 %.1f m + 后余量（各带独立 track_id）；"
+                  "<= %.1f m 原样不动" % (trigger, front_len, trigger),
+        "trigger_m": trigger,
+        "front_m": front_len,
         "min_remainder_m": min_remainder,
         "boxes_split": split,
-        "boxes_clipped_only": clipped,
-        # 原 track_id -> 后段 track_id 的固定映射（整段一致）
+        "boxes_skipped_short_remainder": skipped,
         "split_pairs": {str(int(key)): int(value)
                         for key, value in sorted(tail_ids.items())},
         "examples": examples,
@@ -860,5 +929,5 @@ def apply_truck_postprocess(frames: List[Dict[str, Any]],
     diagnostics["xy_fit"] = fit_truck_xy(frames, coords, clip, None, config)
     # 【改动 2026-10-17】最后一步：超长卡车拆两段（前 17 m + 后 余量）。
     # 放在 yaw 处理之后，保证 per-track 的 yaw 规则仍然作用在"完整的一辆长车"上。
-    diagnostics["long_truck_split"] = split_long_trucks(frames, config)
+    diagnostics["long_truck_split"] = split_long_trucks(frames, coords, config)
     return diagnostics
