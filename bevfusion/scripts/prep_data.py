@@ -148,8 +148,9 @@ def main():
         for cam in cams:
             its_by_cam[cam] = sorted(p.stem for p in (cdir / "image" / cam).glob("*.jpg"))
         base_its = its_by_cam[cams[0]]
-        for cam in cams:
-            assert its_by_cam[cam] == base_its, f"{clip}/{cam} 图像帧集合与 {cams[0]} 不一致"
+        if not args.no_images:   # 【H800 补丁 2026-10-17】纯雷达模式不需要图像，容忍各相机帧集合不一致
+            for cam in cams:
+                assert its_by_cam[cam] == base_its, f"{clip}/{cam} 图像帧集合与 {cams[0]} 不一致"
         img_of_ts, dts = {}, []
         for ts in tss:
             it = min(base_its, key=lambda t: abs(int(t) - int(ts)))
