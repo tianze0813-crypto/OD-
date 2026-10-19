@@ -152,6 +152,7 @@ bak/                             已归档（**gitignore**，见 bak/README.md�
 | 项 | Car / Truck（车链） | VRU |
 | --- | --- | --- |
 | 分数门槛（默认）| **Car 0.1 / Truck 0.1** / Trailer 0.25 | **Ped 0.4 / NMV 0.25**（raw 推理门槛 0.25）|
+| Truck 框长上限 | **单框 17 m**：几何估计允许到 26 m，>17 m 的（铰接/超长挂车）在 `truck_postprocess.split_long_trucks` 拆成「前 17 m + 后 余量（26 m→9 m）」两段、各自独立 obj_id；余量 <3 m 时只裁到 17 m | — |
 | 范围 前/后/侧 (m) | 80 / 20 / 40 | 60 / 20 / 40（行人另限 **20 m**，NMV 60 m）|
 | 稀疏度（框内点数）| Car ≤5 / Truck ≤10 | ≤10 |
 | 短轨迹 | Car ≤3 / Truck ≤4 帧 | ≤4 帧（行人另加 <20 帧整条删）|

@@ -66,6 +66,13 @@ class TruckPostConfig:
     reversal_min_net: float = 1.0
     truck_class: str = "Truck"
     vehicle_classes: Tuple[str, ...] = ("Truck", "Bus")
+    # 【改动 2026-10-17 用户口径】单框上限 17 m；超长的卡车（铰接 / 超长挂车，
+    #   几何估计最高到 26 m）不再拉成一个长框，而是沿长轴拆成两段：
+    #      前段 = 17 m（保留原 track_id） + 后段 = 余量（26 m 时正好 9 m，各自独立 track_id）
+    #   余量不足 long_split_min_remainder_m 时只裁到 17 m、不拆（避免出现 0.x m 的碎片框）。
+    long_split_enabled: bool = True
+    long_split_max_piece_m: float = 17.0
+    long_split_min_remainder_m: float = 3.0
 
 
 def _wrap(angle: float) -> float:
@@ -722,6 +729,118 @@ def flip_yaw_reversals(frames: List[Dict[str, Any]],
             "reversed_detections": flipped, "tracks": details}
 
 
+def split_long_trucks(frames: List[Dict[str, Any]],
+                      config: TruckPostConfig = TruckPostConfig()
+                      ) -> Dict[str, Any]:
+    """【改动 2026-10-17】长度超过上限的卡车框拆成两段（前 17 m + 后 余量）。
+
+    用户口径：单框上限 **17 m**；遇到 26 m 这种长车（真铰接 / 超长挂车）就拆成
+    「前面一个 17 m、后面一个 9 m」两个框，各自带独立的 track_id。
+
+    实现要点：
+      * 沿框的**长轴**切（``box[3] >= box[4]`` 时是局部 x 轴，否则是 y 轴）；
+      * 前段（+长轴方向那一端）保留原 track_id；后段拿一个全片唯一的新 id，
+        并打 ``_truck_split_from`` 便于追溯；
+      * 宽 / 高 / z / yaw / 类别 / 分数 / 可见度等字段全部原样继承，只有中心与长边变；
+      * 两段**首尾相接**，不重叠也不留缝；
+      * 余量 < ``long_split_min_remainder_m``（默认 3 m）时只把长边裁到 17 m，不拆，
+        避免生成 0.x m 的碎片框。
+    """
+    if not bool(config.long_split_enabled):
+        return {"enabled": False, "reason": "long_split_disabled"}
+    max_piece = float(config.long_split_max_piece_m)
+    min_remainder = float(config.long_split_min_remainder_m)
+    next_id = 1 + max(
+        (int(det["track_id"]) for frame in frames
+         for det in frame.get("detections", [])
+         if det.get("track_id") is not None), default=0)
+    # 同一条原始轨迹的"后段"必须在整段里用同一个 id，否则每帧一个新 id 会碎成一堆
+    # 单帧轨迹（短轨迹过滤会直接删掉）——这里做 原 id -> 后段 id 的固定映射。
+    tail_ids: Dict[int, int] = {}
+    split = clipped = 0
+    examples: List[Dict[str, Any]] = []
+    for frame in frames:
+        detections = frame.get("detections", [])
+        added: List[Dict[str, Any]] = []
+        for det in detections:
+            if det.get("track_id") is None or not tracking.finite_box(det):
+                continue
+            name = tracking.canonical_class_name(det.get("class_name", ""))
+            if name not in config.vehicle_classes:
+                continue
+            box = [float(value) for value in det["box_lidar"]]
+            long_is_x = box[3] >= box[4]
+            length = box[3] if long_is_x else box[4]
+            if length <= max_piece + 1e-6:
+                continue
+            remainder = length - max_piece
+            if remainder < min_remainder:      # 只裁到上限，不拆
+                if long_is_x:
+                    box[3] = max_piece
+                else:
+                    box[4] = max_piece
+                det["box_lidar"] = box
+                clipped += 1
+                continue
+            # 长轴方向：dx 是长边 -> 用 yaw；dy 是长边 -> yaw + 90°
+            axis = box[6] if long_is_x else box[6] + math.pi / 2.0
+            cosine, sine = math.cos(axis), math.sin(axis)
+            half = length / 2.0
+            front_center = -half + max_piece / 2.0                 # 前段中心（局部长轴坐标）
+            rear_center = -half + max_piece + remainder / 2.0      # 后段中心
+            front = list(box)
+            front[0] = box[0] + cosine * front_center
+            front[1] = box[1] + sine * front_center
+            rear = list(box)
+            rear[0] = box[0] + cosine * rear_center
+            rear[1] = box[1] + sine * rear_center
+            if long_is_x:
+                front[3] = max_piece
+                rear[3] = remainder
+            else:
+                front[4] = max_piece
+                rear[4] = remainder
+            original_id = int(det["track_id"])
+            tail_id = tail_ids.get(original_id)
+            if tail_id is None:
+                tail_id = int(next_id)
+                tail_ids[original_id] = tail_id
+                next_id += 1
+            det["box_lidar"] = front
+            rear_det = copy.deepcopy(det)
+            rear_det["box_lidar"] = rear
+            rear_det["track_id"] = int(tail_id)
+            rear_det["_truck_split_from"] = original_id
+            det["_truck_split_tail_id"] = int(tail_id)
+            added.append(rear_det)
+            split += 1
+            if len(examples) < 20:
+                examples.append({
+                    "frame_id": str(frame.get("frame_id")),
+                    "track_id": original_id,
+                    "tail_track_id": int(rear_det["track_id"]),
+                    "length_before": round(float(length), 3),
+                    "front_length": round(float(max_piece), 3),
+                    "rear_length": round(float(remainder), 3),
+                })
+        if added:
+            detections.extend(added)
+            frame["num_detections"] = len(detections)
+    return {
+        "enabled": True,
+        "policy": "Truck 单框上限 %.1f m；超长框沿长轴拆成「前 %.1f m + 后 余量」，各自独立 track_id"
+                  % (max_piece, max_piece),
+        "max_piece_m": max_piece,
+        "min_remainder_m": min_remainder,
+        "boxes_split": split,
+        "boxes_clipped_only": clipped,
+        # 原 track_id -> 后段 track_id 的固定映射（整段一致）
+        "split_pairs": {str(int(key)): int(value)
+                        for key, value in sorted(tail_ids.items())},
+        "examples": examples,
+    }
+
+
 def apply_truck_postprocess(frames: List[Dict[str, Any]],
                             coords: tracking.CoordinateProvider, clip,
                             config: TruckPostConfig = TruckPostConfig()
@@ -739,4 +858,7 @@ def apply_truck_postprocess(frames: List[Dict[str, Any]],
         diagnostics["iou_merge"] = {"enabled": False,
                                     "reason": "用户要求去掉 IoU 并集合并"}
     diagnostics["xy_fit"] = fit_truck_xy(frames, coords, clip, None, config)
+    # 【改动 2026-10-17】最后一步：超长卡车拆两段（前 17 m + 后 余量）。
+    # 放在 yaw 处理之后，保证 per-track 的 yaw 规则仍然作用在"完整的一辆长车"上。
+    diagnostics["long_truck_split"] = split_long_trucks(frames, config)
     return diagnostics
