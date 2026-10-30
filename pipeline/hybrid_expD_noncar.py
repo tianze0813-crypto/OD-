@@ -89,6 +89,35 @@ def _early_range_filter(frames: List[Dict[str, Any]], *,
             "nonmotorized_max_distance": nonmotorized_max_distance}
 
 
+def _early_nonmotorized_height_filter(frames: List[Dict[str, Any]], *,
+                                      min_height: float) -> Dict[str, Any]:
+    """【改动 2026-10-30】把"空车"非机动车过滤掉：框高 < min_height 直接丢。
+
+    依据（用户实测）：没人坐的自行车/电瓶车检测框高约 1.35~1.4m，坐上人约 1.6m，
+    因此 1.4m 以下基本是空车，标注规则里不需要。放在原始检测之后第一步，
+    比跟踪/几何都便宜。
+    """
+    before = _count(frames)
+    removed = 0
+    for frame in frames:
+        kept = []
+        for det in frame.get("detections", []):
+            cls = tracking.canonical_class_name(det.get("class_name", ""))
+            if cls == "Nonmotorized_vehicle":
+                box = det.get("box_lidar") or []
+                try:
+                    height = float(box[5])
+                except (TypeError, ValueError, IndexError):
+                    height = None
+                if height is not None and height < min_height:
+                    removed += 1
+                    continue
+            kept.append(det)
+        frame["detections"] = kept
+    return {"detections_before": before, "detections_after": before - removed,
+            "detections_removed": removed, "min_height_m": float(min_height)}
+
+
 def _yaw_v2_config(flags):        # 【改动】
     """把 dict 形式的开关转成 geometry_yaw_v2 的 YawVehicleDynamicConfig。"""
     if not flags:
@@ -456,6 +485,8 @@ def run(raw_json: Path, clip: Path, out_json: Path,
         class_score_thresholds: Mapping[str, float] | None = None,
         pedestrian_max_distance: float = 15.0,   # 【改动】20 -> 15
         nonmotorized_max_distance: float = 60.0,
+        # 【改动 2026-10-30】非机动车框高下限（米）：低于它视为空车直接丢；0 = 关闭（VRU 链默认 1.4）
+        nonmotorized_min_height: float = 0.0,
         # 【改动 2026-10-10】行人框统一 1.8m + 顶部贴头皮 + 底部按 P95 拟合地面裁（有间距才裁、最多 20cm）（VRU 链默认开）
         pedestrian_top_fit: bool = False,
         pedestrian_top_fit_min_points: int = 8,
@@ -511,6 +542,7 @@ def run(raw_json: Path, clip: Path, out_json: Path,
         "input_detections": _count(frames),
         "stage_order": [
             "early_non_car_class_filter",
+            "early_nonmotorized_height_filter",   # 【改动 2026-10-30】空车（框高 < 阈值）
             "early_range_filter",   # 【改动】提到最前
             "category_score_filter_non_car_only",
             "current_identity_tracking",
@@ -521,6 +553,12 @@ def run(raw_json: Path, clip: Path, out_json: Path,
     }
     diagnostics["early_non_car_filter"] = _noncar_filter(
         frames, keep_classes=keep_classes)   # 【改动】
+    # 【改动 2026-10-30】紧接类别过滤：把空车（框高 < 1.35m 的非机动车）丢掉。
+    if nonmotorized_min_height and float(nonmotorized_min_height) > 0:
+        diagnostics["early_nonmotorized_height_filter"] = _early_nonmotorized_height_filter(
+            frames, min_height=float(nonmotorized_min_height))
+    else:
+        diagnostics["early_nonmotorized_height_filter"] = {"enabled": False}
     # 【改动】紧接类别过滤后，立刻做范围过滤（便宜且能砍掉 ~2/3 的框）
     if pre_tracking_filters:   # 【改动】Truck 链：跳过跟踪前范围过滤，改由 step2/step2_5 跟踪后过滤
         diagnostics["early_range_filter"] = _early_range_filter(

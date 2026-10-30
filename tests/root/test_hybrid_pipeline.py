@@ -8,10 +8,12 @@ from unittest.mock import patch
 import numpy as np
 
 from pipeline.hybrid_expD_noncar import (
+    _early_nonmotorized_height_filter,
     _noncar_filter,
     drop_spinning_vehicle,
     fit_pedestrian_box_top,
 )
+from pipeline.hybrid_expD_vru import DEFAULTS as VRU_DEFAULTS
 from pipeline.hybrid_merge import merge_frames, merge_label_frames
 
 
@@ -85,6 +87,48 @@ class _MissingPoseCoords:
 
     def world_from_lidar(self, timestamp):
         return None if int(timestamp) in self.missing else np.eye(4, dtype=np.float64)
+
+
+class NonmotorizedHeightFilterTest(unittest.TestCase):
+    """空车过滤：非机动车框高 < 1.4m 直接丢（有人坐约 1.6m）。"""
+
+    @staticmethod
+    def _det(cls, height, track_id=1):
+        det = {
+            "track_id": track_id, "class_name": cls, "score": 0.8,
+            "box_lidar": [1.0, 2.0, 0.8, 0.8, 1.8, float(height), 0.0],
+        }
+        return det
+
+    def test_empty_bike_below_threshold_is_dropped(self):
+        frames = [{"frame_id": "1", "detections": [self._det("Nonmotorized_vehicle", 1.30)]}]
+        stats = _early_nonmotorized_height_filter(frames, min_height=1.40)
+        self.assertEqual(stats["detections_removed"], 1)
+        self.assertEqual(frames[0]["detections"], [])
+
+    def test_rider_bike_kept(self):
+        frames = [{"frame_id": "1", "detections": [self._det("Nonmotorized_vehicle", 1.60)]}]
+        stats = _early_nonmotorized_height_filter(frames, min_height=1.40)
+        self.assertEqual(stats["detections_removed"], 0)
+        self.assertEqual(len(frames[0]["detections"]), 1)
+
+    def test_boundary_height_is_kept(self):
+        """严格小于才丢：正好 1.40m 保留。"""
+        frames = [{"frame_id": "1", "detections": [self._det("Nonmotorized_vehicle", 1.40)]}]
+        stats = _early_nonmotorized_height_filter(frames, min_height=1.40)
+        self.assertEqual(stats["detections_removed"], 0)
+
+    def test_other_classes_are_untouched(self):
+        frames = [{"frame_id": "1", "detections": [
+            self._det("Pedestrian", 1.20, 1),
+            self._det("Truck", 1.20, 2),
+        ]}]
+        stats = _early_nonmotorized_height_filter(frames, min_height=1.40)
+        self.assertEqual(stats["detections_removed"], 0)
+        self.assertEqual(len(frames[0]["detections"]), 2)
+
+    def test_vru_chain_default_is_enabled(self):
+        self.assertEqual(VRU_DEFAULTS["nonmotorized_min_height"], 1.40)
 
 
 class HybridPipelineTest(unittest.TestCase):

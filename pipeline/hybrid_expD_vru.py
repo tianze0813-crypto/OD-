@@ -44,6 +44,7 @@ DEFAULTS: Dict[str, Any] = dict(
     pedestrian_min_frames=20,    # 【改动】只对行人：帧数 <20 的轨迹整条删（2026-09-19 用户要求）
     pedestrian_max_distance=20.0,            # 【改动】2026-10-10：行人 15m -> 20m
     nonmotorized_max_distance=60.0,
+    nonmotorized_min_height=1.40,   # 【改动 2026-10-30】框高 <1.4m 的非机动车＝空车，直接过滤
     # 【改动】2026-10-10 行人框统一 1.8m + 顶部贴头皮 + 底部裁到真实最低点（VRU 链默认开）
     pedestrian_top_fit=True,
     pedestrian_top_fit_min_points=8,
@@ -106,6 +107,8 @@ def main() -> None:
     parser.add_argument("--nonmotorized-score-threshold", type=float, default=0.25)  # 【改动】2026-10-10
     parser.add_argument("--pedestrian-max-distance", type=float, default=20.0)  # 【改动】2026-10-10
     parser.add_argument("--nonmotorized-max-distance", type=float, default=60.0)
+    parser.add_argument("--nonmotorized-min-height", type=float, default=1.40,
+                        help="【改动 2026-10-30】非机动车框高下限（米）：低于它视为空车直接过滤，0=关闭")
     parser.add_argument("--no-pedestrian-top-fit", action="store_true",
                         help="关闭行人框顶空白贴合")
     parser.add_argument("--short-track-max-frames", type=int, default=4)
@@ -119,6 +122,7 @@ def main() -> None:
                                        "Nonmotorized_vehicle": float(args.nonmotorized_score_threshold)},
                pedestrian_max_distance=float(args.pedestrian_max_distance),
                nonmotorized_max_distance=float(args.nonmotorized_max_distance),
+               nonmotorized_min_height=float(args.nonmotorized_min_height),
                pedestrian_top_fit=not args.no_pedestrian_top_fit,
                range_front=args.range_front, range_rear=args.range_rear,
                range_side=args.range_side,
