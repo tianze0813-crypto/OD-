@@ -158,7 +158,7 @@ bak/                             已归档（**gitignore**，见 bak/README.md�
 | 短轨迹 | Car ≤3 / Truck ≤4 帧 | ≤4 帧（行人另加 <20 帧整条删）|
 | 行人框 | — | 框高统一 1.9m（原始 >1.9m 用原始高度）→ 顶贴头皮 → 框内低点 P95 作参照，框底与参照间距 >5cm 才裁、最多 20cm；逐帧，框内 <8 点跳过 |
 | 非机动车静止过滤 | — | **已删除**（2026-10-10：原 15m 净位移删链规则整段移除）|
-| 非机动车空车过滤 | — | **框高 < 1.4 m 直接丢**（2026-10-30 新增；空车约 1.35~1.4 m、坐人约 1.6 m）。在原始检测之后第一步做（`_early_nonmotorized_height_filter`），阈值可调 `nonmotorized_min_height` / `--nonmotorized-min-height`，0 = 关闭 |
+| 非机动车空车过滤 | — | **框高 < 1.45 m 直接丢**（2026-10-30 新增；空车约 1.35~1.45 m、坐人约 1.6 m）。在原始检测之后第一步做（`_early_nonmotorized_height_filter`），阈值可调 `nonmotorized_min_height` / `--nonmotorized-min-height`，0 = 关闭 |
 | 遮挡属性 / 可见度过滤 | **合并后的公共阶段统一算一次**（`pipeline/final_visibility.py`）：帧内全部类别一起判遮挡。**可见度过滤默认关闭**（`--drop-vis-below` 默认 0 = 只写 `visibility` 属性、不删框；给正数如 0.05 才按 `ratio <= 阈值` 删）；链内不再算 | 同左 |
 | 挂车 | `--trailer-policy to-truck`（默认并成 Truck，标注侧无 Trailer 类）| — |
 | 静态刚性框 | `--static-rigid`（默认关）| — |

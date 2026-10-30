@@ -93,8 +93,8 @@ def _early_nonmotorized_height_filter(frames: List[Dict[str, Any]], *,
                                       min_height: float) -> Dict[str, Any]:
     """【改动 2026-10-30】把"空车"非机动车过滤掉：框高 < min_height 直接丢。
 
-    依据（用户实测）：没人坐的自行车/电瓶车检测框高约 1.35~1.4m，坐上人约 1.6m，
-    因此 1.4m 以下基本是空车，标注规则里不需要。放在原始检测之后第一步，
+    依据（用户实测）：没人坐的自行车/电瓶车检测框高约 1.35~1.45m，坐上人约 1.6m，
+    因此阈值以下基本是空车，标注规则里不需要（默认 1.45m）。放在原始检测之后第一步，
     比跟踪/几何都便宜。
     """
     before = _count(frames)
@@ -485,7 +485,7 @@ def run(raw_json: Path, clip: Path, out_json: Path,
         class_score_thresholds: Mapping[str, float] | None = None,
         pedestrian_max_distance: float = 15.0,   # 【改动】20 -> 15
         nonmotorized_max_distance: float = 60.0,
-        # 【改动 2026-10-30】非机动车框高下限（米）：低于它视为空车直接丢；0 = 关闭（VRU 链默认 1.4）
+        # 【改动 2026-10-30】非机动车框高下限（米）：低于它视为空车直接丢；0 = 关闭（VRU 链默认 1.45）
         nonmotorized_min_height: float = 0.0,
         # 【改动 2026-10-10】行人框统一 1.8m + 顶部贴头皮 + 底部按 P95 拟合地面裁（有间距才裁、最多 20cm）（VRU 链默认开）
         pedestrian_top_fit: bool = False,
