@@ -6,7 +6,7 @@
   1. Car   : 合并车链（BEVFusion Car+Truck 一次推理 + 共享跟踪 + Car 专属 step3/4/4.5/5）
              —— 旧单 Car 链（Waymo Car 头 / hybrid_expD_car）已于 2026-09-22 删除
   2. Truck : pipeline/hybrid_expD_truck.py，权重 models/voxelnext_truckB_epoch15.pth（obj_id +1000）
-  3. VRU   : pipeline/hybrid_expD_vru.py，权重 models/voxelnext_vru_1head2cls_epoch20.pth（obj_id +2000）
+  3. VRU   : pipeline/hybrid_expD_vru.py，权重 models/voxelnext_vru_hum_b_ep15.pth（obj_id +2000）
 
 三条链各自独立推理，最后按 frame_id 合成一份 label/det/（【改动】2026-10-13：多一层 det）。
 用 --chains 可选子集，例如 --chains car,truck；旧五类单链用 --chains car,noncar。
@@ -50,8 +50,11 @@ NONCAR_CKPT = ROOT / "models" / "vod_2cls_ft_e12.pth"
 # 【改动】三条链各自的权重/配置
 TRUCK_CFG = ROOT / "models" / "voxelnext_truck_infer.yaml"
 TRUCK_CKPT = ROOT / "models" / "voxelnext_truckB_epoch15.pth"
-VRU_CFG = ROOT / "models" / "voxelnext_vru_infer_60_005.yaml"   # 【改动】2026-10-10 与 0.05m/±60m 新权重配套；旧权重用 voxelnext_vru_infer.yaml
-VRU_CKPT = ROOT / "models" / "voxelnext_vru_rider_005_60m_epoch20.pth"   # 【改动】2026-10-10 新 VRU 默认权重
+# 【改动 2026-10-21】VRU 默认换成 ep15（0.04m / ±80m / 三路融合点云 / 纯人工 GT 训练）：
+#   权重 models/voxelnext_vru_hum_b_ep15.pth，配置 models/voxelnext_vru_infer_80_004.yaml。
+#   旧默认 rider_005_60m_epoch20 + voxelnext_vru_infer_60_005.yaml（0.05m/±60m）仍可显式指回。
+VRU_CFG = ROOT / "models" / "voxelnext_vru_infer_80_004.yaml"
+VRU_CKPT = ROOT / "models" / "voxelnext_vru_hum_b_ep15.pth"
 TRUCK_ID_OFFSET = 1000
 VRU_ID_OFFSET = 2000
 DEFAULT_CHAINS = ("car", "truck", "vru")

@@ -49,7 +49,7 @@ done
 ```text
 [hybrid] chains=('car', 'truck', 'vru') | 车链 Car+Truck: detector=BEVFusion mode=lidar
          weights=models/ft_ct3_p2_fulllr_epoch13.pth ... | VRU: detector=voxelnext
-         weights=voxelnext_vru_1head2cls_epoch20.pth
+         weights=voxelnext_vru_hum_b_ep15.pth
 ```
 
 ## 输出
@@ -99,7 +99,7 @@ hybrid_run.sh                                   挑 openpcdet 环境的 python�
    │                        -> geometry/truck_postprocess -> 轨迹级类别统一 -> base_link
    │
    ├─ pipeline/hybrid_expD_vru.py                          VRU 链（VoxelNeXt）
-   │   └─ pipeline/step1_lidar_inference.py 【子进程】models/voxelnext_vru_1head2cls_epoch20.pth
+   │   └─ pipeline/step1_lidar_inference.py 【子进程】models/voxelnext_vru_hum_b_ep15.pth（0.04m/±80m）
    │
    ├─ scripts/run_hybrid_prelabel.py::_merge_chain_labels  三条链按 frame_id 合成一份 label/det/
    └─ pipeline/final_visibility.py  公共收尾阶段：合并标签后统一算遮挡属性 + 可见度过滤
@@ -138,7 +138,7 @@ bak/                             已归档（**gitignore**，见 bak/README.md�
 ```
 
 `models/` 里在用的：**`ft_ct3_p2_fulllr_epoch13.pth`（车链默认，交警域微调 ct3_p2 = 从 ct2-A 起点纯人工 GT 全量微调，配 `configs/police_bevfusion_mmdet3d_lidaronly_ct2roi.py`；2026-10-17 起）**、`ft_ct2_A_fulllr_epoch8.pth`（上一版，可显式指回）、`bevfusion_mmdet3d_lidaronly.pth`（旧官方 46MB，可显式指回）、`bevfusion_mmdet3d_lidarcam.pth`
-（fusion 模式）、`voxelnext_vru_rider_005_60m_epoch20.pth` + `voxelnext_vru_infer_60_005.yaml`（VRU 默认，2026-10-10 起，0.05m/±60m 配套 config；旧 `voxelnext_vru_1head2cls_epoch20.pth` + `voxelnext_vru_infer.yaml` 保留可显式指回）、
+（fusion 模式）、**`voxelnext_vru_hum_b_ep15.pth` + `voxelnext_vru_infer_80_004.yaml`（VRU 默认，2026-10-21 起：0.04m / ±80m / 三路融合点云 / 纯人工 GT 训练的 epoch 15）**、`voxelnext_vru_rider_005_60m_epoch20.pth` + `voxelnext_vru_infer_60_005.yaml`（上一版，0.05m/±60m，可显式指回）、`voxelnext_vru_1head2cls_epoch20.pth` + `voxelnext_vru_infer.yaml`（更早版本，可显式指回）、
 `voxelnext_truckB_epoch15.pth` + `voxelnext_truck_infer.yaml`（Truck 回退，入口会校验存在）、
 `vod_2cls_ft_e12.pth` + `voxelnext_fiveclass_nuscenes_infer.yaml`（`--chains noncar`）。
 
