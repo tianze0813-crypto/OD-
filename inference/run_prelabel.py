@@ -45,6 +45,9 @@ class PcdBinDataset(DatasetTemplate):
         if raw.size % 4 != 0:
             raise ValueError(f"unexpected value count in {point_path}: {raw.size}")
         points = raw.reshape(-1, 4).astype(np.float32)
+        # 【改动 2026-10-21】强度默认原样送入（×1.0）。训练侧 nuScenes/VOD/Police
+        # 的 loader 都不归一化强度（只有 PandaSet 的 loader 做 /255），曾经默认
+        # 1/255 导致训练 0~255 / 推理 0~1 差 255 倍，强度通道基本失效。
         points[:, 3] *= self.intensity_scale
         # Some nuScenes training configs declare a fifth timestamp channel
         # although the deployed SUST frames are single-sweep XYZI.  Supply a
@@ -74,9 +77,10 @@ def main():
     parser.add_argument("--out_json", required=True)
     parser.add_argument("--score_thresh", type=float, default=0.3)
     parser.add_argument(
-        "--intensity_scale", type=float, default=1.0 / 255.0,
-        help="Multiplier applied to the fourth (intensity) column; "
-             "default preserves the historical /255 behavior.",
+        "--intensity_scale", type=float, default=1.0,
+        help="Multiplier applied to the fourth (intensity) column. "
+             "默认 1.0 = 原样送入，与训练侧（nuScenes/VOD/Police 均不归一化）对齐；"
+             "只有 PandaSet 时代训练的模型才需要 1/255。",
     )
     args = parser.parse_args()
 
