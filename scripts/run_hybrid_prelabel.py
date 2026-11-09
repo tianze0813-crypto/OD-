@@ -505,6 +505,73 @@ def _drop_cars_covered_by_trucks(
                          "examples": worst[:10]}
 
 
+def _drop_cars_covered_by_nonmotorized(
+        frames: List[Dict[str, Any]], iou_threshold: float = 0.5
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """【改动 2026-11-09】Car 与非机动车框 BEV IoU >= 阈值 → 删掉【该 Car id 的全部帧】。
+
+    背景（用户 2026-11-09）：预标时同一辆车会被 Car 链和 VRU 链各标一次，出现
+    "Car + Nonmotorized_vehicle" 重复框（车被 VRU 判成了非机动车）。口径：两者
+    BEV IoU 超过 50% 时以非机动车为准，把 Car 去掉、非机动车留下；同 Car/Truck 规则
+    一样，删的是整条 Car 轨迹，不只是重叠那一帧。
+    """
+    from tracking import tracker_conservative as tracking
+    if iou_threshold is None or float(iou_threshold) <= 0:
+        return frames, {"enabled": False, "reason": "threshold<=0"}
+    dropped_ids: set = set()
+    matched_pairs = 0
+    examples: List[Dict[str, Any]] = []
+    for frame in frames:
+        cars = [item for item in frame.get("labels", [])
+                if item.get("obj_type") == "Car"]
+        nmvs = [item for item in frame.get("labels", [])
+                if item.get("obj_type") == "Nonmotorized_vehicle"]
+        if not cars or not nmvs:
+            continue
+        for car in cars:
+            car_id = str(car.get("obj_id"))
+            if car_id in dropped_ids:
+                continue
+            box = _label_box7(car)
+            best_iou = 0.0
+            best_nmv = None
+            for nmv in nmvs:
+                nmv_box = _label_box7(nmv)
+                iou = tracking.bev_iou(box[:2], box[3:5], box[6],
+                                       nmv_box[:2], nmv_box[3:5], nmv_box[6])
+                if iou > best_iou:
+                    best_iou, best_nmv = iou, str(nmv.get("obj_id"))
+            if best_iou >= float(iou_threshold):
+                dropped_ids.add(car_id)
+                matched_pairs += 1
+                examples.append({"frame_id": frame.get("frame_id"),
+                                 "car_id": car_id,
+                                 "nonmotorized_id": best_nmv,
+                                 "bev_iou": round(best_iou, 3)})
+    if not dropped_ids:
+        return frames, {"enabled": True, "iou_threshold": float(iou_threshold),
+                        "metric": "bev_iou", "dropped_car_ids": 0,
+                        "dropped_boxes": 0, "matched_pairs": 0}
+    kept_frames: List[Dict[str, Any]] = []
+    dropped_boxes = 0
+    for frame in frames:
+        labels = []
+        for item in frame.get("labels", []):
+            if (item.get("obj_type") == "Car"
+                    and str(item.get("obj_id")) in dropped_ids):
+                dropped_boxes += 1
+                continue
+            labels.append(item)
+        kept_frames.append({**frame, "labels": labels})
+    return kept_frames, {"enabled": True, "iou_threshold": float(iou_threshold),
+                         "metric": "bev_iou",
+                         "dropped_car_ids": len(dropped_ids),
+                         "dropped_boxes": dropped_boxes,
+                         "matched_pairs": matched_pairs,
+                         "dropped_ids": sorted(dropped_ids)[:40],
+                         "examples": examples[:10]}
+
+
 def _merge_chain_labels(chain_labels: Dict[str, Dict[str, List[Dict[str, Any]]]],
                         order: List[str],
                         car_truck_cover_threshold: float = 0.5
@@ -608,6 +675,7 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
              keep_chain_labels: bool = False,
              # 已停用（见 _merge_chain_labels：Car 优先接管 Car/Truck 冲突）
              car_truck_cover_threshold: float = 0.5,
+             car_nonmotorized_iou_threshold: float = 0.5,   # 【改动 2026-11-09】Car×非机动车 BEV IoU 去重
              # 【改动】2026-09-21 Car+Truck 合并成一条后处理（共享动静态区域）；
              # --no-car-truck-merged 可回退到原来的两条链，方便 A/B。
              # 【改动】车链过程诊断（槽位/动态区域/…）默认不落盘；调试时才写进输出目录
@@ -873,6 +941,16 @@ def run_clip(python: Path, clip: Path, output_root: Path, *, overwrite: bool,
                 _print(f"{base}: 就地重跑，复用盘上已有标签 {reused_total} 个"
                        f"（非 {'/'.join(selected)} 类别），旧标签剔除 {dropped_existing} 个")
 
+        # 【改动 2026-11-09】Car / 非机动车去重（放在合并的最后、公共收尾之前）：
+        # 同一辆车被 Car 链和 VRU 链各标一次时，BEV IoU 超阈值就以非机动车为准。
+        merged, car_nmv_stats = _drop_cars_covered_by_nonmotorized(
+            merged, car_nonmotorized_iou_threshold)
+        merge_diag["car_nonmotorized_overlap"] = car_nmv_stats
+        if car_nmv_stats.get("dropped_car_ids"):
+            _print(f"{base}: Car/非机动车去重：删掉 {car_nmv_stats['dropped_car_ids']} 条 Car 轨迹"
+                   f"（{car_nmv_stats['dropped_boxes']} 框，BEV IoU >= "
+                   f"{car_nmv_stats['iou_threshold']}），保留下来的非机动车框不动")
+
         # 【改动 2026-10-14】公共收尾阶段：car/truck/VRU 标签都出来之后，逐帧对
         # 全部类别统一算遮挡属性 + 可见度过滤（帧内跨类遮挡才判得出来）。
         fused_dir = _fused_lidar_dir(work, clip) if "vru" in selected else None
@@ -1079,6 +1157,9 @@ def main() -> int:
     parser.add_argument("--car-truck-cover-threshold", type=float, default=0.5,
                         help="Car 被 Truck 覆盖的面积 / Car 面积 达到该值就删掉这条 "
                              "Car 轨迹的全部帧（0 关闭）")
+    parser.add_argument("--car-nmv-iou-threshold", type=float, default=0.5,
+                        help="【改动 2026-11-09】Car 与非机动车框 BEV IoU 达到该值就删掉这条 "
+                             "Car 轨迹的全部帧、保留非机动车（0 关闭；默认 0.5）")
     parser.add_argument("--keep-chain-labels", action="store_true",
                         help="额外把 label_truck/ label_vru/ 写进输出 clip")
     parser.add_argument("--output-tag", type=str, default="",
@@ -1277,6 +1358,7 @@ def main() -> int:
             vru_fuse_lidars=not bool(args.no_vru_fuse_lidars),
             keep_chain_labels=args.keep_chain_labels,
             car_truck_cover_threshold=args.car_truck_cover_threshold,
+            car_nonmotorized_iou_threshold=args.car_nmv_iou_threshold,
         ))
     print(json.dumps({"clips": summaries}, ensure_ascii=False, indent=2))
     return 0

@@ -164,6 +164,10 @@ bak/                             已归档（**gitignore**，见 bak/README.md�
 | 静态刚性框 | `--static-rigid`（默认关）| — |
 | yaw | Car：`--car-yaw-settle step45`（默认，B1：static_yaw 只算不写 + 几何跑 detector 原生系 + step4.5 settle 在几何之后写轴和方向）；Truck：`geometry_yaw_v2` | `legacy` |
 
+> **合并后共用规则（2026-11-09）**：Car 与 Nonmotorized_vehicle 框 **BEV IoU ≥ 0.5** 时，
+> 删掉**该 Car 轨迹的全部帧**、非机动车原样保留（同一辆车被 Car 链和 VRU 链各标一次的重复框）。
+> 阈值 `--car-nmv-iou-threshold`（默认 0.5，0 = 关闭），在合并之后、公共可见度/写盘之前执行。
+
 常用开关：`--chains car,truck,vru`（默认）｜`--drop-vis-below`（默认 **0 = 关闭可见度过滤**，只算属性；给正数如 0.05 才删框）｜`--truck-detector-mode lidar|fusion`（默认 lidar）
 ｜`--vru-detector voxelnext|bevfusion`（默认 voxelnext）｜`--vru-raw-threshold`（默认 0.25）｜`--no-vru-fuse-lidars`（**VRU 链默认开启**多雷达融合：推理前把 lidar_front/rear 按标定 + 自车运动补偿融合进 lidar_top，补 top 近场盲区；车链不融合）｜`--bev-raw-dir`（复用已生成的 raw，不重跑推理）
 ｜`--car-yaw-settle step45\|step45-axis\|step2`（默认 step45 = B1）｜`--keep-vehicle-diagnostics`｜`--keep-chain-labels`｜`--link-only`｜`--output-tag`

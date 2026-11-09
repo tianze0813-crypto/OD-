@@ -89,6 +89,59 @@ class _MissingPoseCoords:
         return None if int(timestamp) in self.missing else np.eye(4, dtype=np.float64)
 
 
+class CarNonmotorizedDedupTest(unittest.TestCase):
+    """同一辆车被 Car 链 + VRU 链各标一次：BEV IoU 超阈值删 Car、留非机动车。"""
+
+    @staticmethod
+    def _label(obj_id, cls, x=0.0, y=0.0, dx=4.0, dy=1.8, dz=1.6, yaw=0.0):
+        return {
+            "obj_id": str(obj_id), "obj_type": cls, "score": 0.9,
+            "psr": {"position": {"x": x, "y": y, "z": 0.8},
+                    "rotation": {"x": 0.0, "y": 0.0, "z": yaw},
+                    "scale": {"x": dx, "y": dy, "z": dz}},
+        }
+
+    def test_overlapping_car_is_dropped_and_nonmotorized_kept(self):
+        frames = [
+            {"frame_id": "1", "labels": [
+                self._label(7, "Car"),
+                self._label(2001, "Nonmotorized_vehicle", dx=4.0, dy=1.7, dz=2.0)]},
+            {"frame_id": "2", "labels": [
+                self._label(7, "Car"),
+                self._label(2001, "Nonmotorized_vehicle", dx=4.0, dy=1.7, dz=2.0)]},
+        ]
+        out, stats = hybrid_launcher._drop_cars_covered_by_nonmotorized(frames, 0.5)
+        self.assertEqual(stats["dropped_car_ids"], 1)
+        self.assertEqual(stats["dropped_boxes"], 2)      # 整条轨迹都删
+        for frame in out:
+            self.assertEqual([item["obj_type"] for item in frame["labels"]],
+                             ["Nonmotorized_vehicle"])
+
+    def test_non_overlapping_pair_is_kept(self):
+        frames = [{"frame_id": "1", "labels": [
+            self._label(7, "Car", x=0.0),
+            self._label(2001, "Nonmotorized_vehicle", x=20.0)]}]
+        out, stats = hybrid_launcher._drop_cars_covered_by_nonmotorized(frames, 0.5)
+        self.assertEqual(stats["dropped_car_ids"], 0)
+        self.assertEqual(len(out[0]["labels"]), 2)
+
+    def test_small_bike_inside_car_is_not_a_duplicate(self):
+        """正常骑车人（小框）在车旁边不该被当成重复，IoU 很小。"""
+        frames = [{"frame_id": "1", "labels": [
+            self._label(7, "Car", dx=4.2, dy=1.8, dz=1.6),
+            self._label(2001, "Nonmotorized_vehicle", dx=1.8, dy=0.7, dz=1.6)]}]
+        out, stats = hybrid_launcher._drop_cars_covered_by_nonmotorized(frames, 0.5)
+        self.assertEqual(stats["dropped_car_ids"], 0)
+
+    def test_threshold_zero_disables_rule(self):
+        frames = [{"frame_id": "1", "labels": [
+            self._label(7, "Car"),
+            self._label(2001, "Nonmotorized_vehicle", dx=4.0, dy=1.7, dz=2.0)]}]
+        out, stats = hybrid_launcher._drop_cars_covered_by_nonmotorized(frames, 0.0)
+        self.assertFalse(stats["enabled"])
+        self.assertEqual(len(out[0]["labels"]), 2)
+
+
 class NonmotorizedHeightFilterTest(unittest.TestCase):
     """空车过滤：非机动车框高 < 1.45m 直接丢（有人坐约 1.6m）。"""
 
