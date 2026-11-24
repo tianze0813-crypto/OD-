@@ -89,7 +89,7 @@ class Step45Config:
     # 【改动 2026-09-23】step4.5 末尾：对高度约等于高先验 1.70m 的 Car，
     # 复刻 SUST 双击侧视图下边界 auto-shrink：车顶不动，框底贴到框内最低点；
     # 只要 fit 后高度不缩到 1.40m 以下就动；没有点 / fit 不动就 no-op。
-    height_prior_bottom_fit_enabled: bool = True
+    height_prior_bottom_fit_enabled: bool = False  # 【2026-11-24 用户要求】暂时关闭底边贴点精修
     height_prior_bottom_fit_height_m: float = 1.70
     height_prior_bottom_fit_tol_m: float = 0.02
     height_prior_bottom_fit_min_height_m: float = 1.40

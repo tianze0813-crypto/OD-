@@ -128,7 +128,7 @@ class CarBoxFitConfig:
     #   每 ID：静止车 z_top_base 定死成世界系常数；运动车每帧跟实测车顶
     #         无地面 + 静态区域 + 能凑出直线排 → 用这一排的共底地面（反推真实地面）
     #   高度夹在 [1.45, 1.70]；只写 box_lidar[2]/[5]
-    car_height_policy_enabled: bool = True
+    car_height_policy_enabled: bool = False   # 【2026-11-24 用户要求】暂时关闭车高精修（顶贴车顶+夹 1.45~1.70 会把矮车压陷地）
     car_height_low_m: float = 1.45
     car_height_high_m: float = 1.70
     car_height_inset_m: float = 0.10
@@ -182,7 +182,7 @@ class CarBoxFitConfig:
     #         地面不可得 → 顶 = 框内最高回波（= 车顶），底 = 顶 - 统一高度
     #   轨迹级：高度统一 = 优先取 r < near_m 的测量（取 percentile，遮挡帧把顶拉低的能兜回来）
     #           再夹到 [low, high]；只写 box_lidar[2]/[5]，XY 与 yaw 不动
-    car_height_policy_enabled: bool = True
+    car_height_policy_enabled: bool = False   # 【2026-11-24 用户要求】暂时关闭车高精修（顶贴车顶+夹 1.45~1.70 会把矮车压陷地）
     car_height_low_m: float = 1.45
     car_height_high_m: float = 1.70
     car_height_near_m: float = 50.0
